@@ -112,6 +112,7 @@ const form = ref({
   discount: '',
   preferPriceTable: false,
   sanitizedLog: true,
+  sanitizedFormat: 'xlsx',
   keepLog: false,
 })
 
@@ -163,6 +164,7 @@ async function handleSubmit() {
   if (form.value.discount !== '') fd.append('discount', String(form.value.discount))
   fd.append('preferPriceTable', String(form.value.preferPriceTable))
   fd.append('sanitizedLog', String(form.value.sanitizedLog))
+  fd.append('sanitizedFormat', form.value.sanitizedFormat)
   fd.append('keepLog', String(form.value.keepLog))
 
   loading.value = true
@@ -264,6 +266,15 @@ async function handleSubmit() {
         <label><input v-model="form.preferPriceTable" type="checkbox" /> Claude 也优先用报价表</label>
         <label><input v-model="form.sanitizedLog" type="checkbox" /> 生成脱敏日志</label>
         <label><input v-model="form.keepLog" type="checkbox" /> 附带原日志到账单文件</label>
+      </div>
+
+      <div class="field" v-if="form.sanitizedLog">
+        <label>脱敏日志格式</label>
+        <select v-model="form.sanitizedFormat">
+          <option value="xlsx">xlsx（单表最多约 104 万行，超出会自动拆分多个 sheet）</option>
+          <option value="csv">csv（纯文本，无行数上限，适合超大日志）</option>
+          <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
+        </select>
       </div>
 
       <button type="submit" :disabled="loading">{{ loading ? '生成中…' : '生成账单' }}</button>
@@ -503,6 +514,12 @@ async function handleSubmit() {
   padding: 6px 8px;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.field select {
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  max-width: 420px;
 }
 .grid {
   display: grid;

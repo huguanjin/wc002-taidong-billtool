@@ -52,6 +52,7 @@ type Params struct {
 	ExchangeRate      float64
 	KeepLog           bool
 	SanitizedLog      bool
+	SanitizedFormat   string // "xlsx"（默认，为空时等同）| "csv" | "tsv"
 	PreferPriceTable  bool
 	Sheet             string
 	Encoding          string

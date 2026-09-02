@@ -9,9 +9,15 @@ import (
 	"time"
 )
 
-// SanitizedRowWriter 脱敏日志的行写入接口，由 excel_write.go 实现。
+// SanitizedRowWriter 脱敏日志的行写入接口，由 excel_write.go / csv_write.go 实现。
 type SanitizedRowWriter interface {
 	WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64) error
+}
+
+// SanitizedWriter 脱敏日志写出器：在 SanitizedRowWriter 基础上要求实现收尾关闭。
+type SanitizedWriter interface {
+	SanitizedRowWriter
+	Close() error
 }
 
 // AggregateResult 汇总结果，附带推断出的账期与统计信息。

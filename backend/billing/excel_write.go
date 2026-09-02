@@ -11,38 +11,53 @@ import (
 )
 
 // ExcelSanitizedWriter 流式写出脱敏日志：展开缓存列，删除 other 列。
+// 单个 sheet 写满 xlsx 行数上限（ExcelMaxRowsPerSheet）时自动切到下一个 sheet，避免超大日志写出失败。
 type ExcelSanitizedWriter struct {
 	headers          []string
 	sanitizedHeaders []string
 	file             *excelize.File
-	sheet            string
+	sheetBase        string
+	sheetIndex       int
 	stream           *excelize.StreamWriter
-	rowNum           int
+	rowNum           int // 当前 sheet 内已写入的行数（含表头）
+	totalRows        int // 全部 sheet 累计写入的数据行数
 	path             string
 }
 
 func NewExcelSanitizedWriter(path string, headers []string) (*ExcelSanitizedWriter, error) {
 	sanitizedHeaders := buildSanitizedHeaders(headers)
 	f := excelize.NewFile()
-	sheet := "日志查询"
-	if err := f.SetSheetName(f.GetSheetName(0), sheet); err != nil {
+	sheetBase := "日志查询"
+	if err := f.SetSheetName(f.GetSheetName(0), sheetBase); err != nil {
 		return nil, err
 	}
-	sw, err := f.NewStreamWriter(sheet)
+	w := &ExcelSanitizedWriter{
+		headers: headers, sanitizedHeaders: sanitizedHeaders,
+		file: f, sheetBase: sheetBase, path: path,
+	}
+	if err := w.startSheet(sheetBase); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+// startSheet 在给定 sheet 上新建 StreamWriter 并写入表头，重置行计数。
+func (w *ExcelSanitizedWriter) startSheet(name string) error {
+	sw, err := w.file.NewStreamWriter(name)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	headerRow := make([]interface{}, len(sanitizedHeaders))
-	for i, h := range sanitizedHeaders {
+	headerRow := make([]interface{}, len(w.sanitizedHeaders))
+	for i, h := range w.sanitizedHeaders {
 		headerRow[i] = h
 	}
 	if err := sw.SetRow("A1", headerRow); err != nil {
-		return nil, err
+		return err
 	}
-	return &ExcelSanitizedWriter{
-		headers: headers, sanitizedHeaders: sanitizedHeaders,
-		file: f, sheet: sheet, stream: sw, rowNum: 1, path: path,
-	}, nil
+	w.sheetIndex++
+	w.stream = sw
+	w.rowNum = 1
+	return nil
 }
 
 func buildSanitizedHeaders(headers []string) []string {
@@ -57,6 +72,19 @@ func buildSanitizedHeaders(headers []string) []string {
 
 // WriteRow 实现 SanitizedRowWriter。
 func (w *ExcelSanitizedWriter) WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64) error {
+	if w.rowNum >= ExcelMaxRowsPerSheet {
+		if err := w.stream.Flush(); err != nil {
+			return err
+		}
+		nextSheet := fmt.Sprintf("%s_%d", w.sheetBase, w.sheetIndex+1)
+		if _, err := w.file.NewSheet(nextSheet); err != nil {
+			return err
+		}
+		if err := w.startSheet(nextSheet); err != nil {
+			return err
+		}
+	}
+
 	values := make([]interface{}, 0, len(w.sanitizedHeaders))
 	for i, name := range w.headers {
 		if name == "" || SanitizedDropColumns[name] {
@@ -66,6 +94,7 @@ func (w *ExcelSanitizedWriter) WriteRow(row []string, cacheRead, cacheWrite5m, c
 	}
 	values = append(values, cacheRead, cacheWrite5m+cacheWrite1h, cacheWrite5m, cacheWrite1h)
 	w.rowNum++
+	w.totalRows++
 	axis, err := excelize.CoordinatesToCellName(1, w.rowNum)
 	if err != nil {
 		return err
@@ -84,7 +113,7 @@ func cellValueForSanitized(v string) interface{} {
 	return v
 }
 
-func (w *ExcelSanitizedWriter) RowsWritten() int { return w.rowNum - 1 }
+func (w *ExcelSanitizedWriter) RowsWritten() int { return w.totalRows }
 
 func (w *ExcelSanitizedWriter) Close() error {
 	if err := w.stream.Flush(); err != nil {

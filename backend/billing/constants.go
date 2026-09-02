@@ -9,6 +9,8 @@ const (
 	QuotaPerCNY         = 500_000.0
 	MoneyDecimals       = 4
 	DiscountDecimals    = 3
+	// ExcelMaxRowsPerSheet 是 xlsx 格式规定的单个 sheet 最大行数（含表头），超出需拆分到多个 sheet。
+	ExcelMaxRowsPerSheet = 1_048_576
 )
 
 // CacheReadAbsUSD 缓存读取绝对价（$/MTok）；未列出的模型用 input×CacheReadMult。

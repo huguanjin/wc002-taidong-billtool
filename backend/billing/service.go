@@ -31,11 +31,16 @@ func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, par
 	stem := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
 	billPath := filepath.Join(outputDir, defaultOutputName(stem)+".xlsx")
 
-	var sanitizedWriter *ExcelSanitizedWriter
+	var sanitizedWriter SanitizedWriter
 	var sanitizedPath string
 	if params.SanitizedLog {
-		sanitizedPath = filepath.Join(outputDir, defaultSanitizedName(stem)+".xlsx")
-		sanitizedWriter, err = NewExcelSanitizedWriter(sanitizedPath, headers)
+		ext, delimiter, isDelimited := sanitizedFormatInfo(params.SanitizedFormat)
+		sanitizedPath = filepath.Join(outputDir, defaultSanitizedName(stem)+ext)
+		if isDelimited {
+			sanitizedWriter, err = NewCSVSanitizedWriter(sanitizedPath, headers, delimiter)
+		} else {
+			sanitizedWriter, err = NewExcelSanitizedWriter(sanitizedPath, headers)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("初始化脱敏日志写出失败: %w", err)
 		}
@@ -167,7 +172,21 @@ func defaultSanitizedName(stem string) string {
 	return stem + "_脱敏日志"
 }
 
+// sanitizedFormatInfo 把「脱敏日志格式」参数解析为输出扩展名/分隔符；
+// csv、tsv 是纯文本格式，没有 xlsx 单 sheet 104 万行的上限，适合超大日志。
+func sanitizedFormatInfo(format string) (ext string, delimiter rune, isDelimited bool) {
+	switch strings.ToLower(format) {
+	case "csv":
+		return ".csv", ',', true
+	case "tsv":
+		return ".tsv", '\t', true
+	default:
+		return ".xlsx", 0, false
+	}
+}
+
 // attachLogSheet 把原始日志作为「日志查询」工作表附加到账单文件末尾。
+// 行数超过 ExcelMaxRowsPerSheet 时自动拆分到「日志查询_2」「日志查询_3」……多个 sheet。
 func attachLogSheet(billPath string, headers []string, rows [][]string) error {
 	f, err := excelize.OpenFile(billPath)
 	if err != nil {
@@ -175,29 +194,47 @@ func attachLogSheet(billPath string, headers []string, rows [][]string) error {
 	}
 	defer f.Close()
 
-	const sheetName = "日志查询"
-	if idx, _ := f.GetSheetIndex(sheetName); idx != -1 {
-		if err := f.DeleteSheet(sheetName); err != nil {
+	const sheetBase = "日志查询"
+	if idx, _ := f.GetSheetIndex(sheetBase); idx != -1 {
+		if err := f.DeleteSheet(sheetBase); err != nil {
 			return err
 		}
-	}
-	if _, err := f.NewSheet(sheetName); err != nil {
-		return err
 	}
 
 	headerRow := make([]interface{}, len(headers))
 	for i, h := range headers {
 		headerRow[i] = h
 	}
+
+	sheetName := sheetBase
+	sheetIndex := 1
+	if _, err := f.NewSheet(sheetName); err != nil {
+		return err
+	}
 	if err := f.SetSheetRow(sheetName, "A1", &headerRow); err != nil {
 		return err
 	}
-	for i, row := range rows {
+
+	rowInSheet := 1 // 已写入当前 sheet 的行数（含表头）
+	for _, row := range rows {
+		if rowInSheet >= ExcelMaxRowsPerSheet {
+			sheetIndex++
+			sheetName = fmt.Sprintf("%s_%d", sheetBase, sheetIndex)
+			if _, err := f.NewSheet(sheetName); err != nil {
+				return err
+			}
+			if err := f.SetSheetRow(sheetName, "A1", &headerRow); err != nil {
+				return err
+			}
+			rowInSheet = 1
+		}
+
 		values := make([]interface{}, len(row))
 		for j, v := range row {
 			values[j] = cellValueForSanitized(v)
 		}
-		axis, _ := excelize.CoordinatesToCellName(1, i+2)
+		rowInSheet++
+		axis, _ := excelize.CoordinatesToCellName(1, rowInSheet)
 		if err := f.SetSheetRow(sheetName, axis, &values); err != nil {
 			return err
 		}

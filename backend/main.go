@@ -149,6 +149,7 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	if v := formValue(form, "sanitizedLog"); v != "" {
 		params.SanitizedLog = v == "true"
 	}
+	params.SanitizedFormat = formValue(form, "sanitizedFormat")
 	params.Sheet = formValue(form, "sheet")
 	params.Encoding = formValue(form, "encoding")
 
@@ -214,7 +215,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	name := filepath.Base(path)
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="download.xlsx"; filename*=UTF-8''%s`, url.PathEscape(name)))
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="download%s"; filename*=UTF-8''%s`, filepath.Ext(name), url.PathEscape(name)))
 	http.ServeFile(w, r, path)
 }
 
