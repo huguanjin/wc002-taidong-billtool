@@ -17,7 +17,7 @@ sudo mkdir -p /opt/taidong-bill
 cd /opt/taidong-bill
 ```
 
-从本地仓库拷贝以下文件/目录到服务器的 `/opt/taidong-bill`（用 `scp` / `rsync` / Git 拉取均可，任选其一）：
+需要放到部署目录 `/opt/taidong-bill` 的文件：
 
 ```
 docker-compose.yml
@@ -26,10 +26,33 @@ data/bill_template.xlsx
 data/price_table.xlsx
 ```
 
-> `data/` 里的两个 xlsx 没有提交到 git 仓库（见 [.gitignore](.gitignore)），需要手动拷贝，例如：
-> ```bash
-> scp docker-compose.yml .env.example ubuntu@<服务器IP>:/opt/taidong-bill/
-> scp -r data ubuntu@<服务器IP>:/opt/taidong-bill/
+`docker-compose.yml` / `.env.example` 已提交到 git 仓库，在服务器上拉取即可，任选一种：
+
+```bash
+# 方式一：仓库为 public 时，直接用 curl 下载单个文件（无需 clone 整个仓库）
+curl -fsSL -o docker-compose.yml \
+  https://raw.githubusercontent.com/huguanjin/wc002-taidong-billtool/main/docker-compose.yml
+curl -fsSL -o .env.example \
+  https://raw.githubusercontent.com/huguanjin/wc002-taidong-billtool/main/.env.example
+```
+
+```bash
+# 方式二：git sparse-checkout，只拉取需要的几个文件（仓库为 private 时需先配置好 SSH key 或 PAT）
+git init
+git remote add origin https://github.com/huguanjin/wc002-taidong-billtool.git
+git sparse-checkout init --cone
+git sparse-checkout set docker-compose.yml .env.example
+git pull origin main
+```
+
+> `data/` 下的两个 xlsx **没有提交到 git 仓库**（业务数据，见 [.gitignore](.gitignore)），
+> 以上两种方式都拉不到，需要从本地 Windows 机器手动上传，例如在本地 PowerShell 里执行：
+> ```powershell
+> scp -r "d:\My-LocalGitFile\15.wangchuankeji\wc002-taidong-billtool\data" ubuntu@<服务器IP>:/opt/taidong-bill/
+> ```
+> 之后有更新也可以用 `rsync` 增量同步：
+> ```powershell
+> rsync -avz "d:\My-LocalGitFile\15.wangchuankeji\wc002-taidong-billtool\data/" ubuntu@<服务器IP>:/opt/taidong-bill/data/
 > ```
 
 ## 2. 配置 `.env`
