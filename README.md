@@ -51,6 +51,23 @@ npm run dev
 
 ---
 
+## 部署到服务器（Docker Compose + GHCR）
+
+代码推送到 `main` 分支后，GitHub Actions（[.github/workflows/docker-publish.yml](.github/workflows/docker-publish.yml)）
+会自动构建 Docker 镜像并推送到 `ghcr.io/huguanjin/wc002-taidong-billtool`。
+
+服务器上准备好 [docker-compose.yml](docker-compose.yml)、`.env`（从 [.env.example](.env.example) 复制并修改账号密码）
+和 `data/` 下的模板文件后，两条命令即可启动：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+完整步骤（含 GHCR 登录、HTTPS 反向代理、备份、常见问题排查）见 **[DEPLOY.md](DEPLOY.md)**。
+
+---
+
 ## 旧版命令行工具（Python，仍保留作参考/备用）
 
 ## 目录结构
