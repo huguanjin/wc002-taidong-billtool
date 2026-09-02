@@ -1,0 +1,419 @@
+package billing
+
+import (
+	"encoding/json"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// ToFloat 对应 _to_float：空/非法一律返回 0。
+func ToFloat(value string) float64 {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0
+	}
+	return f
+}
+
+func jsonNumber(v interface{}) float64 {
+	switch t := v.(type) {
+	case nil:
+		return 0
+	case float64:
+		return t
+	case string:
+		return ToFloat(t)
+	case bool:
+		return 0
+	default:
+		return 0
+	}
+}
+
+// ParseCacheTokens 对应 parse_cache_tokens：优先解析 other 里的结构化缓存字段，
+// 解析失败（非规整 JSON）时回退到 extract_cache_columns 的容错解析。
+func ParseCacheTokens(other string) (cacheRead, cacheWrite5m, cacheWrite1h float64) {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return 0, 0, 0
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err == nil && data != nil {
+		cacheRead = jsonNumber(data["cache_tokens"])
+		cc5Raw, has5 := data["cache_creation_tokens_5m"]
+		cc1Raw, has1 := data["cache_creation_tokens_1h"]
+		if has5 || has1 {
+			return cacheRead, jsonNumber(cc5Raw), jsonNumber(cc1Raw)
+		}
+
+		cc := jsonNumber(data["cache_creation_tokens"])
+		if cc == 0 {
+			cc = jsonNumber(data["cache_write_tokens"])
+		}
+		ratio := CacheWrite5mMult
+		if r, ok := data["cache_creation_ratio"]; ok && r != nil {
+			ratio = ratioOrDefault(r, ratio)
+		} else if r, ok := data["cache_creation_ratio_5m"]; ok && r != nil {
+			ratio = ratioOrDefault(r, ratio)
+		}
+		if ratio >= 1.9 {
+			return cacheRead, 0, cc
+		}
+		return cacheRead, cc, 0
+	}
+
+	creation, cacheTokens := ExtractCacheFields(other)
+	cr := 0.0
+	if cacheTokens != nil {
+		cr = float64(*cacheTokens)
+	}
+	cc := 0.0
+	if creation != nil {
+		cc = float64(*creation)
+	}
+	return cr, cc, 0
+}
+
+func ratioOrDefault(v interface{}, def float64) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(t), 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+// ParseWebSearch 返回 (web_search_call_count, web_search_price $/1k calls)。
+func ParseWebSearch(other string) (calls float64, price float64) {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return 0, 0
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return 0, 0
+	}
+	calls = jsonNumber(data["web_search_call_count"])
+	if calls <= 0 {
+		if v, ok := data["web_search"]; ok {
+			if b, isBool := v.(bool); (isBool && b) || (!isBool && v != nil && v != false) {
+				calls = 1
+			}
+		}
+	}
+	price = jsonNumber(data["web_search_price"])
+	return calls, price
+}
+
+// ParseModelPrice 日志 other.model_price；>0 表示按次固定美金价，-1 表示按 ratio。
+func ParseModelPrice(other string) float64 {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return -1.0
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return -1.0
+	}
+	if v, ok := data["model_price"]; ok && v != nil {
+		return jsonNumber(v)
+	}
+	return -1.0
+}
+
+// ImageBillingMode 图片模型计费方式：token / per_call；非图片返回 ""。
+func ImageBillingMode(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(m, "gemini") && strings.Contains(m, "image") {
+		if strings.HasSuffix(m, "-token") {
+			return "token"
+		}
+		return "per_call"
+	}
+	if m == "gpt-image-2" {
+		return "token"
+	}
+	if strings.HasPrefix(m, "gpt-image") || (strings.HasPrefix(m, "gpt") && strings.Contains(m, "image")) {
+		return "per_call"
+	}
+	return ""
+}
+
+func IsOpenAIOrGeminiModel(model string) bool {
+	m := strings.ToLower(model)
+	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o1") ||
+		strings.HasPrefix(m, "o3") || strings.HasPrefix(m, "o4") ||
+		strings.HasPrefix(m, "gemini-") || strings.HasPrefix(m, "kimi-")
+}
+
+func IsAnthropicModel(model string) bool {
+	return strings.HasPrefix(strings.ToLower(model), "claude")
+}
+
+// InferUsageSemantic 推断 prompt_tokens 语义：anthropic=已是未命中；openai=含缓存。
+func InferUsageSemantic(model string, explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if IsAnthropicModel(model) {
+		return "anthropic"
+	}
+	if IsOpenAIOrGeminiModel(model) {
+		return "openai"
+	}
+	return "anthropic"
+}
+
+func UsageSemanticFromOther(other string) string {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return ""
+	}
+	if v, ok := data["usage_semantic"]; ok && v != nil {
+		if s, isStr := v.(string); isStr {
+			return s
+		}
+	}
+	return ""
+}
+
+// UncachedInputTokens anthropic：prompt 已是未命中；openai/gemini：prompt 含缓存，需扣减。
+func UncachedInputTokens(promptTokens, cacheRead, cacheWrite5m, cacheWrite1h float64, usageSemantic string) float64 {
+	if usageSemantic == "" || usageSemantic == "anthropic" {
+		return math.Max(0, promptTokens)
+	}
+	return math.Max(0, promptTokens-cacheRead-cacheWrite5m-cacheWrite1h)
+}
+
+// ResolveTierPrices 若模型有阶梯配置，返回该请求的 (input, output, cache_read) $/MTok。
+func ResolveTierPrices(model string, promptTokens float64) (input, output, cacheRead float64, ok bool) {
+	cfg, exists := TieredModelPrices[model]
+	if !exists {
+		return 0, 0, 0, false
+	}
+	useLow := promptTokens < cfg.Threshold
+	if cfg.Op == "le" {
+		useLow = promptTokens <= cfg.Threshold
+	}
+	chosen := cfg.Low
+	if !useLow {
+		chosen = cfg.High
+	}
+	return chosen[0], chosen[1], chosen[2], true
+}
+
+// CacheUnitPrices 返回 (缓存读, 写5m, 写1h) $/MTok。
+func CacheUnitPrices(model string, inputPerM float64) (read, w5, w1 float64) {
+	read = inputPerM * CacheReadMult
+	if v, ok := CacheReadAbsUSD[model]; ok {
+		read = v
+	}
+	return read, inputPerM * CacheWrite5mMult, inputPerM * CacheWrite1hMult
+}
+
+// ResolvePrice 返回 (价格, 备注)；价格已换算为 USD/MTok。nil 表示缺少定价。
+func ResolvePrice(model string, book *PriceBook, preferPriceTable bool, exchangeRate float64) (*ModelPrice, string) {
+	var notes []string
+	table, hasTable := book.ByModel[model]
+	officialAnthropic, hasAnthropic := OfficialAnthropicPrices[model]
+	officialGemini, hasGemini := OfficialGeminiTextPrices[model]
+	officialKimi, hasKimi := OfficialKimiPrices[model]
+	officialImage, hasImage := OfficialImageTokenPrices[model]
+	mode := ImageBillingMode(model)
+
+	if mode == "per_call" {
+		return &ModelPrice{
+			InputPerM: 0, OutputPerM: 0, Currency: "USD",
+			Source: "per_call", Category: "Image", Channel: "per_call",
+		}, "图片按次计费，刊例取日志 model_price"
+	}
+
+	var chosen *ModelPrice
+	switch {
+	case hasImage && !preferPriceTable:
+		chosen = &ModelPrice{InputPerM: officialImage.Input, OutputPerM: officialImage.Output, Currency: "USD", Source: "image_official", Category: "Image", Channel: "token"}
+		if hasTable && priceDiffers(table, officialImage) {
+			notes = append(notes, "报价表价格与图片官网不一致，已按官网价")
+		}
+	case hasGemini && !preferPriceTable:
+		chosen = &ModelPrice{InputPerM: officialGemini.Input, OutputPerM: officialGemini.Output, Currency: "USD", Source: "gemini_official", Category: "Gemini", Channel: "official"}
+		if hasTable && priceDiffers(table, officialGemini) {
+			notes = append(notes, "报价表价格与 Gemini 官网不一致，已按官网价")
+		}
+	case hasAnthropic && !preferPriceTable:
+		chosen = &ModelPrice{InputPerM: officialAnthropic.Input, OutputPerM: officialAnthropic.Output, Currency: "USD", Source: "anthropic_official", Category: "Anthropic", Channel: "official"}
+		if hasTable && priceDiffers(table, officialAnthropic) {
+			notes = append(notes, "报价表价格与 Anthropic 官网不一致，已按官网价")
+		}
+	case hasKimi && !preferPriceTable:
+		chosen = &ModelPrice{InputPerM: officialKimi.Input, OutputPerM: officialKimi.Output, Currency: "USD", Source: "kimi_official", Category: "Kimi", Channel: "official"}
+		if hasTable && priceDiffers(table, officialKimi) {
+			notes = append(notes, "报价表价格与 Kimi 官网不一致，已按官网价")
+		}
+	case hasTable:
+		t := table
+		chosen = &t
+	case hasImage:
+		chosen = &ModelPrice{InputPerM: officialImage.Input, OutputPerM: officialImage.Output, Currency: "USD", Source: "image_official", Category: "Image", Channel: "token"}
+	case hasGemini:
+		chosen = &ModelPrice{InputPerM: officialGemini.Input, OutputPerM: officialGemini.Output, Currency: "USD", Source: "gemini_official", Category: "Gemini", Channel: "official"}
+	case hasAnthropic:
+		chosen = &ModelPrice{InputPerM: officialAnthropic.Input, OutputPerM: officialAnthropic.Output, Currency: "USD", Source: "anthropic_official", Category: "Anthropic", Channel: "official"}
+	case hasKimi:
+		chosen = &ModelPrice{InputPerM: officialKimi.Input, OutputPerM: officialKimi.Output, Currency: "USD", Source: "kimi_official", Category: "Kimi", Channel: "official"}
+	}
+
+	if chosen == nil {
+		return nil, "缺少官方/报价表定价"
+	}
+
+	if chosen.Currency == "CNY" {
+		chosen = &ModelPrice{
+			InputPerM: chosen.InputPerM / exchangeRate, OutputPerM: chosen.OutputPerM / exchangeRate,
+			Currency: "USD", Source: chosen.Source + "_cny_converted", Category: chosen.Category, Channel: chosen.Channel,
+		}
+		notes = append(notes, "原报价为人民币，已按汇率折算美元")
+	}
+
+	return chosen, strings.Join(notes, "；")
+}
+
+func priceDiffers(table ModelPrice, official PriceUSD) bool {
+	const eps = 1e-9
+	return math.Abs(table.InputPerM-official.Input) > eps || math.Abs(table.OutputPerM-official.Output) > eps
+}
+
+// RowListUSD 单条请求的官方美金刊例（含阶梯与 web_search）。
+func RowListUSD(model string, promptTokens, uncached, cacheRead, cacheWrite5m, cacheWrite1h, output float64,
+	basePrice *ModelPrice, webSearchCalls, webSearchPricePer1k float64) float64 {
+
+	var inp, outp, crp float64
+	if ti, to, tc, ok := ResolveTierPrices(model, promptTokens); ok {
+		inp, outp, crp = ti, to, tc
+	} else if basePrice != nil {
+		inp, outp = basePrice.InputPerM, basePrice.OutputPerM
+		crp = inp * CacheReadMult
+		if v, ok := CacheReadAbsUSD[model]; ok {
+			crp = v
+		}
+	} else {
+		if webSearchCalls > 0 && webSearchPricePer1k > 0 {
+			return webSearchCalls * webSearchPricePer1k / 1000.0
+		}
+		return 0
+	}
+
+	w5p := inp * CacheWrite5mMult
+	w1p := inp * CacheWrite1hMult
+	usd := (uncached*inp + cacheRead*crp + output*outp + cacheWrite5m*w5p + cacheWrite1h*w1p) / 1_000_000
+	if webSearchCalls > 0 && webSearchPricePer1k > 0 {
+		usd += webSearchCalls * webSearchPricePer1k / 1000.0
+	}
+	return usd
+}
+
+// OfficialListUSD 未打折美金刊例：汇总阶段已按请求累计（含阶梯与 web_search）。
+func OfficialListUSD(agg *AggRow) float64 { return agg.OfficialUSD }
+
+// OfficialListCNY 总金额（人民币）= 官方美金 × 汇率（不截断）。
+func OfficialListCNY(agg *AggRow, exchangeRate float64) float64 {
+	return OfficialListUSD(agg) * exchangeRate
+}
+
+func round(v float64, decimals int) float64 {
+	p := math.Pow(10, float64(decimals))
+	return math.Round(v*p) / p
+}
+
+// SettleCNY 结算金额（人民币），保留4位小数。
+func SettleCNY(agg *AggRow) float64 {
+	return round(agg.SiteCNY(), MoneyDecimals)
+}
+
+// ComputeGroupDiscounts 同一分组标识使用同一折扣 = 该组结算人民币合计 / 总金额人民币合计。
+func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool) map[string]float64 {
+	if forcedDiscount != nil {
+		result := make(map[string]float64, len(rows))
+		for _, agg := range rows {
+			result[agg.Group] = round(*forcedDiscount, DiscountDecimals)
+		}
+		return result
+	}
+
+	settleByGroup := map[string]float64{}
+	listByGroup := map[string]float64{}
+	for _, agg := range rows {
+		price, _ := ResolvePrice(agg.Model, book, preferPriceTable, exchangeRate)
+		if price == nil {
+			continue
+		}
+		settleByGroup[agg.Group] += SettleCNY(agg)
+		listByGroup[agg.Group] += OfficialListCNY(agg, exchangeRate)
+	}
+
+	discounts := make(map[string]float64, len(settleByGroup))
+	for group, settle := range settleByGroup {
+		listing := listByGroup[group]
+		raw := 0.0
+		if listing > 0 {
+			raw = settle / listing
+		}
+		discounts[group] = round(raw, DiscountDecimals)
+	}
+	return discounts
+}
+
+// ParseDiscountText 对应 parse_discount_text：兼容百分数、"6折"、纯小数写法。
+func ParseDiscountText(value string) (float64, bool) {
+	text := strings.TrimSpace(value)
+	if text == "" || text == "待定" {
+		return 0, false
+	}
+	if strings.HasSuffix(text, "%") {
+		if f, err := strconv.ParseFloat(strings.TrimSuffix(text, "%"), 64); err == nil {
+			return f / 100.0, true
+		}
+		return 0, false
+	}
+	if strings.HasSuffix(text, "折") {
+		numText := strings.TrimSuffix(text, "折")
+		if n, err := strconv.ParseFloat(numText, 64); err == nil {
+			if n > 1 {
+				return n / 10.0, true
+			}
+			return n, true
+		}
+		return 0, false
+	}
+	if f, err := strconv.ParseFloat(text, 64); err == nil {
+		if f <= 1 {
+			return f, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// SortedGroupNames 按名称排序的分组列表，便于日志/摘要稳定输出。
+func SortedGroupNames(discounts map[string]float64) []string {
+	names := make([]string, 0, len(discounts))
+	for g := range discounts {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+	return names
+}

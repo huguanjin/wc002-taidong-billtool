@@ -1,0 +1,9 @@
+.git
+.github
+frontend/node_modules
+frontend/dist
+frontend/.npm-cache
+backend/*.exe
+backend/*.test
+*.log
+__pycache__

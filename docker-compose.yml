@@ -1,0 +1,34 @@
+services:
+  backend:
+    image: ghcr.io/huguanjin/wc002-taidong-billtool:latest
+    container_name: taidong-bill-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      # 从 .env.example 复制而来，配置登录账号密码（BILL_AUTH_USERNAME / BILL_AUTH_PASSWORD）
+      - .env
+    environment:
+      BILL_ADDR: ":8080"
+      BILL_DATA_DIR: "/app/data"
+      BILL_FRONTEND_DIST: "/app/frontend/dist"
+      BILL_JOB_DIR: "/tmp/taidong-bill-jobs"
+      # 服务器端"可视化选择文件 / 填路径读取源文件"功能的浏览根目录，默认等于 BILL_DATA_DIR
+      # 如需指向单独的源日志目录，在 .env 里设置 BILL_BROWSE_ROOT 即可覆盖（注意与下方 volumes 挂载路径保持一致）
+      BILL_BROWSE_ROOT: "${BILL_BROWSE_ROOT:-/app/data}"
+    volumes:
+      # 账单模板 / 报价表，挂载后可直接替换，无需重新构建镜像
+      - ./data:/app/data
+      # 若源日志单独存放，取消下面注释并同步修改 BILL_BROWSE_ROOT
+      # - ./source-logs:/app/source-logs
+      # 上传/生成的临时文件，容器重启后仍可保留
+      - bill-jobs:/tmp/taidong-bill-jobs
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  bill-jobs:
