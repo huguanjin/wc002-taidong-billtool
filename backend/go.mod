@@ -3,11 +3,13 @@ module taidong-bill-backend
 go 1.25.0
 
 require (
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/xuri/excelize/v2 v2.11.0
 	golang.org/x/text v0.41.0
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/richardlehane/mscfb v1.0.7 // indirect
 	github.com/richardlehane/msoleps v1.0.6 // indirect
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect

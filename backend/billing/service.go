@@ -17,11 +17,27 @@ type GenerateResult struct {
 }
 
 // GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
-func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, params Params) (*GenerateResult, error) {
-	book, err := LoadPriceBook(priceTablePath)
-	if err != nil {
-		return nil, fmt.Errorf("加载报价表失败: %w", err)
+// dbConfig 为空表示未配置业务数据库连接，此时 PriceSourceDB 会报错。
+func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, params Params, dbConfig *DBConfig) (*GenerateResult, error) {
+	var book *PriceBook
+	var err error
+	switch params.PriceSource {
+	case PriceSourceDB:
+		if dbConfig == nil {
+			return nil, fmt.Errorf("未配置数据库连接信息，无法使用数据库实时价格")
+		}
+		book, err = LoadPriceBookFromDB(*dbConfig)
+		if err != nil {
+			return nil, fmt.Errorf("从数据库加载价格失败: %w", err)
+		}
+	default:
+		book, err = LoadPriceBook(priceTablePath)
+		if err != nil {
+			return nil, fmt.Errorf("加载报价表失败: %w", err)
+		}
 	}
+	// official 模式下内置官方价优先；price_table/db 模式下报价表/数据库价格优先。
+	preferPriceTable := params.PriceSource == PriceSourcePriceTable || params.PriceSource == PriceSourceDB
 
 	headers, rows, err := LoadLogRows(inputPath, params.Sheet, params.Encoding)
 	if err != nil {
@@ -56,7 +72,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, par
 		writerIface = sanitizedWriter
 	}
 
-	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, params.PreferPriceTable, writerIface)
+	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, preferPriceTable, writerIface)
 	if sanitizedWriter != nil {
 		if closeErr := sanitizedWriter.Close(); closeErr != nil && aggErr == nil {
 			return nil, fmt.Errorf("写出脱敏日志失败: %w", closeErr)
@@ -82,7 +98,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, par
 		year = agg.Year
 	}
 
-	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, params.Discount, exchangeRate, params.PreferPriceTable)
+	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, params.Discount, exchangeRate, preferPriceTable)
 	if err != nil {
 		return nil, fmt.Errorf("写出账单失败: %w", err)
 	}
@@ -93,7 +109,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, par
 		}
 	}
 
-	summary := buildSummary(agg, book, exchangeRate, params.PreferPriceTable, missingPrices)
+	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices)
 
 	return &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}, nil
 }

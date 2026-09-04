@@ -91,7 +91,7 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 	result, err := GenerateBill(logPath, templatePath, priceTablePath, outDir, Params{
 		ExchangeRate: 7,
 		SanitizedLog: true,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("GenerateBill 失败: %v", err)
 	}

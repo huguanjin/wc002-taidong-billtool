@@ -44,6 +44,15 @@ func NewPriceBook() *PriceBook {
 	return &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
 }
 
+// PriceSource 模型单价来源：内置官方价 / 人工维护报价表(xlsx) / 业务数据库实时。
+type PriceSource string
+
+const (
+	PriceSourceOfficial   PriceSource = "official"
+	PriceSourcePriceTable PriceSource = "price_table"
+	PriceSourceDB         PriceSource = "db"
+)
+
 // Params 一次出账请求的参数，对应 log_to_bill.py 的命令行参数。
 type Params struct {
 	Month             int     // 0 表示未指定，从日志推断
@@ -53,7 +62,7 @@ type Params struct {
 	KeepLog           bool
 	SanitizedLog      bool
 	SanitizedFormat   string // "xlsx"（默认，为空时等同）| "csv" | "tsv"
-	PreferPriceTable  bool
+	PriceSource       PriceSource // 空值等同 PriceSourceOfficial
 	Sheet             string
 	Encoding          string
 }

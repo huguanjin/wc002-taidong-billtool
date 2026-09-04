@@ -110,7 +110,7 @@ const form = ref({
   year: '',
   exchangeRate: 7,
   discount: '',
-  preferPriceTable: false,
+  priceSource: 'official',
   sanitizedLog: true,
   sanitizedFormat: 'xlsx',
   keepLog: false,
@@ -162,7 +162,7 @@ async function handleSubmit() {
   if (form.value.year !== '') fd.append('year', String(form.value.year))
   if (form.value.exchangeRate !== '') fd.append('exchangeRate', String(form.value.exchangeRate))
   if (form.value.discount !== '') fd.append('discount', String(form.value.discount))
-  fd.append('preferPriceTable', String(form.value.preferPriceTable))
+  fd.append('priceSource', form.value.priceSource)
   fd.append('sanitizedLog', String(form.value.sanitizedLog))
   fd.append('sanitizedFormat', form.value.sanitizedFormat)
   fd.append('keepLog', String(form.value.keepLog))
@@ -262,8 +262,16 @@ async function handleSubmit() {
         </div>
       </div>
 
+      <div class="field">
+        <label>模型单价来源</label>
+        <select v-model="form.priceSource">
+          <option value="official">内置官方价（覆盖不到的模型自动回退报价表）</option>
+          <option value="price_table">人工维护报价表（data/price_table.xlsx 优先）</option>
+          <option value="db">业务数据库实时价格（options 表优先，5 分钟缓存）</option>
+        </select>
+      </div>
+
       <div class="checkboxes">
-        <label><input v-model="form.preferPriceTable" type="checkbox" /> Claude 也优先用报价表</label>
         <label><input v-model="form.sanitizedLog" type="checkbox" /> 生成脱敏日志</label>
         <label><input v-model="form.keepLog" type="checkbox" /> 附带原日志到账单文件</label>
       </div>

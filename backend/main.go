@@ -22,6 +22,7 @@ var (
 	dataDir      string
 	jobDir       string
 	frontendDist string
+	dbConfig     *billing.DBConfig // 为空表示未配置业务数据库，PriceSourceDB 不可用
 )
 
 type jobRecord struct {
@@ -58,6 +59,7 @@ func main() {
 
 	initAuth()
 	initBrowseRoot()
+	initDBConfig()
 
 	go cleanupOldJobs()
 	go cleanupSessions()
@@ -83,6 +85,22 @@ func main() {
 	}
 	log.Printf("监听 %s，数据目录: %s", addr, dataDir)
 	log.Fatal(http.ListenAndServe(addr, mux))
+}
+
+// initDBConfig 从环境变量读取业务数据库连接信息；BILL_DB_HOST 为空表示未配置，dbConfig 保持 nil。
+func initDBConfig() {
+	host := os.Getenv("BILL_DB_HOST")
+	if host == "" {
+		return
+	}
+	dbConfig = &billing.DBConfig{
+		Host:     host,
+		Port:     os.Getenv("BILL_DB_PORT"),
+		User:     os.Getenv("BILL_DB_USER"),
+		Password: os.Getenv("BILL_DB_PASSWORD"),
+		DBName:   os.Getenv("BILL_DB_NAME"),
+		Table:    os.Getenv("BILL_DB_TABLE"),
+	}
 }
 
 func withCORS(h http.HandlerFunc) http.HandlerFunc {
@@ -144,7 +162,10 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 			params.Discount = &f
 		}
 	}
-	params.PreferPriceTable = formValue(form, "preferPriceTable") == "true"
+	params.PriceSource = billing.PriceSource(formValue(form, "priceSource"))
+	if params.PriceSource == "" && formValue(form, "preferPriceTable") == "true" {
+		params.PriceSource = billing.PriceSourcePriceTable // 兼容旧版前端的 preferPriceTable 复选框
+	}
 	params.KeepLog = formValue(form, "keepLog") == "true"
 	if v := formValue(form, "sanitizedLog"); v != "" {
 		params.SanitizedLog = v == "true"
@@ -156,7 +177,7 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	templatePath := filepath.Join(dataDir, "bill_template.xlsx")
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
 
-	result, err := billing.GenerateBill(inputPath, templatePath, priceTablePath, jobPath, params)
+	result, err := billing.GenerateBill(inputPath, templatePath, priceTablePath, jobPath, params, dbConfig)
 	if err != nil {
 		httpError(w, http.StatusUnprocessableEntity, err.Error())
 		return
