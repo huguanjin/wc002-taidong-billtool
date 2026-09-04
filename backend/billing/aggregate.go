@@ -208,6 +208,34 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 	}, nil
 }
 
+// ExtractDistinctModels 提取日志中出现的去重模型名（按名称排序），用于生成账单前
+// 检查价格覆盖情况，不做完整聚合。
+func ExtractDistinctModels(headers []string, rows [][]string) ([]string, error) {
+	col := map[string]int{}
+	for i, h := range headers {
+		if h != "" {
+			col[h] = i
+		}
+	}
+	idxModel, ok := col["model_name"]
+	if !ok {
+		return nil, fmt.Errorf("日志缺少列: [model_name]；实际列: %v", headers)
+	}
+
+	seen := map[string]bool{}
+	var models []string
+	for _, row := range rows {
+		model := strings.TrimSpace(cellAt(row, idxModel))
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	return models, nil
+}
+
 func parseUnixTimestamp(v string) (int64, bool) {
 	s := strings.TrimSpace(v)
 	if s == "" {

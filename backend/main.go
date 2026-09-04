@@ -70,6 +70,7 @@ func main() {
 	mux.HandleFunc("/api/session", withCORS(handleSession))
 	mux.HandleFunc("/api/bill", withCORS(requireAuth(handleGenerateBill)))
 	mux.HandleFunc("/api/pull-db-prices", withCORS(requireAuth(handlePullDBPrices)))
+	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -107,6 +108,89 @@ func initDBConfig() {
 // dbPriceCachePath 手动拉取数据库价格落盘的位置，与 data 目录一起挂载，重启容器后仍可读取。
 func dbPriceCachePath() string {
 	return filepath.Join(dataDir, "db_price_cache.json")
+}
+
+// loadPriceBookForSource 按价格来源加载 PriceBook，GenerateBill 与 handleCheckMissingPrices 共用。
+func loadPriceBookForSource(source billing.PriceSource, priceTablePath string) (*billing.PriceBook, error) {
+	if source == billing.PriceSourceDB {
+		book, _, err := billing.LoadPriceBookFromDBCacheFile(dbPriceCachePath())
+		return book, err
+	}
+	book, err := billing.LoadPriceBook(priceTablePath)
+	if err != nil {
+		return nil, fmt.Errorf("加载报价表失败: %w", err)
+	}
+	return book, nil
+}
+
+// handleCheckMissingPrices 出账前预检：列出日志里出现的模型在当前价格来源下有没有找不到定价的，
+// 不写任何文件，处理完立即清理临时上传的日志文件。
+func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(200 << 20); err != nil {
+		httpError(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+		return
+	}
+
+	jobID := newJobID()
+	jobPath := filepath.Join(jobDir, jobID)
+	if err := os.MkdirAll(jobPath, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer os.RemoveAll(jobPath)
+
+	inputPath, err := resolveInputFile(r, jobPath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	form := r.MultipartForm.Value
+	priceSource := billing.PriceSource(formValue(form, "priceSource"))
+	sheet := formValue(form, "sheet")
+	encoding := formValue(form, "encoding")
+
+	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
+	book, err := loadPriceBookForSource(priceSource, priceTablePath)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	preferPriceTable := priceSource == billing.PriceSourcePriceTable || priceSource == billing.PriceSourceDB
+
+	exchangeRate := billing.DefaultExchangeRate
+	if v := formValue(form, "exchangeRate"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			exchangeRate = f
+		}
+	}
+
+	headers, rows, err := billing.LoadLogRows(inputPath, sheet, encoding)
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, "读取日志失败: "+err.Error())
+		return
+	}
+	models, err := billing.ExtractDistinctModels(headers, rows)
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	var missingModels []string
+	for _, model := range models {
+		if price, _ := billing.ResolvePrice(model, book, preferPriceTable, exchangeRate); price == nil {
+			missingModels = append(missingModels, model)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"modelCount":    len(models),
+		"missingModels": missingModels,
+	})
 }
 
 // handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。
@@ -200,6 +284,14 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	params.SanitizedFormat = formValue(form, "sanitizedFormat")
 	params.Sheet = formValue(form, "sheet")
 	params.Encoding = formValue(form, "encoding")
+	if v := formValue(form, "manualPrices"); v != "" {
+		var manual map[string]billing.ManualPriceInput
+		if err := json.Unmarshal([]byte(v), &manual); err != nil {
+			httpError(w, http.StatusBadRequest, "解析手动补全价格失败: "+err.Error())
+			return
+		}
+		params.ManualPrices = manual
+	}
 
 	templatePath := filepath.Join(dataDir, "bill_template.xlsx")
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")

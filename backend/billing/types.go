@@ -53,6 +53,12 @@ const (
 	PriceSourceDB         PriceSource = "db"
 )
 
+// ManualPriceInput 用户在「检查模型价格覆盖」环节手动补全的单模型单价（USD/MTok）。
+type ManualPriceInput struct {
+	InputPerM  float64 `json:"inputPerM"`
+	OutputPerM float64 `json:"outputPerM"`
+}
+
 // Params 一次出账请求的参数，对应 log_to_bill.py 的命令行参数。
 type Params struct {
 	Month             int     // 0 表示未指定，从日志推断
@@ -65,6 +71,9 @@ type Params struct {
 	PriceSource       PriceSource // 空值等同 PriceSourceOfficial
 	Sheet             string
 	Encoding          string
+	// ManualPrices 缺失定价模型的手动补全价格，键为日志里的原始模型名，
+	// 生成账单时会合并进 PriceBook.ByModel（Source: "manual_override"）。
+	ManualPrices map[string]ManualPriceInput
 }
 
 // Summary 返回给前端展示的结果摘要。

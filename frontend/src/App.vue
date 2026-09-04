@@ -124,6 +124,13 @@ const pullingPrices = ref(false)
 const pullPricesMsg = ref('')
 const pullPricesError = ref('')
 
+const checkingPrices = ref(false)
+const checkPricesError = ref('')
+const priceCheckDone = ref(false)
+const checkedModelCount = ref(0)
+const missingModels = ref([])
+const manualPrices = ref({})
+
 async function pullDbPrices() {
   pullingPrices.value = true
   pullPricesMsg.value = ''
@@ -164,25 +171,65 @@ const hasMissingPrice = computed(
   () => result.value && result.value.summary.missingPriceModels && result.value.summary.missingPriceModels.length > 0
 )
 
+// appendSourceFields 把当前选择的日志来源（上传文件 或 服务器路径）写入 FormData，
+// 供生成账单和检查价格覆盖两个请求共用。返回 false 表示校验未通过（已写入 errorMsg）。
+function appendSourceFields(fd, errRef) {
+  if (sourceMode.value === 'upload') {
+    const file = fileInput.value && fileInput.value.files && fileInput.value.files[0]
+    if (!file) {
+      errRef.value = '请先选择日志文件（.xlsx / .csv / .tsv）'
+      return false
+    }
+    fd.append('file', file)
+  } else {
+    if (!serverPath.value.trim()) {
+      errRef.value = '请填写服务器上的源文件路径，或点击「浏览服务器文件」选择'
+      return false
+    }
+    fd.append('serverPath', serverPath.value.trim())
+  }
+  return true
+}
+
+async function checkMissingPrices() {
+  checkPricesError.value = ''
+  priceCheckDone.value = false
+
+  const fd = new FormData()
+  if (!appendSourceFields(fd, checkPricesError)) return
+  fd.append('priceSource', form.value.priceSource)
+  if (form.value.exchangeRate !== '') fd.append('exchangeRate', String(form.value.exchangeRate))
+
+  checkingPrices.value = true
+  try {
+    const resp = await fetch('/api/check-prices', { method: 'POST', body: fd })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      checkPricesError.value = data.error || `检查失败（${resp.status}）`
+      return
+    }
+    checkedModelCount.value = data.modelCount || 0
+    missingModels.value = data.missingModels || []
+    const nextManual = {}
+    for (const model of missingModels.value) {
+      nextManual[model] = manualPrices.value[model] || { input: '', output: '' }
+    }
+    manualPrices.value = nextManual
+    priceCheckDone.value = true
+  } catch (err) {
+    checkPricesError.value = '检查失败：' + err.message
+  } finally {
+    checkingPrices.value = false
+  }
+}
+
 async function handleSubmit() {
   errorMsg.value = ''
   result.value = null
 
   const fd = new FormData()
-  if (sourceMode.value === 'upload') {
-    const file = fileInput.value && fileInput.value.files && fileInput.value.files[0]
-    if (!file) {
-      errorMsg.value = '请先选择日志文件（.xlsx / .csv / .tsv）'
-      return
-    }
-    fd.append('file', file)
-  } else {
-    if (!serverPath.value.trim()) {
-      errorMsg.value = '请填写服务器上的源文件路径，或点击「浏览服务器文件」选择'
-      return
-    }
-    fd.append('serverPath', serverPath.value.trim())
-  }
+  if (!appendSourceFields(fd, errorMsg)) return
   if (form.value.month !== '') fd.append('month', String(form.value.month))
   if (form.value.year !== '') fd.append('year', String(form.value.year))
   if (form.value.exchangeRate !== '') fd.append('exchangeRate', String(form.value.exchangeRate))
@@ -191,6 +238,16 @@ async function handleSubmit() {
   fd.append('sanitizedLog', String(form.value.sanitizedLog))
   fd.append('sanitizedFormat', form.value.sanitizedFormat)
   fd.append('keepLog', String(form.value.keepLog))
+
+  const manualEntries = {}
+  for (const [model, p] of Object.entries(manualPrices.value)) {
+    if (p.input !== '' && p.output !== '' && p.input !== undefined && p.output !== undefined) {
+      manualEntries[model] = { inputPerM: Number(p.input), outputPerM: Number(p.output) }
+    }
+  }
+  if (Object.keys(manualEntries).length > 0) {
+    fd.append('manualPrices', JSON.stringify(manualEntries))
+  }
 
   loading.value = true
   try {
@@ -301,6 +358,36 @@ async function handleSubmit() {
         </div>
         <span class="hint" v-if="form.priceSource === 'db' && pullPricesMsg">{{ pullPricesMsg }}</span>
         <p class="error" v-if="form.priceSource === 'db' && pullPricesError">{{ pullPricesError }}</p>
+        <div class="path-row">
+          <button type="button" class="btn-browse" @click="checkMissingPrices" :disabled="checkingPrices">
+            {{ checkingPrices ? '检查中…' : '检查模型价格覆盖' }}
+          </button>
+        </div>
+        <p class="error" v-if="checkPricesError">{{ checkPricesError }}</p>
+        <span class="hint" v-if="priceCheckDone && missingModels.length === 0">
+          已检查 {{ checkedModelCount }} 个模型，当前价格来源均能匹配到定价。
+        </span>
+      </div>
+
+      <div class="card" v-if="priceCheckDone && missingModels.length > 0">
+        <h3>缺少定价的模型（{{ missingModels.length }} / {{ checkedModelCount }}）</h3>
+        <p class="hint">可在下方手动填写单价（$/MTok）补全；留空的模型仍按现有规则处理（无价则总金额/结算美金为 0）。</p>
+        <table>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>输入单价 ($/MTok)</th>
+              <th>输出单价 ($/MTok)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="model in missingModels" :key="model">
+              <td>{{ model }}</td>
+              <td><input v-model="manualPrices[model].input" type="number" step="0.01" min="0" /></td>
+              <td><input v-model="manualPrices[model].output" type="number" step="0.01" min="0" /></td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="checkboxes">
@@ -628,6 +715,14 @@ th, td {
 }
 th:nth-child(1), th:nth-child(2), td:nth-child(1), td:nth-child(2) {
   text-align: left;
+}
+td input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  text-align: right;
 }
 thead {
   background: #f7f8fa;

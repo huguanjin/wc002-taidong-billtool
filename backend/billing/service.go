@@ -35,6 +35,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 	}
 	// official 模式下内置官方价优先；price_table/db 模式下报价表/数据库价格优先。
 	preferPriceTable := params.PriceSource == PriceSourcePriceTable || params.PriceSource == PriceSourceDB
+	mergeManualPrices(book, params.ManualPrices)
 
 	headers, rows, err := LoadLogRows(inputPath, params.Sheet, params.Encoding)
 	if err != nil {
@@ -109,6 +110,17 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices)
 
 	return &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}, nil
+}
+
+// mergeManualPrices 把用户手动补全的价格写入 book.ByModel，作为「哪里都找不到定价」时的
+// 最后兜底；已有官方价/报价表条目的模型不受影响（ResolvePrice 仍优先选官方价）。
+func mergeManualPrices(book *PriceBook, manual map[string]ManualPriceInput) {
+	for model, p := range manual {
+		book.ByModel[model] = ModelPrice{
+			InputPerM: p.InputPerM, OutputPerM: p.OutputPerM, Currency: "USD",
+			Source: "manual_override", Category: "手动补全", Channel: "manual",
+		}
+	}
 }
 
 func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string) Summary {

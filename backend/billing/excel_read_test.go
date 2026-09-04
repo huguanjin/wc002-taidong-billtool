@@ -56,6 +56,39 @@ func TestLoadLogRowsTSV(t *testing.T) {
 	}
 }
 
+// TestExtractDistinctModels 覆盖去重、排序、以及缺少 model_name 列时报错。
+func TestExtractDistinctModels(t *testing.T) {
+	headers := []string{"model_name", "group"}
+	rows := [][]string{
+		{"gpt-5.4", "vip"},
+		{"claude-sonnet-5", "default"},
+		{"gpt-5.4", "default"},
+		{" claude-sonnet-5 ", "vip"},
+		{"", "vip"},
+	}
+	models, err := ExtractDistinctModels(headers, rows)
+	if err != nil {
+		t.Fatalf("ExtractDistinctModels 失败: %v", err)
+	}
+	want := []string{"claude-sonnet-5", "gpt-5.4"}
+	if len(models) != len(want) {
+		t.Fatalf("期望 %v，实际 %v", want, models)
+	}
+	for i := range want {
+		if models[i] != want[i] {
+			t.Errorf("期望 %v，实际 %v", want, models)
+			break
+		}
+	}
+}
+
+func TestExtractDistinctModelsMissingColumn(t *testing.T) {
+	headers := []string{"group", "quota"}
+	if _, err := ExtractDistinctModels(headers, [][]string{{"default", "100"}}); err == nil {
+		t.Fatal("期望缺少 model_name 列时报错，实际未报错")
+	}
+}
+
 // TestDetectDelimiterMisnamedCSV 覆盖「扩展名是 .csv 但内容其实是 Tab 分隔」的兼容场景。
 func TestDetectDelimiterMisnamedCSV(t *testing.T) {
 	dir := t.TempDir()
