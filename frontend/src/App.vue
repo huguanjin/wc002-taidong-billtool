@@ -120,6 +120,31 @@ const loading = ref(false)
 const errorMsg = ref('')
 const result = ref(null)
 
+const pullingPrices = ref(false)
+const pullPricesMsg = ref('')
+const pullPricesError = ref('')
+
+async function pullDbPrices() {
+  pullingPrices.value = true
+  pullPricesMsg.value = ''
+  pullPricesError.value = ''
+  try {
+    const resp = await fetch('/api/pull-db-prices', { method: 'POST' })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      pullPricesError.value = data.error || `拉取失败（${resp.status}）`
+      return
+    }
+    const fetchedAt = new Date(data.fetchedAt).toLocaleString('zh-CN')
+    pullPricesMsg.value = `已拉取 ${data.modelCount} 个模型价格，时间：${fetchedAt}`
+  } catch (err) {
+    pullPricesError.value = '请求失败：' + err.message
+  } finally {
+    pullingPrices.value = false
+  }
+}
+
 function onFileChange(e) {
   const file = e.target.files && e.target.files[0]
   selectedFileName.value = file ? file.name : ''
@@ -267,8 +292,15 @@ async function handleSubmit() {
         <select v-model="form.priceSource">
           <option value="official">内置官方价（覆盖不到的模型自动回退报价表）</option>
           <option value="price_table">人工维护报价表（data/price_table.xlsx 优先）</option>
-          <option value="db">业务数据库实时价格（options 表优先，5 分钟缓存）</option>
+          <option value="db">业务数据库实时价格（需先手动拉取）</option>
         </select>
+        <div class="path-row" v-if="form.priceSource === 'db'">
+          <button type="button" class="btn-browse" @click="pullDbPrices" :disabled="pullingPrices">
+            {{ pullingPrices ? '拉取中…' : '拉取最新数据库价格' }}
+          </button>
+        </div>
+        <span class="hint" v-if="form.priceSource === 'db' && pullPricesMsg">{{ pullPricesMsg }}</span>
+        <p class="error" v-if="form.priceSource === 'db' && pullPricesError">{{ pullPricesError }}</p>
       </div>
 
       <div class="checkboxes">

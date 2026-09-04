@@ -17,18 +17,15 @@ type GenerateResult struct {
 }
 
 // GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
-// dbConfig 为空表示未配置业务数据库连接，此时 PriceSourceDB 会报错。
-func GenerateBill(inputPath, templatePath, priceTablePath, outputDir string, params Params, dbConfig *DBConfig) (*GenerateResult, error) {
+// dbPriceCachePath 是「拉取最新数据库价格」写出的本地 JSON 文件路径，出账时只读此文件，不连接数据库。
+func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, outputDir string, params Params) (*GenerateResult, error) {
 	var book *PriceBook
 	var err error
 	switch params.PriceSource {
 	case PriceSourceDB:
-		if dbConfig == nil {
-			return nil, fmt.Errorf("未配置数据库连接信息，无法使用数据库实时价格")
-		}
-		book, err = LoadPriceBookFromDB(*dbConfig)
+		book, _, err = LoadPriceBookFromDBCacheFile(dbPriceCachePath)
 		if err != nil {
-			return nil, fmt.Errorf("从数据库加载价格失败: %w", err)
+			return nil, err
 		}
 	default:
 		book, err = LoadPriceBook(priceTablePath)

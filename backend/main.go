@@ -69,6 +69,7 @@ func main() {
 	mux.HandleFunc("/api/logout", withCORS(handleLogout))
 	mux.HandleFunc("/api/session", withCORS(handleSession))
 	mux.HandleFunc("/api/bill", withCORS(requireAuth(handleGenerateBill)))
+	mux.HandleFunc("/api/pull-db-prices", withCORS(requireAuth(handlePullDBPrices)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -101,6 +102,32 @@ func initDBConfig() {
 		DBName:   os.Getenv("BILL_DB_NAME"),
 		Table:    os.Getenv("BILL_DB_TABLE"),
 	}
+}
+
+// dbPriceCachePath 手动拉取数据库价格落盘的位置，与 data 目录一起挂载，重启容器后仍可读取。
+func dbPriceCachePath() string {
+	return filepath.Join(dataDir, "db_price_cache.json")
+}
+
+// handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。
+func handlePullDBPrices(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if dbConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置数据库连接信息（BILL_DB_HOST 等环境变量）")
+		return
+	}
+	count, fetchedAt, err := billing.PullPriceBookFromDB(*dbConfig, dbPriceCachePath())
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"modelCount": count,
+		"fetchedAt":  fetchedAt.Format(time.RFC3339),
+	})
 }
 
 func withCORS(h http.HandlerFunc) http.HandlerFunc {
@@ -177,7 +204,7 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	templatePath := filepath.Join(dataDir, "bill_template.xlsx")
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
 
-	result, err := billing.GenerateBill(inputPath, templatePath, priceTablePath, jobPath, params, dbConfig)
+	result, err := billing.GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath(), jobPath, params)
 	if err != nil {
 		httpError(w, http.StatusUnprocessableEntity, err.Error())
 		return
