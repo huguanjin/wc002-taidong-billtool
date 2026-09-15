@@ -132,6 +132,9 @@ const browserRoot = ref('')
 const browserPath = ref('')
 const browserParent = ref('')
 const browserEntries = ref([])
+// 合并日志要一次选多个文件，所以浏览器支持多选模式；普通出账仍是单选即关闭。
+const browserMode = ref('single')
+const browserPicked = ref([])
 
 async function loadBrowse(path) {
   browserLoading.value = true
@@ -156,12 +159,60 @@ async function loadBrowse(path) {
 }
 
 function openBrowser() {
+  browserMode.value = 'single'
+  browserPicked.value = []
+  browserOpen.value = true
+  loadBrowse('')
+}
+
+// 合并用：多选服务器上的日志文件，路径以文本形式回填到多行输入框。
+function openMergeBrowser() {
+  browserMode.value = 'multi'
+  browserPicked.value = []
   browserOpen.value = true
   loadBrowse('')
 }
 
 function closeBrowser() {
   browserOpen.value = false
+}
+
+function isPicked(entry) {
+  return browserPicked.value.some((p) => p.path === entry.path)
+}
+
+// 多选模式下点文件是勾选/取消勾选，点目录仍是进出目录。
+function pickEntry(entry) {
+  if (browserMode.value === 'single') {
+    pickFile(entry)
+    return
+  }
+  if (entry.isDir) {
+    loadBrowse(entry.path)
+    return
+  }
+  const idx = browserPicked.value.findIndex((p) => p.path === entry.path)
+  if (idx >= 0) browserPicked.value.splice(idx, 1)
+  else browserPicked.value.push(entry)
+}
+
+function confirmBrowserPick() {
+  if (browserMode.value === 'single') {
+    browserOpen.value = false
+    return
+  }
+  browserOpen.value = false
+  if (browserPicked.value.length === 0) return
+  const picked = browserPicked.value.map((e) => e.path)
+  const existing = mergeServerPaths.value
+    .split('\n')
+    .map((p) => p.trim())
+    .filter((p) => p !== '')
+  const merged = existing.slice()
+  for (const p of picked) {
+    if (!merged.includes(p)) merged.push(p)
+  }
+  mergeServerPaths.value = merged.join('\n')
 }
 
 function pickFile(entry) {
@@ -389,12 +440,18 @@ async function handleSubmit() {
 
       <div class="field" v-else>
         <label>服务器文件路径（每行一个，至少两个）</label>
-        <textarea
-          v-model="mergeServerPaths"
-          rows="3"
-          placeholder="logs/8月上旬日志.xlsx&#10;logs/8月下旬日志.xlsx"
-        ></textarea>
-        <span class="hint">相对路径基于浏览根目录（BILL_BROWSE_ROOT），也可填写该目录下的绝对路径</span>
+        <div class="path-row">
+          <textarea
+            v-model="mergeServerPaths"
+            rows="3"
+            placeholder="logs/8月上旬日志.xlsx&#10;logs/8月下旬日志.xlsx"
+          ></textarea>
+          <button type="button" class="btn-browse" @click="openMergeBrowser">浏览服务器文件</button>
+        </div>
+        <span class="hint">
+          相对路径基于浏览根目录（BILL_BROWSE_ROOT），也可填写该目录下的绝对路径；
+          点右侧按钮可进目录连续勾选多个文件
+        </span>
       </div>
 
       <div class="grid">
@@ -591,7 +648,7 @@ async function handleSubmit() {
     <div class="modal-mask" v-if="browserOpen" @click.self="closeBrowser">
       <div class="modal-box">
         <div class="modal-header">
-          <h3>选择服务器文件</h3>
+          <h3>{{ browserMode === 'multi' ? '选择要合并的服务器文件（可多选）' : '选择服务器文件' }}</h3>
           <button type="button" class="btn-close" @click="closeBrowser">×</button>
         </div>
         <p class="hint">根目录：{{ browserRoot }}　当前：/{{ browserPath }}</p>
@@ -602,13 +659,31 @@ async function handleSubmit() {
             class="browser-row"
             v-for="entry in browserEntries"
             :key="entry.path"
-            @click="entry.isDir ? loadBrowse(entry.path) : pickFile(entry)"
+            :class="{ picked: browserMode === 'multi' && !entry.isDir && isPicked(entry) }"
+            @click="pickEntry(entry)"
           >
-            <span>{{ entry.isDir ? '📁' : '📄' }} {{ entry.name }}</span>
+            <span>
+              <input
+                v-if="browserMode === 'multi' && !entry.isDir"
+                type="checkbox"
+                :checked="isPicked(entry)"
+                @click.stop="pickEntry(entry)"
+              />
+              {{ entry.isDir ? '📁' : '📄' }} {{ entry.name }}
+            </span>
             <span class="browser-meta" v-if="!entry.isDir">{{ entry.modTime }}</span>
           </div>
           <p class="hint" v-if="!browserLoading && browserEntries.length === 0">（空目录）</p>
           <p class="hint" v-if="browserLoading">加载中…</p>
+        </div>
+        <div class="modal-footer" v-if="browserMode === 'multi'">
+          <span class="hint">已勾选 {{ browserPicked.length }} 个文件</span>
+          <div>
+            <button type="button" class="btn-browse" @click="closeBrowser">取消</button>
+            <button type="button" @click="confirmBrowserPick" :disabled="browserPicked.length === 0">
+              加入路径列表
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -679,12 +754,16 @@ textarea {
 .path-row {
   display: flex;
   gap: 8px;
+  align-items: flex-start;
 }
 .path-row input {
   flex: 1;
   padding: 6px 8px;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.path-row textarea {
+  flex: 1;
 }
 .btn-browse {
   background: #f0f4ff;
@@ -747,6 +826,23 @@ textarea {
 }
 .browser-row:hover {
   background: #f7f8fa;
+}
+.browser-row.picked {
+  background: #eef4ff;
+}
+.browser-row input[type='checkbox'] {
+  margin-right: 4px;
+  cursor: pointer;
+}
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+.modal-footer button {
+  margin-left: 8px;
 }
 .browser-meta {
   color: #999;
