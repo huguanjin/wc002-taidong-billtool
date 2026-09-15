@@ -1,5 +1,7 @@
 package billing
 
+import "time"
+
 // ModelPrice 单模型单价（已换算为 USD/MTok）。
 type ModelPrice struct {
 	InputPerM  float64
@@ -33,6 +35,10 @@ type AggRow struct {
 	// ExprTiers 本账期内表达式命中的档位名集合（按首次命中顺序），
 	// 用于在账单里说明这行的刊例由哪几档混合而成。
 	ExprTiers []string
+	// LastAt 本行最后一次请求发生的时刻（日志 created_at），为零值表示日志没有该列。
+	// 折算表达式单价时必须用它，而不是出账时刻——deepseek-v4.1-flash 这类
+	// 表达式带 hour("Asia/Shanghai") 峰谷倍率，用 now() 会得到与账期无关的单价。
+	LastAt time.Time
 }
 
 // SiteCNY 站点人民币 = quota / 500000。

@@ -215,7 +215,11 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 
 		if hasCreated {
 			if ts, ok := parseUnixTimestamp(cellAt(row, idxCreated)); ok && ts > 0 {
-				dt := time.Unix(ts, 0).In(cstLocation)
+				dt := time.Unix(ts, 0)
+				if dt.After(agg.LastAt) {
+					agg.LastAt = dt
+				}
+				dt = dt.In(cstLocation)
 				monthCounter[int(dt.Month())]++
 				yearCounter[dt.Year()]++
 			}

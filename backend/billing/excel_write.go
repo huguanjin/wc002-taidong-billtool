@@ -262,13 +262,29 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			consistent := false
 			switch {
 			case hasExpr:
-				// 单价列取自表达式在当前上下文长度下的等效系数，
+				// 单价列取自表达式在该行实际请求时刻、该上下文长度下的等效系数。
+				// 时刻不能用 now()：峰谷倍率（hour()）依赖请求当时的时间点。
 				// 表达式含图片/音频等附加项时无法折算成单价，留空。
-				rates, err := ExtractExprRates(agg.BillingExpr, time.Now(), agg.Uncached+agg.CacheRead+agg.CacheWrite5m+agg.CacheWrite1h)
+				at := agg.LastAt
+				if at.IsZero() {
+					at = time.Now()
+				}
+				rates, err := ExtractExprRates(agg.BillingExpr, at, agg.Uncached+agg.CacheRead+agg.CacheWrite5m+agg.CacheWrite1h)
 				if err == nil {
 					display = ModelPrice{InputPerM: rates.InputPerM, OutputPerM: rates.OutputPerM, Currency: "USD", Source: "expr"}
 					readP, w5P, w1P = rates.CacheReadPerM, rates.CacheWritePerM, rates.CacheWrite1hPerM
 					consistent = rates.Pure
+					if rates.Pure {
+						// Y/Z/AA 三个「列表价」列按表达式系数回填：
+						// Y 缓存未命中（输入）单价，同 E 列口径；
+						// Z 缓存读单价，同 G 列口径（表达式未引用 cr 时为 0，留空）；
+						// AA 输出单价。表达式含图片/音频附加项时单价不足以还原金额，三列都留空。
+						setNum(25, r, rates.InputPerM, styleMoney)
+						if rates.CacheReadPerM != 0 {
+							setNum(26, r, rates.CacheReadPerM, styleMoney)
+						}
+						setNum(27, r, rates.OutputPerM, styleMoney)
+					}
 				}
 			case isTiered:
 				tier := TieredModelPrices[agg.Model]
@@ -298,6 +314,17 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 				setStr(24, r, "是")
 			} else {
 				setStr(24, r, "否")
+			}
+		}
+
+		// 阶梯计费模型在备注里留下价档说明：整月都落在同一档时只记档位名，
+		// 跨档时写明是哪几档混合，便于客户核对刊例为什么不是「单价×总量」。
+		if hasExpr && len(agg.ExprTiers) > 0 {
+			if len(agg.ExprTiers) == 1 {
+				setStr(28, r, "阶梯计费，本行命中档位："+strings.Join(agg.ExprTiers, "、"))
+			} else {
+				setStr(28, r, fmt.Sprintf("阶梯计费，本行跨 %d 档混合计价：%s",
+					len(agg.ExprTiers), strings.Join(agg.ExprTiers, "、")))
 			}
 		}
 	}
