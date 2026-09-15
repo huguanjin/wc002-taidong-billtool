@@ -101,6 +101,10 @@ func DetectCSVEncoding(path, preferred string) (encoding string, content string,
 
 // LoadLogRows 读取日志 xlsx/csv/tsv，返回表头与数据行（不含表头）。
 func LoadLogRows(path, sheetName, encoding string) (headers []string, rows [][]string, err error) {
+	return readLogRows(path, sheetName, encoding)
+}
+
+func readLogRows(path, sheetName, encoding string) (headers []string, rows [][]string, err error) {
 	if IsDelimitedText(path) {
 		_, text, err := DetectCSVEncoding(path, encoding)
 		if err != nil {

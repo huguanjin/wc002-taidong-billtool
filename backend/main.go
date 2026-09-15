@@ -28,6 +28,7 @@ var (
 type jobRecord struct {
 	billPath      string
 	sanitizedPath string
+	mergedPath    string
 	createdAt     time.Time
 }
 
@@ -69,6 +70,7 @@ func main() {
 	mux.HandleFunc("/api/logout", withCORS(handleLogout))
 	mux.HandleFunc("/api/session", withCORS(handleSession))
 	mux.HandleFunc("/api/bill", withCORS(requireAuth(handleGenerateBill)))
+	mux.HandleFunc("/api/merge-logs", withCORS(requireAuth(handleMergeLogs)))
 	mux.HandleFunc("/api/pull-db-prices", withCORS(requireAuth(handlePullDBPrices)))
 	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
@@ -319,6 +321,67 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleMergeLogs 把多个日志文件合并成一个，结果按用户选择的格式写到 data 目录，
+// 同时登记成本次任务，前端可直接下载（data 目录对浏览器不可见，只能走下载接口）。
+func handleMergeLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(200 << 20); err != nil {
+		httpError(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+		return
+	}
+
+	jobID := newJobID()
+	jobPath := filepath.Join(jobDir, jobID)
+	if err := os.MkdirAll(jobPath, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer os.RemoveAll(jobPath)
+
+	inputPaths, err := resolveInputFiles(r, jobPath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(inputPaths) < 2 {
+		httpError(w, http.StatusBadRequest, "至少需要选择两个日志文件才能合并")
+		return
+	}
+
+	form := r.MultipartForm.Value
+	result, err := billing.MergeLogs(inputPaths, billing.MergeParams{
+		Sheet:    formValue(form, "sheet"),
+		Encoding: formValue(form, "encoding"),
+		Format:   formValue(form, "format"),
+		Dedupe:   formValue(form, "dedupe") == "true",
+		OutDir:   dataDir,
+	})
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	jobsMu.Lock()
+	jobs[jobID] = jobRecord{mergedPath: result.Path, createdAt: time.Now()}
+	jobsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"jobId":          jobID,
+		"mergedFileName": filepath.Base(result.Path),
+		"mergedUrl":      "/api/download/" + jobID + "/merged",
+		"mergedPath":     result.Path,
+		"inputCount":     result.InputCount,
+		"inputRows":      result.InputRows,
+		"rowCount":       result.RowCount,
+		"droppedRows":    result.DroppedRows,
+		"headers":        result.Headers,
+		"format":         result.Format,
+	})
+}
+
 func formValue(form map[string][]string, key string) string {
 	if v, ok := form[key]; ok && len(v) > 0 {
 		return v[0]
@@ -348,6 +411,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		path = rec.billPath
 	case "sanitized":
 		path = rec.sanitizedPath
+	case "merged":
+		path = rec.mergedPath
 	}
 	if path == "" {
 		http.NotFound(w, r)

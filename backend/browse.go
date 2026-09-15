@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -137,26 +138,9 @@ func handleBrowse(w http.ResponseWriter, r *http.Request) {
 // resolveInputFile 取得本次出账的输入文件：优先使用上传的 file 字段，否则使用服务器本地路径 serverPath 字段。
 func resolveInputFile(r *http.Request, jobPath string) (string, error) {
 	if file, header, err := r.FormFile("file"); err == nil {
-		defer file.Close()
-		ext := strings.ToLower(filepath.Ext(header.Filename))
-		if !isAllowedLogExt(ext) {
-			return "", fmt.Errorf("仅支持 .xlsx / .csv / .tsv 日志文件")
-		}
-		// 保留原始文件名（仅取 base name，避免路径穿越），以便账期/输出文件名从中推断。
-		originalName := filepath.Base(header.Filename)
-		if originalName == "" || originalName == "." || originalName == string(filepath.Separator) {
-			originalName = "input" + ext
-		}
-		dstPath := filepath.Join(jobPath, originalName)
-		dst, err := os.Create(dstPath)
-		if err != nil {
-			return "", err
-		}
-		defer dst.Close()
-		if _, err := io.Copy(dst, file); err != nil {
-			return "", err
-		}
-		return dstPath, nil
+		file.Close()
+		dstPath, _, err := saveUploadedFile(header, jobPath, 0)
+		return dstPath, err
 	}
 
 	serverPath := ""
@@ -166,7 +150,44 @@ func resolveInputFile(r *http.Request, jobPath string) (string, error) {
 	if strings.TrimSpace(serverPath) == "" {
 		return "", fmt.Errorf("缺少上传文件 file 或服务器路径 serverPath")
 	}
+	return resolveServerLogPath(serverPath, jobPath)
+}
 
+// saveUploadedFile 把上传的日志文件落到 jobPath 目录（仅取 base name，避免路径穿越），
+// 返回落盘路径与原始文件名。seq 用于多个上传文件重名时区分，单文件传 0。
+func saveUploadedFile(header *multipart.FileHeader, jobPath string, seq int) (string, string, error) {
+	file, err := header.Open()
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+
+	ext := strings.ToLower(filepath.Ext(header.Filename))
+	if !isAllowedLogExt(ext) {
+		return "", "", fmt.Errorf("仅支持 .xlsx / .csv / .tsv 日志文件")
+	}
+	// 保留原始文件名，以便账期/输出文件名从中推断。
+	originalName := filepath.Base(header.Filename)
+	if originalName == "" || originalName == "." || originalName == string(filepath.Separator) {
+		originalName = "input" + ext
+	}
+	if seq > 0 {
+		originalName = fmt.Sprintf("%d_%s", seq, originalName)
+	}
+	dstPath := filepath.Join(jobPath, originalName)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer dst.Close()
+	if _, err := io.Copy(dst, file); err != nil {
+		return "", "", err
+	}
+	return dstPath, header.Filename, nil
+}
+
+// resolveServerLogPath 把 browseRoot 内的服务器路径复制到 jobPath，返回副本路径。
+func resolveServerLogPath(serverPath, jobPath string) (string, error) {
 	resolved, err := resolveInBrowseRoot(serverPath)
 	if err != nil {
 		return "", err
@@ -184,6 +205,43 @@ func resolveInputFile(r *http.Request, jobPath string) (string, error) {
 		return "", err
 	}
 	return dstPath, nil
+}
+
+// resolveInputFiles 取得本次合并的多个输入文件（上传文件优先，否则取服务器路径）。
+// 返回的路径顺序与用户选择顺序一致。
+func resolveInputFiles(r *http.Request, jobPath string) ([]string, error) {
+	if r.MultipartForm == nil {
+		return nil, fmt.Errorf("缺少上传文件 file 或服务器路径 serverPath")
+	}
+
+	var paths []string
+	if headers := r.MultipartForm.File["file"]; len(headers) > 0 {
+		for i, header := range headers {
+			dstPath, _, err := saveUploadedFile(header, jobPath, i+1)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", header.Filename, err)
+			}
+			paths = append(paths, dstPath)
+		}
+		return paths, nil
+	}
+
+	raw := r.MultipartForm.Value["serverPath"]
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		dstPath, err := resolveServerLogPath(p, jobPath)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, dstPath)
+	}
+	if len(paths) == 0 {
+		return nil, fmt.Errorf("缺少上传文件 file 或服务器路径 serverPath")
+	}
+	return paths, nil
 }
 
 func copyFile(src, dst string) error {

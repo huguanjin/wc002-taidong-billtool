@@ -61,6 +61,70 @@ const selectedFileName = ref('')
 const sourceMode = ref('upload')
 const serverPath = ref('')
 
+// 日志合并：可一次选多个文件（或服务器上的多个路径）拼成一个日志
+const mergeInput = ref(null)
+const mergeSelectedNames = ref([])
+const mergeServerPaths = ref('')
+const mergeForm = ref({ format: 'xlsx', dedupe: false })
+const merging = ref(false)
+const mergeError = ref('')
+const mergeResult = ref(null)
+
+function onMergeFileChange(e) {
+  const files = e.target.files ? Array.from(e.target.files) : []
+  mergeSelectedNames.value = files.map((f) => f.name)
+}
+
+async function handleMerge() {
+  mergeError.value = ''
+  mergeResult.value = null
+
+  const fd = new FormData()
+  if (sourceMode.value === 'upload') {
+    const files = mergeInput.value && mergeInput.value.files ? Array.from(mergeInput.value.files) : []
+    if (files.length < 2) {
+      mergeError.value = '请至少选择两个日志文件'
+      return
+    }
+    for (const f of files) fd.append('file', f)
+  } else {
+    const paths = mergeServerPaths.value
+      .split('\n')
+      .map((p) => p.trim())
+      .filter((p) => p !== '')
+    if (paths.length < 2) {
+      mergeError.value = '请填写至少两个服务器文件路径（每行一个）'
+      return
+    }
+    for (const p of paths) fd.append('serverPath', p)
+  }
+  fd.append('format', mergeForm.value.format)
+  fd.append('dedupe', String(mergeForm.value.dedupe))
+
+  merging.value = true
+  try {
+    const resp = await fetch('/api/merge-logs', { method: 'POST', body: fd })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      mergeError.value = data.error || `合并失败（${resp.status}）`
+      return
+    }
+    mergeResult.value = data
+  } catch (err) {
+    mergeError.value = '合并失败：' + err.message
+  } finally {
+    merging.value = false
+  }
+}
+
+// 合并结果就在服务器 data 目录里，直接回填成账单的输入路径，省去再上传一次。
+function useMergedAsBillInput() {
+  if (!mergeResult.value) return
+  serverPath.value = mergeResult.value.mergedPath
+  sourceMode.value = 'server'
+}
+
 const browserOpen = ref(false)
 const browserLoading = ref(false)
 const browserError = ref('')
@@ -292,24 +356,79 @@ async function handleSubmit() {
     </div>
     <p class="subtitle">上传日志（xlsx / csv / tsv），生成账单与脱敏日志</p>
 
+    <div class="field source-switch">
+      <label>日志来源</label>
+      <div class="source-tabs">
+        <button
+          type="button"
+          :class="{ active: sourceMode === 'upload' }"
+          @click="sourceMode = 'upload'"
+        >上传文件</button>
+        <button
+          type="button"
+          :class="{ active: sourceMode === 'server' }"
+          @click="sourceMode = 'server'"
+        >服务器路径</button>
+      </div>
+    </div>
 
-    <form class="card" @submit.prevent="handleSubmit">
-      <div class="field">
-        <label>日志来源</label>
-        <div class="source-tabs">
-          <button
-            type="button"
-            :class="{ active: sourceMode === 'upload' }"
-            @click="sourceMode = 'upload'"
-          >上传文件</button>
-          <button
-            type="button"
-            :class="{ active: sourceMode === 'server' }"
-            @click="sourceMode = 'server'"
-          >服务器路径</button>
+    <form class="card" @submit.prevent="handleMerge">
+      <h2>日志合并</h2>
+      <p class="hint">
+        日志来源有多个文件时，先在这里按顺序合成一个日志，合并结果写入服务器 data 目录。
+        各文件的列名需与第一个文件一致（列顺序可以不同，会按列名自动对齐）。
+      </p>
+
+      <div class="field" v-if="sourceMode === 'upload'">
+        <label>日志文件（可多选，至少两个）</label>
+        <input ref="mergeInput" type="file" accept=".xlsx,.csv,.tsv" multiple @change="onMergeFileChange" />
+        <span class="hint" v-if="mergeSelectedNames.length">
+          已选择 {{ mergeSelectedNames.length }} 个：{{ mergeSelectedNames.join('、') }}
+        </span>
+      </div>
+
+      <div class="field" v-else>
+        <label>服务器文件路径（每行一个，至少两个）</label>
+        <textarea
+          v-model="mergeServerPaths"
+          rows="3"
+          placeholder="logs/8月上旬日志.xlsx&#10;logs/8月下旬日志.xlsx"
+        ></textarea>
+        <span class="hint">相对路径基于浏览根目录（BILL_BROWSE_ROOT），也可填写该目录下的绝对路径</span>
+      </div>
+
+      <div class="grid">
+        <div class="field">
+          <label>合并结果格式</label>
+          <select v-model="mergeForm.format">
+            <option value="xlsx">xlsx（单表最多约 104 万行，超出会自动拆分多个 sheet）</option>
+            <option value="csv">csv（纯文本，无行数上限，适合超大日志）</option>
+            <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
+          </select>
         </div>
       </div>
 
+      <div class="checkboxes">
+        <label><input v-model="mergeForm.dedupe" type="checkbox" /> 去除完全重复的行</label>
+      </div>
+
+      <button type="submit" :disabled="merging">{{ merging ? '合并中…' : '合并日志' }}</button>
+      <p class="error" v-if="mergeError">{{ mergeError }}</p>
+
+      <div v-if="mergeResult">
+        <p>
+          合并 {{ mergeResult.inputCount }} 个文件（共 {{ fmtNum(mergeResult.inputRows) }} 行），
+          结果 {{ fmtNum(mergeResult.rowCount) }} 行<template v-if="mergeResult.droppedRows > 0">，去重丢弃 {{ fmtNum(mergeResult.droppedRows) }} 行</template>。
+        </p>
+        <p class="hint">已写入：{{ mergeResult.mergedPath }}</p>
+        <div class="downloads">
+          <a class="btn" :href="mergeResult.mergedUrl">下载合并日志：{{ mergeResult.mergedFileName }}</a>
+          <button type="button" class="btn-browse" @click="useMergedAsBillInput">作为账单输入</button>
+        </div>
+      </div>
+    </form>
+
+    <form class="card" @submit.prevent="handleSubmit">
       <div class="field" v-if="sourceMode === 'upload'">
         <label>日志文件</label>
         <input ref="fileInput" type="file" accept=".xlsx,.csv,.tsv" @change="onFileChange" />
@@ -526,6 +645,9 @@ async function handleSubmit() {
   max-width: 360px;
   margin: 60px auto 0;
 }
+.source-switch {
+  margin-bottom: 12px;
+}
 .source-tabs {
   display: flex;
   gap: 8px;
@@ -543,6 +665,16 @@ async function handleSubmit() {
   background: #2c6ef2;
   color: #fff;
   border-color: #2c6ef2;
+}
+textarea {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+  box-sizing: border-box;
 }
 .path-row {
   display: flex;
