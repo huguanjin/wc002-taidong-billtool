@@ -225,9 +225,9 @@ const form = ref({
   year: '',
   exchangeRate: 7,
   discount: '',
-  priceSource: 'official',
+  priceSource: 'db',
   sanitizedLog: true,
-  sanitizedFormat: 'xlsx',
+  sanitizedFormat: 'tsv',
   keepLog: false,
 })
 
@@ -244,6 +244,7 @@ const checkPricesError = ref('')
 const priceCheckDone = ref(false)
 const checkedModelCount = ref(0)
 const missingModels = ref([])
+const exprModels = ref([])
 const manualPrices = ref({})
 
 async function pullDbPrices() {
@@ -326,6 +327,7 @@ async function checkMissingPrices() {
     }
     checkedModelCount.value = data.modelCount || 0
     missingModels.value = data.missingModels || []
+    exprModels.value = data.exprModels || []
     const nextManual = {}
     for (const model of missingModels.value) {
       nextManual[model] = manualPrices.value[model] || { input: '', output: '' }
@@ -543,6 +545,29 @@ async function handleSubmit() {
         <span class="hint" v-if="priceCheckDone && missingModels.length === 0">
           已检查 {{ checkedModelCount }} 个模型，当前价格来源均能匹配到定价。
         </span>
+        <span class="hint" v-if="priceCheckDone && exprModels.length > 0">
+          其中 {{ exprModels.length }} 个模型由阶梯计费表达式定价（不依赖 ModelRatio/ModelPrice），详见下方。
+        </span>
+      </div>
+
+      <div class="card" v-if="priceCheckDone && exprModels.length > 0">
+        <h3>阶梯表达式定价的模型（{{ exprModels.length }}）</h3>
+        <p class="hint">
+          这些模型的价格由 option 表的 billing_expr 表达式算出，刊例价与单价均取自表达式，
+          「缺少定价」检查不适用。同一模型跨档位时单价列取当月实际命中的档位。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>模型</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="model in exprModels" :key="model">
+              <td>{{ model }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       <div class="card" v-if="priceCheckDone && missingModels.length > 0">

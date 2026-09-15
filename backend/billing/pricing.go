@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"sort"
@@ -129,6 +130,72 @@ func ParseModelPrice(other string) float64 {
 		return jsonNumber(v)
 	}
 	return -1.0
+}
+
+// ParseBillingExpr 从日志 other 里取本次请求实际使用的阶梯计费表达式。
+// 上游计费时把表达式以 base64 写进 other.expr_b64，因此日志自带「当时生效的规则」，
+// 比事后去读 options 表更贴近事实——option 表可能已经改过。
+func ParseBillingExpr(other string) string {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return ""
+	}
+	raw, ok := data["expr_b64"]
+	if !ok || raw == nil {
+		return ""
+	}
+	s, isStr := raw.(string)
+	if !isStr || s == "" {
+		return ""
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(decoded))
+}
+
+// ParseMatchedTier 日志 other.matched_tier：上游计费时 tier() 命中的档位名。
+func ParseMatchedTier(other string) string {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return ""
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return ""
+	}
+	if v, ok := data["matched_tier"]; ok && v != nil {
+		if s, isStr := v.(string); isStr {
+			return s
+		}
+	}
+	return ""
+}
+
+// ParseExtraTokens 从日志 other 里取图片/音频的 token 明细，供 gpt-realtime 一类
+// 表达式（引用 img/img_o/ai/ao）计价。日志里没有这些字段时一律返回 0，
+// 此时这些 token 仍留在 p/c 里按基础价计费，不会凭空多算费用。
+func ParseExtraTokens(other string) (img, imgO, ai, ao float64) {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return 0, 0, 0, 0
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return 0, 0, 0, 0
+	}
+	details, _ := data["prompt_tokens_details"].(map[string]interface{})
+	compDetails, _ := data["completion_tokens_details"].(map[string]interface{})
+	img = jsonNumber(details["image_tokens"])
+	ai = jsonNumber(details["audio_tokens"])
+	ao = jsonNumber(compDetails["audio_tokens"])
+	imgO = jsonNumber(compDetails["image_tokens"])
+	return img, imgO, ai, ao
 }
 
 // ImageBillingMode 图片模型计费方式：token / per_call；非图片返回 ""。
@@ -344,6 +411,18 @@ func SettleCNY(agg *AggRow) float64 {
 	return round(agg.SiteCNY(), MoneyDecimals)
 }
 
+// HasKnownListPrice 该行是否有可信的官方刊例，用于折扣分母的取舍。
+//
+// 阶梯表达式模型在 ModelRatio/ModelPrice 里通常查不到价（上游由表达式定价，
+// 价表里没有它的条目），但表达式本身已经算出了刊例，这类行必须计入分母；
+// 真的一点价都取不到的模型才排除，否则会把折扣整体拉高。
+func HasKnownListPrice(agg *AggRow) bool {
+	if agg.OfficialUSD > 0 {
+		return true
+	}
+	return agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
+}
+
 // ComputeGroupDiscounts 同一分组标识使用同一折扣 = 该组结算人民币合计 / 总金额人民币合计。
 func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool) map[string]float64 {
 	if forcedDiscount != nil {
@@ -357,8 +436,7 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 	settleByGroup := map[string]float64{}
 	listByGroup := map[string]float64{}
 	for _, agg := range rows {
-		price, _ := ResolvePrice(agg.Model, book, preferPriceTable, exchangeRate)
-		if price == nil {
+		if !HasKnownListPrice(agg) {
 			continue
 		}
 		settleByGroup[agg.Group] += SettleCNY(agg)

@@ -26,7 +26,13 @@ type AggRow struct {
 	WebSearchCalls float64
 	// 图片按次计费的调用次数；按量图片模型此字段为 0
 	ImagePerCallCount float64
-	BillingMode       string // token | per_call
+	BillingMode       string // token | per_call | tiered_expr
+	// BillingExpr 该模型的阶梯计费表达式（来自日志 other.expr_b64 或 options 表）；
+	// 非阶梯模型为空。
+	BillingExpr string
+	// ExprTiers 本账期内表达式命中的档位名集合（按首次命中顺序），
+	// 用于在账单里说明这行的刊例由哪几档混合而成。
+	ExprTiers []string
 }
 
 // SiteCNY 站点人民币 = quota / 500000。

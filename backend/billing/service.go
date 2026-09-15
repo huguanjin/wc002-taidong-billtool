@@ -20,10 +20,11 @@ type GenerateResult struct {
 // dbPriceCachePath 是「拉取最新数据库价格」写出的本地 JSON 文件路径，出账时只读此文件，不连接数据库。
 func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, outputDir string, params Params) (*GenerateResult, error) {
 	var book *PriceBook
+	var exprSetting *BillingExprSetting
 	var err error
 	switch params.PriceSource {
 	case PriceSourceDB:
-		book, _, err = LoadPriceBookFromDBCacheFile(dbPriceCachePath)
+		book, exprSetting, _, err = LoadDBPriceCache(dbPriceCachePath)
 		if err != nil {
 			return nil, err
 		}
@@ -70,7 +71,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		writerIface = sanitizedWriter
 	}
 
-	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, preferPriceTable, writerIface)
+	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, preferPriceTable, exprSetting, writerIface)
 	if sanitizedWriter != nil {
 		if closeErr := sanitizedWriter.Close(); closeErr != nil && aggErr == nil {
 			return nil, fmt.Errorf("写出脱敏日志失败: %w", closeErr)
@@ -129,10 +130,10 @@ func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, p
 	groupDiscounts := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable)
 
 	for _, a := range agg.Rows {
-		price, _ := ResolvePrice(a.Model, book, preferPriceTable, exchangeRate)
 		settle := SettleCNY(a)
 		list := 0.0
-		hasPrice := price != nil
+		// 阶梯表达式模型在价表里查不到条目，但刊例已由表达式算出，同样算「有价」。
+		hasPrice := HasKnownListPrice(a)
 		if hasPrice {
 			list = OfficialListCNY(a, exchangeRate)
 		}

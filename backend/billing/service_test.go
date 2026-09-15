@@ -116,8 +116,8 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 		t.Errorf("期望原始行数 4，实际 %d", result.Summary.RowCount)
 	}
 
-	if len(result.Summary.MissingPriceModels) != 1 || result.Summary.MissingPriceModels[0] != "gpt-5.4/vip" {
-		t.Errorf("期望缺失定价仅 gpt-5.4/vip（阶梯模型未登记在官方价表中属已知行为），实际 %v", result.Summary.MissingPriceModels)
+	if len(result.Summary.MissingPriceModels) != 0 {
+		t.Errorf("期望无缺失定价的模型，实际 %v", result.Summary.MissingPriceModels)
 	}
 
 	var claudeRow, gptRow *RowSummary
@@ -145,8 +145,12 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 	if gptRow == nil {
 		t.Fatal("未找到 gpt-5.4 汇总行")
 	}
-	// gpt-5.4 走阶梯定价，不在报价表/官网表中登记，属已知的“缺定价但仍正确计费”场景
-	if gptRow.HasPrice {
-		t.Errorf("gpt-5.4 期望 HasPrice=false（阶梯模型无独立官方价表条目）")
+	// gpt-5.4 走内置阶梯价表（官方价表里没有它的条目，由 TieredModelPrices 兜底），
+	// 刊例由阶梯低档价算出，因此算「有价」。
+	if !gptRow.HasPrice {
+		t.Errorf("gpt-5.4 期望 HasPrice=true（阶梯价表兜底）")
+	}
+	if gptRow.ListCNY <= 0 {
+		t.Errorf("gpt-5.4 期望刊例为正，实际 %v", gptRow.ListCNY)
 	}
 }

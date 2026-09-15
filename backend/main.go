@@ -113,16 +113,17 @@ func dbPriceCachePath() string {
 }
 
 // loadPriceBookForSource 按价格来源加载 PriceBook，GenerateBill 与 handleCheckMissingPrices 共用。
-func loadPriceBookForSource(source billing.PriceSource, priceTablePath string) (*billing.PriceBook, error) {
+// 第二个返回值为阶梯表达式配置（仅「数据库实时价格」模式有，其余为 nil）。
+func loadPriceBookForSource(source billing.PriceSource, priceTablePath string) (*billing.PriceBook, *billing.BillingExprSetting, error) {
 	if source == billing.PriceSourceDB {
-		book, _, err := billing.LoadPriceBookFromDBCacheFile(dbPriceCachePath())
-		return book, err
+		book, expr, _, err := billing.LoadDBPriceCache(dbPriceCachePath())
+		return book, expr, err
 	}
 	book, err := billing.LoadPriceBook(priceTablePath)
 	if err != nil {
-		return nil, fmt.Errorf("加载报价表失败: %w", err)
+		return nil, nil, fmt.Errorf("加载报价表失败: %w", err)
 	}
-	return book, nil
+	return book, nil, nil
 }
 
 // handleCheckMissingPrices 出账前预检：列出日志里出现的模型在当前价格来源下有没有找不到定价的，
@@ -157,7 +158,7 @@ func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
 	encoding := formValue(form, "encoding")
 
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
-	book, err := loadPriceBookForSource(priceSource, priceTablePath)
+	book, exprSetting, err := loadPriceBookForSource(priceSource, priceTablePath)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, err.Error())
 		return
@@ -182,8 +183,14 @@ func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var missingModels []string
+	// 阶梯表达式模型在 ModelRatio/ModelPrice 里通常查不到条目，但表达式就是它的定价，
+	// 这类模型不该报「缺少定价」，单独列出来供人工核对表达式。
+	var missingModels, exprModels []string
 	for _, model := range models {
+		if exprSetting.HasExpr(model) {
+			exprModels = append(exprModels, model)
+			continue
+		}
 		if price, _ := billing.ResolvePrice(model, book, preferPriceTable, exchangeRate); price == nil {
 			missingModels = append(missingModels, model)
 		}
@@ -192,6 +199,7 @@ func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"modelCount":    len(models),
 		"missingModels": missingModels,
+		"exprModels":    exprModels,
 	})
 }
 

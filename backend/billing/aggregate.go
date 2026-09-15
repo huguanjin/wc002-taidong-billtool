@@ -34,7 +34,10 @@ var cstLocation = time.FixedZone("CST", 8*3600)
 
 // AggregateFromRows 对应 log_to_bill.py 的 aggregate_from_rows：逐行解析缓存/语义/计费，
 // 按 (model, group) 聚合，同时可选地把展开缓存列后的脱敏行写给 sanitizedWriter。
-func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, exchangeRate float64, preferPriceTable bool, sanitizedWriter SanitizedRowWriter) (*AggregateResult, error) {
+//
+// exprSetting 提供 options 表里的阶梯计费表达式（可为 nil）。命中表达式的模型，
+// 其官方美金刊例直接由表达式算出，不再依赖 ModelRatio/ModelPrice 那套表。
+func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, exchangeRate float64, preferPriceTable bool, exprSetting *BillingExprSetting, sanitizedWriter SanitizedRowWriter) (*AggregateResult, error) {
 	col := map[string]int{}
 	for i, h := range headers {
 		if h != "" {
@@ -123,34 +126,80 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			webSearchRows++
 		}
 
-		basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
-		if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
-			basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
+		// 该请求发生的时间：日志的 created_at 是 Unix 秒。出账面对历史日志，
+		// 带 hour() 一类的表达式必须按请求当时的时刻判断（见 RunBillingExpr）。
+		at := time.Now()
+		if hasCreated {
+			if ts, ok := parseUnixTimestamp(cellAt(row, idxCreated)); ok && ts > 0 {
+				at = time.Unix(ts, 0)
+			}
 		}
 
 		var perCall, listUSD float64
+		var exprUsed, matchedTier string
+		billingMode := imgMode
+		if billingMode == "" {
+			billingMode = "token"
+		}
+
+		// 表达式优先取日志自带的（计费当时生效的规则），其次取 options 表当前配置。
+		exprStr := ""
+		if imgMode != "per_call" {
+			exprStr = ParseBillingExpr(other)
+			if exprStr == "" && exprSetting != nil {
+				exprStr = exprSetting.Expr(model)
+			}
+			if exprStr != "" {
+				billingMode = BillingModeTieredExpr
+			}
+		}
+
 		if imgMode == "per_call" {
 			if mp := ParseModelPrice(other); mp > 0 {
 				listUSD = mp
 			}
 			perCall = 1.0
+		} else if exprStr != "" {
+			img, imgO, ai, ao := ParseExtraTokens(other)
+			params := BuildExprParams(model, prompt, uncached, completion,
+				cacheRead, cacheWrite5m, cacheWrite1h, img, imgO, ai, ao, exprStr)
+			res, err := RunBillingExpr(exprStr, params, at)
+			if err != nil {
+				// 表达式跑不通时回落到按量价表，宁可价格略有偏差也不整行失败。
+				basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
+				if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
+					basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
+				}
+				listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
+				billingMode = "token"
+			} else {
+				listUSD = res.USD / 1_000_000
+				exprUsed = exprStr
+				matchedTier = res.MatchedTier
+			}
 		} else {
+			basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
+			if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
+				basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
+			}
 			listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
 		}
 
 		key := [2]string{model, group}
 		agg, exists := buckets[key]
 		if !exists {
-			mode := imgMode
-			if mode == "" {
-				mode = "token"
-			}
-			agg = &AggRow{Model: model, Group: group, BillingMode: mode}
+			agg = &AggRow{Model: model, Group: group, BillingMode: billingMode}
 			buckets[key] = agg
 			if !groupSeen[group] {
 				groupSeen[group] = true
 				groupOrder = append(groupOrder, group)
 			}
+		}
+		if exprUsed != "" {
+			agg.BillingExpr = exprUsed
+		}
+		if matchedTier != "" && !containsString(agg.ExprTiers, matchedTier) {
+			agg.ExprTiers = append(agg.ExprTiers, matchedTier)
 		}
 		agg.Uncached += uncached
 		agg.CacheRead += cacheRead
@@ -236,8 +285,16 @@ func ExtractDistinctModels(headers []string, rows [][]string) ([]string, error) 
 	return models, nil
 }
 
-func parseUnixTimestamp(v string) (int64, bool) {
-	s := strings.TrimSpace(v)
+func containsString(list []string, v string) bool {
+	for _, item := range list {
+		if item == v {
+			return true
+		}
+	}
+	return false
+}
+
+func parseUnixTimestamp(v string) (int64, bool) {	s := strings.TrimSpace(v)
 	if s == "" {
 		return 0, false
 	}

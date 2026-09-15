@@ -233,8 +233,12 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 
 		setNum(22, r, SettleCNY(agg), styleMoney)
 
+		// 阶梯表达式模型：刊例由表达式逐条累加得出，档位可能混用
+		// （同一行的请求分处 base / tier_2），此时用「单价×总量」的公式
+		// 反而算不准，所以总金额直接落数值，只有折扣折算仍用公式。
+		hasExpr := agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
 		_, isTiered := TieredModelPrices[agg.Model]
-		useTokenFormula := price != nil && price.Source != "per_call" && !isTiered
+		useTokenFormula := price != nil && price.Source != "per_call" && !isTiered && !hasExpr
 
 		if useTokenFormula {
 			listExpr := fmt.Sprintf("((D%d*E%d+F%d*G%d+H%d*I%d+J%d*K%d+L%d*M%d)/1000000+O%d*10/1000)", r, r, r, r, r, r, r, r, r, r, r)
@@ -247,21 +251,39 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		}
 
 		switch {
-		case price == nil:
+		case !HasKnownListPrice(agg):
 			missingPrices = append(missingPrices, agg.Model+"/"+agg.Group)
 			setStr(24, r, "否")
-		case price.Source == "per_call":
+		case price != nil && price.Source == "per_call":
 			setStr(24, r, "否")
 		default:
-			display := *price
+			display := ModelPrice{}
 			var readP, w5P, w1P float64
-			if tier, ok := TieredModelPrices[agg.Model]; ok {
+			consistent := false
+			switch {
+			case hasExpr:
+				// 单价列取自表达式在当前上下文长度下的等效系数，
+				// 表达式含图片/音频等附加项时无法折算成单价，留空。
+				rates, err := ExtractExprRates(agg.BillingExpr, time.Now(), agg.Uncached+agg.CacheRead+agg.CacheWrite5m+agg.CacheWrite1h)
+				if err == nil {
+					display = ModelPrice{InputPerM: rates.InputPerM, OutputPerM: rates.OutputPerM, Currency: "USD", Source: "expr"}
+					readP, w5P, w1P = rates.CacheReadPerM, rates.CacheWritePerM, rates.CacheWrite1hPerM
+					consistent = rates.Pure
+				}
+			case isTiered:
+				tier := TieredModelPrices[agg.Model]
 				display = ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low_display"}
 				readP = tier.Low[2]
 				w5P = display.InputPerM * CacheWrite5mMult
 				w1P = display.InputPerM * CacheWrite1hMult
-			} else {
+			default:
+				display = *price
 				readP, w5P, w1P = CacheUnitPrices(agg.Model, display.InputPerM)
+				consistent = strings.HasPrefix(price.Source, "anthropic_official") ||
+					strings.HasPrefix(price.Source, "gemini_official") ||
+					strings.HasPrefix(price.Source, "kimi_official") ||
+					strings.HasPrefix(price.Source, "image_official") ||
+					(strings.HasPrefix(price.Source, "price_table") && note == "")
 			}
 			f.SetCellValue(sheet, axisOf(5, r), display.InputPerM)
 			f.SetCellValue(sheet, axisOf(7, r), readP)
@@ -269,12 +291,7 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			f.SetCellValue(sheet, axisOf(11, r), w5P)
 			f.SetCellValue(sheet, axisOf(13, r), w1P)
 
-			consistent := strings.HasPrefix(price.Source, "anthropic_official") ||
-				strings.HasPrefix(price.Source, "gemini_official") ||
-				strings.HasPrefix(price.Source, "kimi_official") ||
-				strings.HasPrefix(price.Source, "image_official") ||
-				(strings.HasPrefix(price.Source, "price_table") && note == "")
-			if isTiered || agg.WebSearchCalls != 0 {
+			if agg.WebSearchCalls != 0 || (display.InputPerM == 0 && display.OutputPerM == 0) {
 				consistent = false
 			}
 			if consistent {

@@ -3,6 +3,7 @@ module taidong-bill-backend
 go 1.25.0
 
 require (
+	github.com/expr-lang/expr v1.17.8
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/xuri/excelize/v2 v2.11.0
 	golang.org/x/text v0.41.0
