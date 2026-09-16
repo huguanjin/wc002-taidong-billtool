@@ -137,9 +137,13 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 	if claudeRow.Uncached != 1_000_000 {
 		t.Errorf("claude 未命中 token 期望 1000000，实际 %v", claudeRow.Uncached)
 	}
-	wantSettle := 50_000.0 / QuotaPerCNY
-	if claudeRow.SettleCNY != round(wantSettle, MoneyDecimals) {
-		t.Errorf("claude 结算人民币期望 %v，实际 %v", wantSettle, claudeRow.SettleCNY)
+	// 结算金额口径 = 总金额 × 折扣，不再取日志 quota 折算值。
+	if claudeRow.ListCNY <= 0 {
+		t.Fatalf("claude 刊例期望为正，实际 %v", claudeRow.ListCNY)
+	}
+	wantClaudeSettle := round(claudeRow.ListCNY*claudeRow.Discount, MoneyDecimals)
+	if claudeRow.SettleCNY != wantClaudeSettle {
+		t.Errorf("claude 结算人民币期望 %v（刊例 × 折扣），实际 %v", wantClaudeSettle, claudeRow.SettleCNY)
 	}
 
 	if gptRow == nil {

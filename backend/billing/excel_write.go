@@ -179,7 +179,7 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 	}
 
 	firstDataRow := 3
-	groupDiscounts := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable)
+	groupDiscounts, derivedDiscounts := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable)
 	periodDate := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 
 	axisOf := func(col, r int) string {
@@ -190,6 +190,11 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		axis := axisOf(col, r)
 		f.SetCellValue(sheet, axis, v)
 		f.SetCellStyle(sheet, axis, axis, style)
+	}
+	// setPrice 写单价列。单价列一律不套金额格式：它们的单位是「美金/百万 token」，
+	// 不是人民币金额，套上 MoneyCNYFmt 会让 10 显示成 10.0000，与同类列口径不一。
+	setPrice := func(col, r int, v float64) {
+		f.SetCellValue(sheet, axisOf(col, r), v)
 	}
 	setFormula := func(col, r int, formula string, style int) {
 		axis := axisOf(col, r)
@@ -231,24 +236,42 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		f.SetCellValue(sheet, axisDisc, disc)
 		f.SetCellStyle(sheet, axisDisc, axisDisc, styleDiscount)
 
-		setNum(22, r, SettleCNY(agg), styleMoney)
-
-		// 阶梯表达式模型：刊例由表达式逐条累加得出，档位可能混用
-		// （同一行的请求分处 base / tier_2），此时用「单价×总量」的公式
-		// 反而算不准，所以总金额直接落数值，只有折扣折算仍用公式。
+		// 阶梯表达式模型：刊例由表达式逐条累加得出，同一行的请求可能分处不同档位
+		// （如 base / tier_2）。跨档行没有单一单价能还原金额，此时不写「单价×用量」。
 		hasExpr := agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
 		_, isTiered := TieredModelPrices[agg.Model]
 		useTokenFormula := price != nil && price.Source != "per_call" && !isTiered && !hasExpr
 
-		if useTokenFormula {
-			listExpr := fmt.Sprintf("((D%d*E%d+F%d*G%d+H%d*I%d+J%d*K%d+L%d*M%d)/1000000+O%d*10/1000)", r, r, r, r, r, r, r, r, r, r, r)
-			setFormula(19, r, fmt.Sprintf("%s*%s", listExpr, formatFloat(exchangeRate)), styleMoney)
-			setFormula(23, r, fmt.Sprintf("%s*T%d", listExpr, r), styleMoney)
-		} else {
-			listUSD := agg.OfficialUSD
-			setNum(19, r, listUSD*exchangeRate, styleMoney)
-			setFormula(23, r, fmt.Sprintf("%s*T%d", formatFloat(listUSD), r), styleMoney)
+		// 表达式行的等效单价只在「该行只命中一个档位、且单价加总恰好还原官方刊例」
+		// 时才有意义，判定统一走 ExprRowReconcile，与 X 列判据同源。
+		exprRates := ExprRates{}
+		exprOK := false
+		exprAt := agg.LastAt
+		if exprAt.IsZero() {
+			exprAt = time.Now()
 		}
+		if hasExpr {
+			exprRates, exprOK = ExprRowReconcile(agg.BillingExpr, agg, exprAt)
+		}
+
+		// AC 列（官方刊例-美金）：能由 E/G/I/K/M 还原的行（普通价表行，或阶梯单档行），
+		// AC 直接是「单价×用量」公式，与单价列同源；不能还原的行（跨档、按次计费、
+		// isTiered 兜底展示价等），AC 落官方刊例本身——这是全表唯一允许出现裸数值的
+		// 单元格，且只出现在这一列，不再散落进 S/W 的公式字符串里。
+		// S/W 一律引用 AC，不再各写一套分支：S = (AC+O*10/1000)*汇率，W = S÷汇率。
+		reconcilable := useTokenFormula || exprOK
+		if reconcilable {
+			acExpr := fmt.Sprintf("(D%d*E%d+F%d*G%d+H%d*I%d+J%d*K%d+L%d*M%d)/1000000", r, r, r, r, r, r, r, r, r, r)
+			setFormula(29, r, acExpr, styleMoney)
+		} else {
+			setNum(29, r, agg.OfficialUSD, styleMoney)
+		}
+		setFormula(19, r, fmt.Sprintf("(AC%d+O%d*10/1000)*%s", r, r, formatFloat(exchangeRate)), styleMoney)
+
+		// 结算金额：口径统一为「总金额 × 折扣」，不再直接取日志 quota 折算的金额。
+		// 两者的差额就是商务折扣与日志里 groupRatio 的差额，差异来源写在 AB 列。
+		setFormula(22, r, fmt.Sprintf("S%d*T%d", r, r), styleMoney)
+		setFormula(23, r, fmt.Sprintf("V%d/%s", r, formatFloat(exchangeRate)), styleMoney)
 
 		switch {
 		case !HasKnownListPrice(agg):
@@ -264,27 +287,22 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			case hasExpr:
 				// 单价列取自表达式在该行实际请求时刻、该上下文长度下的等效系数。
 				// 时刻不能用 now()：峰谷倍率（hour()）依赖请求当时的时间点。
-				// 表达式含图片/音频等附加项时无法折算成单价，留空。
-				at := agg.LastAt
-				if at.IsZero() {
-					at = time.Now()
-				}
-				rates, err := ExtractExprRates(agg.BillingExpr, at, agg.Uncached+agg.CacheRead+agg.CacheWrite5m+agg.CacheWrite1h)
-				if err == nil {
-					display = ModelPrice{InputPerM: rates.InputPerM, OutputPerM: rates.OutputPerM, Currency: "USD", Source: "expr"}
-					readP, w5P, w1P = rates.CacheReadPerM, rates.CacheWritePerM, rates.CacheWrite1hPerM
-					consistent = rates.Pure
-					if rates.Pure {
-						// Y/Z/AA 三个「列表价」列按表达式系数回填：
-						// Y 缓存未命中（输入）单价，同 E 列口径；
-						// Z 缓存读单价，同 G 列口径（表达式未引用 cr 时为 0，留空）；
-						// AA 输出单价。表达式含图片/音频附加项时单价不足以还原金额，三列都留空。
-						setNum(25, r, rates.InputPerM, styleMoney)
-						if rates.CacheReadPerM != 0 {
-							setNum(26, r, rates.CacheReadPerM, styleMoney)
-						}
-						setNum(27, r, rates.OutputPerM, styleMoney)
+				// 表达式含图片/音频等附加项、或本行跨档时无法折算成单价，留空。
+				// X 列不再是「表达式是否线性」，而是「单价×用量能否还原刊例」，
+				// 判据与 S 列公式同源，见 ExprRowReconcile。
+				consistent = exprOK
+				if exprOK {
+					display = ModelPrice{InputPerM: exprRates.InputPerM, OutputPerM: exprRates.OutputPerM, Currency: "USD", Source: "expr"}
+					readP, w5P, w1P = exprRates.CacheReadPerM, exprRates.CacheWritePerM, exprRates.CacheWrite1hPerM
+					// Y/Z/AA 三个「列表价」列按表达式系数回填：
+					// Y 缓存未命中（输入）单价，同 E 列口径；
+					// Z 缓存读单价，同 G 列口径（表达式未引用 cr 时为 0，留空）；
+					// AA 输出单价。表达式含图片/音频附加项时单价不足以还原金额，三列都留空。
+					setPrice(25, r, exprRates.InputPerM)
+					if exprRates.CacheReadPerM != 0 {
+						setPrice(26, r, exprRates.CacheReadPerM)
 					}
+					setPrice(27, r, exprRates.OutputPerM)
 				}
 			case isTiered:
 				tier := TieredModelPrices[agg.Model]
@@ -307,6 +325,26 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			f.SetCellValue(sheet, axisOf(11, r), w5P)
 			f.SetCellValue(sheet, axisOf(13, r), w1P)
 
+			// 跨档行（或表达式含附加项/常数项）单价列留空，交由下面的 AB 列说明原因。
+			// 表达式未引用某档时，该档系数为 0——这里也必须留空而不是写 0：
+			// 「单价 0」会被读成「这项免费」，而实际含义是「该档不参与本行计价」。
+			if hasExpr && !exprOK {
+				for _, col := range []int{5, 7, 9, 11, 13} {
+					f.SetCellValue(sheet, axisOf(col, r), "")
+				}
+			}
+			if exprOK {
+				if exprRates.CacheReadPerM == 0 {
+					f.SetCellValue(sheet, axisOf(7, r), "")
+				}
+				if exprRates.CacheWritePerM == 0 {
+					f.SetCellValue(sheet, axisOf(11, r), "")
+				}
+				if exprRates.CacheWrite1hPerM == 0 {
+					f.SetCellValue(sheet, axisOf(13, r), "")
+				}
+			}
+
 			if agg.WebSearchCalls != 0 || (display.InputPerM == 0 && display.OutputPerM == 0) {
 				consistent = false
 			}
@@ -318,14 +356,31 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		}
 
 		// 阶梯计费模型在备注里留下价档说明：整月都落在同一档时只记档位名，
-		// 跨档时写明是哪几档混合，便于客户核对刊例为什么不是「单价×总量」。
+		// 跨档时写明是哪几档混合，并说明单价为什么不适用，便于客户核对
+		// 刊例为什么不是「单价×总量」。
+		var notes []string
 		if hasExpr && len(agg.ExprTiers) > 0 {
 			if len(agg.ExprTiers) == 1 {
-				setStr(28, r, "阶梯计费，本行命中档位："+strings.Join(agg.ExprTiers, "、"))
+				notes = append(notes, "阶梯计费，本行命中档位："+strings.Join(agg.ExprTiers, "、"))
 			} else {
-				setStr(28, r, fmt.Sprintf("阶梯计费，本行跨 %d 档混合计价：%s",
+				notes = append(notes, fmt.Sprintf("阶梯计费，本行跨 %d 档混合计价：%s",
 					len(agg.ExprTiers), strings.Join(agg.ExprTiers, "、")))
 			}
+		}
+		if hasExpr && !exprOK {
+			notes = append(notes, "本行跨档，单价不适用，请按总金额核对")
+		}
+		// 折扣来源必须可追：价表/合同里查到的折扣是商务谈定值，
+		// 反推值只能保证账面对得上，不等于谈定的折扣。
+		if derivedDiscounts[agg.Group] {
+			notes = append(notes, "折扣为反推值（价表无该分组折扣，按 Σ结算/Σ总金额倒算）")
+		} else if discount != nil {
+			notes = append(notes, "折扣为手工指定值")
+		} else {
+			notes = append(notes, "折扣取自价表")
+		}
+		if len(notes) > 0 {
+			setStr(28, r, strings.Join(notes, "；"))
 		}
 	}
 
@@ -345,6 +400,7 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 	setTotalFormula(19, styleMoneyBold)
 	setTotalFormula(22, styleMoneyBold)
 	setTotalFormula(23, styleMoneyBold)
+	setTotalFormula(29, styleMoneyBold)
 
 	axisT := axisOf(20, totalRow)
 	f.SetCellFormula(sheet, axisT, fmt.Sprintf("IF(S%d=0,0,V%d/S%d)", totalRow, totalRow, totalRow))

@@ -26,6 +26,10 @@ type TierPrice struct {
 	High      [3]float64
 }
 
+// TieredModelPrices 是「表达式跑不通时」的兜底价表，只用于 aggregate.go 的降级路径
+// 与 excel_write.go 的展示兜底。判档一律以表达式为准，这里不要把阈值当成权威口径：
+// 上游各模型的比较符并不统一（gpt-5.4/gpt-5.5/gpt-6-astra 是 <=，gemini-3.1-pro-preview
+// 是 <=，gpt-5.6-sol 是 <），照表达式抄即可，不要自己改写成统一写法。
 var TieredModelPrices = map[string]TierPrice{
 	"gpt-5.4": {
 		Threshold: 272_000, Op: "lt",
@@ -38,6 +42,18 @@ var TieredModelPrices = map[string]TierPrice{
 	"gemini-3.1-pro-preview": {
 		Threshold: 200_000, Op: "le",
 		Low: [3]float64{2.0, 12.0, 0.2}, High: [3]float64{4.0, 18.0, 0.4},
+	},
+	// gpt-6-astra：len <= 272000 ? tier("base", p*10 + c*50 + cr*1 + cc*12.5)
+	//                          : tier("tier_2", p*20 + c*75 + cr*2 + cc*25)
+	"gpt-6-astra": {
+		Threshold: 272_000, Op: "le",
+		Low: [3]float64{10.0, 50.0, 1.0}, High: [3]float64{20.0, 75.0, 2.0},
+	},
+	// gpt-5.6-sol：len < 272000 ? tier("tier_1", p*4 + c*20 + cr*0.4 + cc*5)
+	//                         : tier("tier_2", p*8 + c*30 + cr*0.8 + cc*10)
+	"gpt-5.6-sol": {
+		Threshold: 272_000, Op: "lt",
+		Low: [3]float64{4.0, 20.0, 0.4}, High: [3]float64{8.0, 30.0, 0.8},
 	},
 }
 

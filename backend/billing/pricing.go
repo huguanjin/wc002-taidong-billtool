@@ -295,7 +295,11 @@ func CacheUnitPrices(model string, inputPerM float64) (read, w5, w1 float64) {
 // ResolvePrice 返回 (价格, 备注)；价格已换算为 USD/MTok。nil 表示缺少定价。
 func ResolvePrice(model string, book *PriceBook, preferPriceTable bool, exchangeRate float64) (*ModelPrice, string) {
 	var notes []string
-	table, hasTable := book.ByModel[model]
+	table := ModelPrice{}
+	hasTable := false
+	if book != nil {
+		table, hasTable = book.ByModel[model]
+	}
 	officialAnthropic, hasAnthropic := OfficialAnthropicPrices[model]
 	officialGemini, hasGemini := OfficialGeminiTextPrices[model]
 	officialKimi, hasKimi := OfficialKimiPrices[model]
@@ -423,14 +427,40 @@ func HasKnownListPrice(agg *AggRow) bool {
 	return agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
 }
 
-// ComputeGroupDiscounts 同一分组标识使用同一折扣 = 该组结算人民币合计 / 总金额人民币合计。
-func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool) map[string]float64 {
+// ComputeGroupDiscounts 每个分组标识的折扣。
+//
+// 口径优先级（高到低）：
+//  1. forcedDiscount：调用方显式指定的统一折扣，直接覆盖，不做任何查表；
+//  2. 价表折扣 sheet：按模型厂商家族（见 VendorFamily）匹配，命中即用价表值；
+//  3. 反推：该组 Σ结算人民币 / Σ总金额人民币。
+//
+// 只有走到第 3 步的分组才算「折扣为反推值」，需要由调用方在账单备注里写明——
+// 反推值只能保证账面对得上，并不能说明商务上谈定的折扣是多少。
+//
+// 返回值第二项是「靠反推得到折扣」的分组集合，供写账单时标注。
+func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool) (map[string]float64, map[string]bool) {
 	if forcedDiscount != nil {
 		result := make(map[string]float64, len(rows))
 		for _, agg := range rows {
 			result[agg.Group] = round(*forcedDiscount, DiscountDecimals)
 		}
-		return result
+		return result, map[string]bool{}
+	}
+
+	discounts := map[string]float64{}
+	// 价表优先：同一分组下若各模型的厂商家族折扣不一致，以先命中者为准，
+	// 并把该组记为「混合折扣」，由写账单时在备注里提示复核。
+	tableGroups := map[string]bool{}
+	for _, agg := range rows {
+		if book == nil {
+			break
+		}
+		if d, ok := tableDiscount(book, agg.Model); ok {
+			if _, seen := discounts[agg.Group]; !seen || tableGroups[agg.Group] {
+				discounts[agg.Group] = round(d, DiscountDecimals)
+				tableGroups[agg.Group] = true
+			}
+		}
 	}
 
 	settleByGroup := map[string]float64{}
@@ -443,16 +473,73 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 		listByGroup[agg.Group] += OfficialListCNY(agg, exchangeRate)
 	}
 
-	discounts := make(map[string]float64, len(settleByGroup))
+	derived := map[string]bool{}
 	for group, settle := range settleByGroup {
+		if _, ok := discounts[group]; ok {
+			continue
+		}
 		listing := listByGroup[group]
 		raw := 0.0
+		// 分母为 0（整组零用量）时不反推，避免 0/0 把折扣写成 0。
 		if listing > 0 {
 			raw = settle / listing
 		}
 		discounts[group] = round(raw, DiscountDecimals)
+		derived[group] = true
 	}
-	return discounts
+	return discounts, derived
+}
+
+// tableDiscount 按模型厂商家族在价表折扣 sheet 里查折扣。
+func tableDiscount(book *PriceBook, model string) (float64, bool) {
+	if book == nil {
+		return 0, false
+	}
+	family := VendorFamily(model)
+	if family == "" {
+		return 0, false
+	}
+	if d, ok := book.Discounts[family]; ok {
+		return d, true
+	}
+	return 0, false
+}
+
+// vendorModelPrefixes 模型名 → 厂商家族名的前缀映射。
+//
+// 价表折扣 sheet 的键是厂商家族名（DeepSeek / GLM / Minimax / 可灵），
+// 而日志里的分组标识是客户自己的业务分组（vip、az定制、AWSB opus5 …），
+// 两者不是一个命名空间，所以只能从模型名反推家族。
+// 前缀按「长前缀优先」匹配（minimax-m 早于 mini），避免误判。
+var vendorModelPrefixes = []struct {
+	prefix string
+	family string
+}{
+	{"deepseek", "DeepSeek"},
+	{"glm", "GLM"},
+	{"chatglm", "GLM"},
+	{"minimax", "Minimax"},
+	{"kling", "可灵"},
+	{"可灵", "可灵"},
+}
+
+// VendorFamily 从模型名推断厂商家族，用于匹配价表折扣；无法判断时返回 ""。
+func VendorFamily(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return ""
+	}
+	for _, vp := range vendorModelPrefixes {
+		if strings.HasPrefix(m, vp.prefix) {
+			return vp.family
+		}
+	}
+	return ""
+}
+
+// DiscountFromPriceTable 按模型厂商家族取价表折扣（供单行标注使用）。
+func DiscountFromPriceTable(book *PriceBook, model string) (float64, bool) {
+	return tableDiscount(book, model)
 }
 
 // ParseDiscountText 对应 parse_discount_text：兼容百分数、"6折"、纯小数写法。

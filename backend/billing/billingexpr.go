@@ -290,10 +290,6 @@ type ExprRates struct {
 
 // ExtractExprRates 求表达式在给定上下文长度下的等效单价，用于账单里的单价列。
 //
-// 做法是把表达式在若干「单变量置 1、其余置 0」的基准点上求值，再取差：
-// 每次求值都走完整的档位判断与 hour() 等条件，所以多档表达式、带时段倍率的表达式
-// 都能给出该上下文长度下真正生效的那一档单价，而不必去解析表达式文本。
-//
 // 表达式含 img/ai/ao 这类附加项时，这部分无法用每百万 token 单价表达，
 // Pure 置为 false。
 func ExtractExprRates(exprStr string, at time.Time, inputLen float64) (ExprRates, error) {
@@ -301,7 +297,34 @@ func ExtractExprRates(exprStr string, at time.Time, inputLen float64) (ExprRates
 	if err != nil {
 		return ExprRates{}, err
 	}
+	coef, zero, err := exprCoeffsAt(c, at, inputLen)
+	if err != nil {
+		return ExprRates{}, err
+	}
 
+	rates := ExprRates{
+		InputPerM:        coef[0],
+		OutputPerM:       coef[1],
+		CacheReadPerM:    coef[2],
+		CacheWritePerM:   coef[3],
+		CacheWrite1hPerM: coef[4],
+		// 零点不为 0 说明表达式有与用量无关的常数项（如按次基础费），
+		// 单价列无法体现，标记为非纯表达式。
+		Pure: math.Abs(zero) < 1e-9,
+	}
+	if c.usedVars["img"] || c.usedVars["img_o"] || c.usedVars["ai"] || c.usedVars["ao"] {
+		rates.Pure = false
+	}
+	return rates, nil
+}
+
+// exprCoeffsAt 是 ExtractExprRates 的求值内核：把表达式在若干「单变量置 1、其余置 0」
+// 的基准点上求值，再取差得到五个系数（$/MTok）。
+//
+// 每次求值都走完整的档位判断与 hour() 等条件，所以多档表达式、带时段倍率的表达式
+// 都能给出该上下文长度下真正生效的那一档单价，而不必去解析表达式文本。
+// 返回的第 6 个值是零点值，不为 0 说明表达式含与用量无关的常数项（如按次基础费）。
+func exprCoeffsAt(c *compiledExpr, at time.Time, inputLen float64) ([5]float64, float64, error) {
 	eval := func(p, cOut, cr, cc, cc1h float64) (float64, error) {
 		env := map[string]interface{}{
 			"p": p, "c": cOut, "len": inputLen,
@@ -335,7 +358,7 @@ func ExtractExprRates(exprStr string, at time.Time, inputLen float64) (ExprRates
 	const unit = 1_000_000.0
 	zero, err := eval(0, 0, 0, 0, 0)
 	if err != nil {
-		return ExprRates{}, err
+		return [5]float64{}, 0, err
 	}
 	// 每个变量单独置 unit（其余为 0），与零点的差再除回 unit，即该变量的系数。
 	only := func(idx int) (float64, error) {
@@ -348,23 +371,55 @@ func ExtractExprRates(exprStr string, at time.Time, inputLen float64) (ExprRates
 	for i := range coef {
 		v, err := only(i)
 		if err != nil {
-			return ExprRates{}, err
+			return [5]float64{}, 0, err
 		}
 		coef[i] = (v - zero) / unit
 	}
+	return coef, zero, nil
+}
 
-	rates := ExprRates{
-		InputPerM:        coef[0],
-		OutputPerM:       coef[1],
-		CacheReadPerM:    coef[2],
-		CacheWritePerM:   coef[3],
-		CacheWrite1hPerM: coef[4],
-		// 零点不为 0 说明表达式有与用量无关的常数项（如按次基础费），
-		// 单价列无法体现，标记为非纯表达式。
-		Pure: math.Abs(zero) < 1e-9,
+// ExprRowReconcile 判定「单价 × 用量」能否还原该行的官方刊例，供 X 列与 S/W 公式使用。
+//
+// ok = true：本行只命中过一个档位，该档单价按本行用量加总能精确还原官方刊例，
+// 于是 S/W 可以写成「单价 × 用量」的公式——可复现、可验算。
+// ok = false：本行跨档（或表达式含附加项/常数项），没有单一单价能还原金额。
+// 此时调用方必须留空单价列并把 X 标为「否」，而不是把金额反算成单价把误差藏起来。
+//
+// 判据与 ADAPT_TIERED_BILLING.md 一致：|Σ(单价_i × 用量_i) / 1e6 − 官方美金刊例| < 1e-6。
+func ExprRowReconcile(exprStr string, agg *AggRow, at time.Time) (ExprRates, bool) {
+	if exprStr == "" || agg == nil {
+		return ExprRates{}, false
+	}
+	c, err := compileExpr(exprStr)
+	if err != nil {
+		return ExprRates{}, false
 	}
 	if c.usedVars["img"] || c.usedVars["img_o"] || c.usedVars["ai"] || c.usedVars["ao"] {
-		rates.Pure = false
+		return ExprRates{}, false
 	}
-	return rates, nil
+
+	// 档位由每个请求各自的 len 决定，聚合行里已经看不到逐请求的 len 了。
+	// 但 ExprTiers 记录了本行命中过的档位：命中多档必然跨档，任何单一单价都无法还原。
+	if len(agg.ExprTiers) > 1 {
+		return ExprRates{}, false
+	}
+
+	total := agg.Uncached + agg.CacheRead + agg.CacheWrite5m + agg.CacheWrite1h
+	rates, err := ExtractExprRates(exprStr, at, total)
+	if err != nil || !rates.Pure {
+		return ExprRates{}, false
+	}
+	if math.Abs(ExprUnitAmountUSD(agg, rates)/1e6-agg.OfficialUSD) >= 1e-6 {
+		return ExprRates{}, false
+	}
+	return rates, true
+}
+
+// ExprUnitAmountUSD 按单价列还原的美金金额（以「美元 × 1e6」为单位，未除 1e6）。
+func ExprUnitAmountUSD(agg *AggRow, r ExprRates) float64 {
+	return agg.Uncached*r.InputPerM +
+		agg.CacheRead*r.CacheReadPerM +
+		agg.Output*r.OutputPerM +
+		agg.CacheWrite5m*r.CacheWritePerM +
+		agg.CacheWrite1h*r.CacheWrite1hPerM
 }

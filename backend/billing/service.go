@@ -127,16 +127,18 @@ func mergeManualPrices(book *PriceBook, manual map[string]ManualPriceInput) {
 func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string) Summary {
 	rowSummaries := make([]RowSummary, 0, len(agg.Rows))
 	settleTotal, listTotal := 0.0, 0.0
-	groupDiscounts := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable)
+	groupDiscounts, _ := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable)
 
 	for _, a := range agg.Rows {
-		settle := SettleCNY(a)
 		list := 0.0
 		// 阶梯表达式模型在价表里查不到条目，但刊例已由表达式算出，同样算「有价」。
 		hasPrice := HasKnownListPrice(a)
 		if hasPrice {
 			list = OfficialListCNY(a, exchangeRate)
 		}
+		// 结算金额口径与账单 V 列一致：总金额 × 折扣。日志 quota 折算出的金额
+		// 只作为交叉校验，不再直接当作结算金额，否则账面上的 V 与这里报出的数会对不上。
+		settle := round(list*groupDiscounts[a.Group], MoneyDecimals)
 		settleTotal += settle
 		listTotal += list
 		rowSummaries = append(rowSummaries, RowSummary{
