@@ -191,8 +191,8 @@ func TestTieredBillSingleTierRowIsReproducible(t *testing.T) {
 	// 不含硬编码金额。
 	ac := formula(t, f, sheet, 29, 3)
 	require.NotEmpty(t, ac, "AC 必须是公式而不是裸数值")
-	assert.Contains(t, ac, "D3*E3")
-	assert.Contains(t, ac, "H3*I3")
+	assert.Contains(t, ac, "D3*N(E3)")
+	assert.Contains(t, ac, "H3*N(I3)")
 	assert.NotContains(t, ac, fmt.Sprint(agg.OfficialUSD), "AC 不应出现硬编码的美金刊例")
 
 	// S 必须是公式，统一引用 AC 再乘汇率，不再各写一套分支。

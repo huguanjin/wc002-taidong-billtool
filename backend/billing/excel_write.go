@@ -259,9 +259,12 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		// isTiered 兜底展示价等），AC 落官方刊例本身——这是全表唯一允许出现裸数值的
 		// 单元格，且只出现在这一列，不再散落进 S/W 的公式字符串里。
 		// S/W 一律引用 AC，不再各写一套分支：S = (AC+O*10/1000)*汇率，W = S÷汇率。
+		// 价格列在系数为 0 时会被留空（见下方 hasExpr 分支），留空写入的是空字符串
+		// 而不是数字 0；AC 公式若直接引用会在 Excel 里算出 #VALUE!（数字×文本）。
+		// 用 N() 包一层：N(空文本)=0，N(数字)=原数字，两种情况都安全。
 		reconcilable := useTokenFormula || exprOK
 		if reconcilable {
-			acExpr := fmt.Sprintf("(D%d*E%d+F%d*G%d+H%d*I%d+J%d*K%d+L%d*M%d)/1000000", r, r, r, r, r, r, r, r, r, r)
+			acExpr := fmt.Sprintf("(D%d*N(E%d)+F%d*N(G%d)+H%d*N(I%d)+J%d*N(K%d)+L%d*N(M%d))/1000000", r, r, r, r, r, r, r, r, r, r)
 			setFormula(29, r, acExpr, styleMoney)
 		} else {
 			setNum(29, r, agg.OfficialUSD, styleMoney)
