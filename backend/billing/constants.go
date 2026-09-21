@@ -9,6 +9,9 @@ const (
 	QuotaPerCNY         = 500_000.0
 	MoneyDecimals       = 4
 	DiscountDecimals    = 3
+	// DiscountBaseFactor billtool 自有的"分组倍率→折扣"换算基数，与 new-api 本身的倍率算法无关：
+	// 分组倍率 1 对应折扣 1/DiscountBaseFactor，详见 group_ratio_source.md。
+	DiscountBaseFactor = 7.0
 	// ExcelMaxRowsPerSheet 是 xlsx 格式规定的单个 sheet 最大行数（含表头），超出需拆分到多个 sheet。
 	ExcelMaxRowsPerSheet = 1_048_576
 )

@@ -268,6 +268,55 @@ async function pullDbPrices() {
   }
 }
 
+const userDiscountForm = ref({ username: '', userId: '' })
+const pullingUserDiscount = ref(false)
+const userDiscountError = ref('')
+const userDiscountCurrent = ref(null)
+const userDiscountHistory = ref([])
+
+const derivedFromLabels = {
+  group_group_ratio: '专属倍率',
+  group_ratio: '通用倍率',
+  fallback_default: '兜底默认（未配置，倍率 1）',
+}
+function derivedFromLabel(key) {
+  return derivedFromLabels[key] || key
+}
+
+async function pullUserDiscount() {
+  userDiscountError.value = ''
+  const username = userDiscountForm.value.username.trim()
+  const userId = userDiscountForm.value.userId
+  if (!username && userId === '') {
+    userDiscountError.value = '请填写用户名或用户 ID'
+    return
+  }
+
+  pullingUserDiscount.value = true
+  try {
+    const resp = await fetch('/api/pull-user-discount', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username,
+        userId: userId === '' ? null : Number(userId),
+      }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      userDiscountError.value = data.error || `拉取失败（${resp.status}）`
+      return
+    }
+    userDiscountCurrent.value = data.current
+    userDiscountHistory.value = data.history || []
+  } catch (err) {
+    userDiscountError.value = '请求失败：' + err.message
+  } finally {
+    pullingUserDiscount.value = false
+  }
+}
+
 function onFileChange(e) {
   const file = e.target.files && e.target.files[0]
   selectedFileName.value = file ? file.name : ''
@@ -485,6 +534,60 @@ async function handleSubmit() {
           <button type="button" class="btn-browse" @click="useMergedAsBillInput">作为账单输入</button>
         </div>
       </div>
+    </form>
+
+    <form class="card" @submit.prevent="pullUserDiscount">
+      <h2>客户折扣核对</h2>
+      <p class="hint">
+        按用户名或用户 ID 拉取该用户在业务系统里配置的分组倍率，换算成折扣，存一份快照到本地数据库，
+        便于核对系统折扣与线下报价折扣是否一致。每次点击「拉取」才会连一次业务数据库（只读查询）。
+      </p>
+
+      <div class="grid">
+        <div class="field">
+          <label>用户名</label>
+          <input v-model="userDiscountForm.username" type="text" placeholder="用户名或用户 ID 至少填一项" />
+        </div>
+        <div class="field">
+          <label>用户 ID</label>
+          <input v-model="userDiscountForm.userId" type="number" placeholder="用户名或用户 ID 至少填一项" />
+        </div>
+      </div>
+
+      <button type="submit" :disabled="pullingUserDiscount">{{ pullingUserDiscount ? '拉取中…' : '拉取折扣' }}</button>
+      <p class="error" v-if="userDiscountError">{{ userDiscountError }}</p>
+
+      <div v-if="userDiscountCurrent">
+        <p>
+          用户：{{ userDiscountCurrent.username }}（ID {{ userDiscountCurrent.userId }}） ｜
+          分组：{{ userDiscountCurrent.userGroup }} ｜
+          倍率：{{ userDiscountCurrent.groupRatio }} ｜
+          折扣：{{ userDiscountCurrent.discount.toFixed(3) }} ｜
+          命中规则：{{ derivedFromLabel(userDiscountCurrent.derivedFrom) }}
+        </p>
+        <p class="hint">拉取时间：{{ new Date(userDiscountCurrent.fetchedAt).toLocaleString('zh-CN') }}</p>
+      </div>
+
+      <table v-if="userDiscountHistory.length > 0">
+        <thead>
+          <tr>
+            <th>拉取时间</th>
+            <th>分组</th>
+            <th>倍率</th>
+            <th>折扣</th>
+            <th>命中规则</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="h in userDiscountHistory" :key="h.fetchedAt">
+            <td>{{ new Date(h.fetchedAt).toLocaleString('zh-CN') }}</td>
+            <td>{{ h.userGroup }}</td>
+            <td>{{ h.groupRatio }}</td>
+            <td>{{ h.discount.toFixed(3) }}</td>
+            <td>{{ derivedFromLabel(h.derivedFrom) }}</td>
+          </tr>
+        </tbody>
+      </table>
     </form>
 
     <form class="card" @submit.prevent="handleSubmit">

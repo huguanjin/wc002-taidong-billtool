@@ -7,6 +7,7 @@ services:
       - "8080:8080"
     env_file:
       # 从 .env.example 复制而来，配置登录账号密码（BILL_AUTH_USERNAME / BILL_AUTH_PASSWORD）
+      # 以及「客户折扣核对」功能用的本地 PostgreSQL 连接信息（BILL_PG_*）
       - .env
     environment:
       BILL_ADDR: ":8080"
@@ -23,6 +24,8 @@ services:
       # - ./source-logs:/app/source-logs
       # 上传/生成的临时文件，容器重启后仍可保留
       - bill-jobs:/tmp/taidong-bill-jobs
+    depends_on:
+      - postgres
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
       interval: 30s
@@ -30,5 +33,27 @@ services:
       retries: 3
       start_period: 5s
 
+  # 「客户折扣核对」功能的本地存储：只存 billtool 自己拉取/换算出的折扣快照，
+  # 与业务库（BILL_DB_*，MySQL）完全独立，不会被业务库的变更影响，也不会反向写业务库。
+  postgres:
+    image: postgres:16-alpine
+    container_name: taidong-bill-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: "${BILL_PG_USER:-billtool}"
+      POSTGRES_PASSWORD: "${BILL_PG_PASSWORD:-change-me-please}"
+      POSTGRES_DB: "${BILL_PG_DBNAME:-billtool}"
+    volumes:
+      - bill-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BILL_PG_USER:-billtool}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   bill-jobs:
+  bill-pgdata:
+

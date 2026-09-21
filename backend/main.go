@@ -23,6 +23,7 @@ var (
 	jobDir       string
 	frontendDist string
 	dbConfig     *billing.DBConfig // 为空表示未配置业务数据库，PriceSourceDB 不可用
+	pgConfig     *billing.PGConfig // 为空表示未配置本地 PostgreSQL，客户折扣拉取功能不可用
 )
 
 type jobRecord struct {
@@ -61,6 +62,12 @@ func main() {
 	initAuth()
 	initBrowseRoot()
 	initDBConfig()
+	initPGConfig()
+	if pgConfig != nil {
+		if err := billing.EnsureUserDiscountSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化 PostgreSQL 折扣快照表失败，客户折扣拉取功能可能不可用: %v", err)
+		}
+	}
 
 	go cleanupOldJobs()
 	go cleanupSessions()
@@ -72,6 +79,7 @@ func main() {
 	mux.HandleFunc("/api/bill", withCORS(requireAuth(handleGenerateBill)))
 	mux.HandleFunc("/api/merge-logs", withCORS(requireAuth(handleMergeLogs)))
 	mux.HandleFunc("/api/pull-db-prices", withCORS(requireAuth(handlePullDBPrices)))
+	mux.HandleFunc("/api/pull-user-discount", withCORS(requireAuth(handlePullUserDiscount)))
 	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
@@ -104,6 +112,23 @@ func initDBConfig() {
 		Password: os.Getenv("BILL_DB_PASSWORD"),
 		DBName:   os.Getenv("BILL_DB_NAME"),
 		Table:    os.Getenv("BILL_DB_TABLE"),
+	}
+}
+
+// initPGConfig 从环境变量读取本地 PostgreSQL 连接信息（客户折扣快照存储）；
+// BILL_PG_HOST 为空表示未配置，pgConfig 保持 nil。这是一个和业务库完全独立的数据库。
+func initPGConfig() {
+	host := os.Getenv("BILL_PG_HOST")
+	if host == "" {
+		return
+	}
+	pgConfig = &billing.PGConfig{
+		Host:     host,
+		Port:     os.Getenv("BILL_PG_PORT"),
+		User:     os.Getenv("BILL_PG_USER"),
+		Password: os.Getenv("BILL_PG_PASSWORD"),
+		DBName:   os.Getenv("BILL_PG_DBNAME"),
+		SSLMode:  os.Getenv("BILL_PG_SSLMODE"),
 	}
 }
 
@@ -221,6 +246,57 @@ func handlePullDBPrices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"modelCount": count,
 		"fetchedAt":  fetchedAt.Format(time.RFC3339),
+	})
+}
+
+// handlePullUserDiscount 按用户名或用户 ID 拉取一次分组倍率、换算成折扣，
+// 写入本地 PostgreSQL 留存快照，再连同该用户最近几次的拉取记录一并返回。
+// 每次调用都会连一次业务 MySQL 库（只读查询），但不会写业务库；写的是本地 Postgres。
+func handlePullUserDiscount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if dbConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置业务数据库连接信息（BILL_DB_HOST 等环境变量）")
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL 连接信息（BILL_PG_HOST 等环境变量）")
+		return
+	}
+
+	var body struct {
+		UserID   *int   `json:"userId"`
+		Username string `json:"username"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if body.UserID == nil && strings.TrimSpace(body.Username) == "" {
+		httpError(w, http.StatusBadRequest, "请提供用户名或用户 ID")
+		return
+	}
+
+	current, err := billing.FetchUserGroupDiscount(*dbConfig, body.UserID, body.Username)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if err := billing.SaveUserDiscountPull(*pgConfig, *current); err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	history, err := billing.RecentUserDiscountPulls(*pgConfig, current.UserID, 10)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"current": current,
+		"history": history,
 	})
 }
 

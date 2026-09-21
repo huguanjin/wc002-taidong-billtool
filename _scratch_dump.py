@@ -1,26 +1,30 @@
-import openpyxl
+import openpyxl, sys, glob, os
 
-TIER = "data/按照阶梯计费计算价格.xlsx"
-OLD = "data/未按照阶梯计费计算价格.xlsx"
+def cols(ws):
+    out = {}
+    for col in range(1, ws.max_column + 1):
+        letter = openpyxl.utils.get_column_letter(col)
+        out[letter] = ws.cell(row=1, column=col).value
+    return out
 
-COLS = [1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 19, 20, 22, 23, 24, 28]
-LETTERS = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'S', 'T', 'V', 'W', 'X', 'AB']
-
-
-def dump(path, label):
-    wb = openpyxl.load_workbook(path)
+def dump(path):
+    wb = openpyxl.load_workbook(path, data_only=False)
     ws = wb[wb.sheetnames[0]]
-    print("#### %s sheet=%s max_row=%d max_col=%d" % (label, ws.title, ws.max_row, ws.max_column))
+    print("=" * 100)
+    print("FILE:", os.path.basename(path))
+    print("sheets:", wb.sheetnames, "max_row:", ws.max_row, "max_col:", ws.max_column)
+    hdr = cols(ws)
+    print("headers:", {k: v for k, v in hdr.items()})
+    print("-" * 100)
     for r in range(3, ws.max_row + 1):
-        parts = []
-        for L, c in zip(LETTERS, COLS):
-            v = ws.cell(row=r, column=c).value
-            if v is None:
-                v = ''
-            parts.append("%s=%s" % (L, v))
-        print("r%-3d %s" % (r, " | ".join(parts)))
-    print()
+        vals = []
+        for col in [1, 2, 3, 4, 6, 8, 10, 12, 15, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29]:
+            letter = openpyxl.utils.get_column_letter(col)
+            c = ws.cell(row=r, column=col)
+            v = c.value
+            vals.append(f"{letter}={v!r}")
+        print(f"r{r}: " + " | ".join(vals))
+    wb.close()
 
-
-dump(TIER, "TIERED")
-dump(OLD, "OLD")
+for p in sys.argv[1:]:
+    dump(p)
