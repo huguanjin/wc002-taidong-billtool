@@ -81,6 +81,7 @@ func main() {
 	mux.HandleFunc("/api/pull-db-prices", withCORS(requireAuth(handlePullDBPrices)))
 	mux.HandleFunc("/api/pull-user-discount", withCORS(requireAuth(handlePullUserDiscount)))
 	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
+	mux.HandleFunc("/api/log-groups", withCORS(requireAuth(handleLogGroups)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -233,6 +234,50 @@ func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
 		"missingModels": missingModels,
 		"exprModels":    exprModels,
 		"groups":        groups,
+	})
+}
+
+// handleLogGroups 只读日志的 group 列并去重返回，供前端在选定日志后直接列出分组勾选。
+// 不加载价格、不算聚合，出账前的勾选不该依赖「检查模型价格覆盖」是否点过。
+func handleLogGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseMultipartForm(200 << 20); err != nil {
+		httpError(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+		return
+	}
+
+	jobID := newJobID()
+	jobPath := filepath.Join(jobDir, jobID)
+	if err := os.MkdirAll(jobPath, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer os.RemoveAll(jobPath)
+
+	inputPath, err := resolveInputFile(r, jobPath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	form := r.MultipartForm.Value
+	headers, rows, err := billing.LoadLogRows(inputPath, formValue(form, "sheet"), formValue(form, "encoding"))
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, "读取日志失败: "+err.Error())
+		return
+	}
+	groups, err := billing.ExtractDistinctGroups(headers, rows)
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"groups": groups,
+		"rowCount": len(rows),
 	})
 }
 

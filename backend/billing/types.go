@@ -42,6 +42,24 @@ type AggRow struct {
 	// ListOrigin 本行 OfficialUSD 的来源（见 ListOrigin* 常量）。
 	// 只有外部对标价才能当折扣反推的分母；站内公式自算出来的数字反推不出商务折扣。
 	ListOrigin ListOrigin
+	// ExprUnitCurrency 表达式系数的计价币种："CNY" 表示该模型在站上按人民币报价
+	// （1元=1美金的充值比例，系数 p*1 就是「每百万 1 元」），"USD" 表示系数本身即美金。
+	//
+	// 这个标记只影响单价列与 AC 列的显示换算：账单模板的单价列表头写的是
+	// 「美金/百万token」，人民币系数原样填进去，客户按美金读会虚高 7 倍，
+	// 且 AC 列公式（单价×用量）会连带把总金额放大约汇率倍。
+	// 聚合口径（OfficialUSD 已折算成美金、×汇率还原人民币）与它无关。
+	ExprUnitCurrency string
+}
+
+// ExprUnitDivisor 表达式单价列落成「美金/百万token」要除的数：
+// 人民币计价的系数除汇率，美金计价的不除。汇率缺失时按 1 处理（等于不换算），
+// 宁可显示原值也不要把行弄成 0 单价。
+func (a *AggRow) ExprUnitDivisor(exchangeRate float64) float64 {
+	if a.ExprUnitCurrency != "CNY" || exchangeRate <= 0 {
+		return 1
+	}
+	return exchangeRate
 }
 
 // ListOrigin 标出官方刊例（AggRow.OfficialUSD）是从哪里来的。

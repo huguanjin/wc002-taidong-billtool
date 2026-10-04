@@ -155,7 +155,7 @@ func writeTieredBillMarked(t *testing.T, rows []*AggRow, discount *float64, book
 func TestExprRowReconcileSingleTier(t *testing.T) {
 	agg := exprTieredAgg(t, "gpt-6-astra", "oai", testExprAstra, []string{"base"}, astraBaseTok)
 
-	rates, ok := ExprRowReconcile(testExprAstra, agg, exprAt())
+	rates, ok := ExprRowReconcile(testExprAstra, agg, exprAt(), 7.0)
 	require.True(t, ok, "单档行应当可还原")
 	assert.Equal(t, 10.0, rates.InputPerM)
 	assert.Equal(t, 50.0, rates.OutputPerM)
@@ -172,7 +172,7 @@ func TestExprRowReconcileCrossTier(t *testing.T) {
 	agg := exprTieredAgg(t, "gpt-6-astra", "az定制", testExprAstra,
 		[]string{"base", "tier_2"}, astraCrossTierTok)
 
-	_, ok := ExprRowReconcile(testExprAstra, agg, exprAt())
+	_, ok := ExprRowReconcile(testExprAstra, agg, exprAt(), 7.0)
 	assert.False(t, ok, "跨档行不可还原，不能判为一致")
 
 	// 反证：拿聚合后的总长度去求单价，得到的金额还原不出官方刊例。
@@ -484,6 +484,94 @@ func TestExtractDistinctGroupsFeedsDomesticMarkers(t *testing.T) {
 }
 
 
+// TestDomesticExprUnitColumnsAreUSD 人民币计价的表达式系数必须归一成美金再进单价列。
+//
+// 账单模板的单价列表头写的是「美金/百万token」，而国产模型在站上按人民币报价
+// （1元=1美金的充值比例，表达式里的 p*1 就是「每百万 1 元」）。系数原样填进美金列，
+// 客户按美金读会虚高 7 倍，且 AC 列（单价×用量）会连带把总金额放大一个汇率倍数。
+func TestDomesticExprUnitColumnsAreUSD(t *testing.T) {
+	const rate = 7.0
+	// p*1 + c*4：人民币口径，即每百万输入 1 元、输出 4 元。
+	expr := `(tier("default", p * 1 + c * 4))`
+	at := time.Date(2026, 9, 1, 3, 0, 0, 0, time.UTC)
+
+	makeAgg := func(model, currency string) *AggRow {
+		agg := &AggRow{
+			Model: model, Group: "国产模型",
+			Uncached: 1_000_000, Output: 1_000_000, Rows: 1,
+			BillingMode: BillingModeTieredExpr, BillingExpr: expr,
+			ExprTiers: []string{"default"}, LastAt: at, ExprUnitCurrency: currency,
+		}
+		params := BuildExprParams(model, 2_000_000, agg.Uncached, agg.Output, 0, 0, 0, 0, 0, 0, 0, expr)
+		res, err := RunBillingExpr(expr, params, at)
+		require.NoError(t, err)
+		agg.OfficialUSD = res.USD / 1_000_000
+		if VendorFamily(model) != "" {
+			agg.OfficialUSD /= rate
+		}
+		return agg
+	}
+
+	// 人民币计价：单价列应是人民币 ÷ 汇率，且能还原官方美金刊例。
+	rate1, ok := ExprRowReconcile(expr, makeAgg("deepseek-v4.1-flash", "CNY"), at, rate)
+	require.True(t, ok, "归一后应能还原官方美金刊例")
+	assert.InDelta(t, 1.0/rate, rate1.InputPerM, 1e-9, "1 元/百万 应折成 1/7 美金/百万")
+	assert.InDelta(t, 4.0/rate, rate1.OutputPerM, 1e-9)
+
+	// 同一份系数若币种没标对，就还原不出美金刊例——这正是修复前的症状，
+	// 也是这个标记存在的意义：不能靠模型名去猜，得由聚合阶段明确记下来。
+	_, okUSD := ExprRowReconcile(expr, makeAgg("deepseek-v4.1-flash", "USD"), at, rate)
+	assert.False(t, okUSD, "币种标错时单价无法还原刊例，判据必须拦住")
+
+	// 海外模型系数本身就是美金，不参与归一。
+	// 注意这里必须用海外自己的表达式（testExprAstra，base 档 p*10 + c*50）造刊例，
+	// 不能复用人民币表达式的 makeAgg——那份刊例和美金系数对不上，比出来的不是币种问题。
+	overseas := &AggRow{
+		Model: "gpt-6-astra", Group: "oai",
+		Uncached: 1_000_000, Output: 1_000_000, Rows: 1,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra,
+		ExprTiers: []string{"base"}, LastAt: at, ExprUnitCurrency: "USD",
+	}
+	params := BuildExprParams(overseas.Model, 2_000_000, overseas.Uncached, overseas.Output,
+		0, 0, 0, 0, 0, 0, 0, testExprAstra)
+	res, err := RunBillingExpr(testExprAstra, params, at)
+	require.NoError(t, err)
+	overseas.OfficialUSD = res.USD / 1_000_000
+
+	rate2, ok2 := ExprRowReconcile(testExprAstra, overseas, at, rate)
+	require.True(t, ok2, "海外美金系数应能还原刊例")
+	// 2,000,000 token 超过 testExprAstra 的 272,000 阈值，命中 tier_2 档（p*20 + c*75）。
+	assert.InDelta(t, 20.0, rate2.InputPerM, 1e-9, "美金系数不应被汇率改动")
+	assert.InDelta(t, 75.0, rate2.OutputPerM, 1e-9)
+}
+
+// TestAggregateMarksExprUnitCurrency 聚合阶段必须记下表达式系数的币种，
+// 否则写账单时无从知道该不该除以汇率。
+func TestAggregateMarksExprUnitCurrency(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	// expr: tier("default", p * 1 + c * 4)
+	exprB64 := "dGllcigiZGVmYXVsdCIsIHAgKiAxICsgYyAqIDQp"
+	rows := [][]string{
+		{"deepseek-v4.1-flash", "国产模型", "100000", "2000", "12345", `{"expr_b64":"` + exprB64 + `"}`, "1755000000"},
+		{"claude-sonnet-5", "海外", "100000", "2000", "12345", `{"expr_b64":"` + exprB64 + `"}`, "1755000000"},
+	}
+
+	result, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 2)
+
+	byModel := map[string]*AggRow{}
+	for _, r := range result.Rows {
+		byModel[r.Model] = r
+	}
+	assert.Equal(t, "CNY", byModel["deepseek-v4.1-flash"].ExprUnitCurrency,
+		"国产供应商家族的表达式系数按人民币计价")
+	assert.Equal(t, "USD", byModel["claude-sonnet-5"].ExprUnitCurrency,
+		"非国产模型的表达式系数即美金")
+	assert.Equal(t, 7.0, byModel["deepseek-v4.1-flash"].ExprUnitDivisor(7.0))
+	assert.Equal(t, 1.0, byModel["claude-sonnet-5"].ExprUnitDivisor(7.0))
+}
+
 // 国产厂商模型只要挂的是第三方部署、有官方对标价，就照样能反推；
 // 「是不是国产」和「有没有外部对标价」是两回事，判据以后者为准。
 func TestAutoVendorFamilyDoesNotSuppressDerivation(t *testing.T) {
@@ -546,7 +634,7 @@ func TestBillFormulasReconcileAcrossRows(t *testing.T) {
 		r := 3 + i
 
 		// 1. 单价 × 用量 能否还原官方刊例。
-		rates, ok := ExprRowReconcile(agg.BillingExpr, agg, exprAt())
+		rates, ok := ExprRowReconcile(agg.BillingExpr, agg, exprAt(), 7.0)
 		if ok {
 			unitUSD := ExprUnitAmountUSD(agg, rates) / 1e6
 			if delta := math.Abs(unitUSD - agg.OfficialUSD); delta >= 1e-6 {

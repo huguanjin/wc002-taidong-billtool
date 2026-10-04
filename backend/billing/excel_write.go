@@ -259,7 +259,7 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			exprAt = time.Now()
 		}
 		if hasExpr {
-			exprRates, exprOK = ExprRowReconcile(agg.BillingExpr, agg, exprAt)
+			exprRates, exprOK = ExprRowReconcile(agg.BillingExpr, agg, exprAt, exchangeRate)
 		}
 
 		// AC 列（官方刊例-美金）：能由 E/G/I/K/M 还原的行（普通价表行，或阶梯单档行），

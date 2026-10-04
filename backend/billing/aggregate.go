@@ -145,6 +145,9 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		var exprUsed, matchedTier string
 		// 本行刊例的来源，决定它能不能当折扣反推的分母（见 ListOrigin）。
 		listOrigin := ListOriginNone
+		// 表达式系数的计价币种：国产供应商家族在站上按人民币报价，系数落成
+		// 「美金/百万token」单价前要除汇率；海外模型系数本身即美金，不除。
+		exprUnitCurrency := "USD"
 		billingMode := imgMode
 		if billingMode == "" {
 			billingMode = "token"
@@ -194,7 +197,13 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 					// 国产供应商家族的 billing_expr 系数是人民币、不是美元；这里先除回
 					// exchangeRate，下游 OfficialListCNY = officialUSD * exchangeRate 才能正确
 					// 换回原始人民币刊例，否则会被多乘一次汇率，把国产模型的"官方刊例"放大约 exchangeRate 倍。
+					//
+					// 注意这是载荷性写法，不是重复除法：OfficialUSD 必须是「美金」口径
+					// （AC 列按美金、S 列再 ×汇率还原人民币），除去的这一层由下游乘回来。
+					// 同一币种还要传给单价列（见 ExprUnitCurrency），否则单价列留着人民币数字
+					// 被当成美金，AC 的「单价×用量」公式会整体放大 exchangeRate 倍。
 					listUSD /= exchangeRate
+					exprUnitCurrency = "CNY"
 				}
 				exprUsed = exprStr
 				matchedTier = res.MatchedTier
@@ -234,7 +243,10 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		key := [2]string{model, group}
 		agg, exists := buckets[key]
 		if !exists {
-			agg = &AggRow{Model: model, Group: group, BillingMode: billingMode, ListOrigin: listOrigin}
+			agg = &AggRow{
+				Model: model, Group: group, BillingMode: billingMode, ListOrigin: listOrigin,
+				ExprUnitCurrency: exprUnitCurrency,
+			}
 			buckets[key] = agg
 			if !groupSeen[group] {
 				groupSeen[group] = true
@@ -245,6 +257,11 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			// 或表达式降级行按价表算。整桶来源只有在完全一致时才可信，
 			// 不一致就记成 mixed，让折扣反推跳过这一桶而不是用半截分母算出个错数。
 			agg.ListOrigin = mergesListOrigin(agg.ListOrigin, listOrigin)
+			// 币种同样要一致：只要有一行是人民币系数，这一桶的单价列就得按人民币归一，
+			// 否则单价列会混着两种量纲的数字，客户没法读。
+			if exprUnitCurrency == "CNY" {
+				agg.ExprUnitCurrency = "CNY"
+			}
 		}
 		if exprUsed != "" {
 			agg.BillingExpr = exprUsed

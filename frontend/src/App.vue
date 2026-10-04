@@ -123,6 +123,8 @@ function useMergedAsBillInput() {
   if (!mergeResult.value) return
   serverPath.value = mergeResult.value.mergedPath
   sourceMode.value = 'server'
+  // 换了输入文件，分组列表跟着刷新。
+  loadGroups()
 }
 
 const browserOpen = ref(false)
@@ -218,6 +220,8 @@ function confirmBrowserPick() {
 function pickFile(entry) {
   serverPath.value = entry.path
   browserOpen.value = false
+  // 这条路不经过 input 的 blur，手动触发一次分组加载。
+  loadGroups()
 }
 
 const form = ref({
@@ -246,8 +250,10 @@ const priceCheckDone = ref(false)
 const checkedModelCount = ref(0)
 const missingModels = ref([])
 const exprModels = ref([])
-// 日志里去重后的分组标识，由「检查模型价格覆盖」带回来，用于渲染勾选列表。
+// 日志里去重后的分组标识，选定日志后由 /api/log-groups 带回，用于渲染勾选列表。
 const groups = ref([])
+const loadingGroups = ref(false)
+const groupsError = ref('')
 // selectedDomesticGroups 是勾选为「国产/站内定价」的分组名集合。
 const selectedDomesticGroups = ref({})
 // domesticModelPrefixes 兜住按分组名勾不准的情况：整组里只有部分模型是站内定价时，
@@ -328,6 +334,9 @@ async function pullUserDiscount() {
 function onFileChange(e) {
   const file = e.target.files && e.target.files[0]
   selectedFileName.value = file ? file.name : ''
+  // 选了文件就把分组列出来，不必先点「检查价格覆盖」——勾选是出账前的事，
+  // 和价格检查是两件事。
+  if (file) loadGroups()
 }
 
 function fmtNum(v) {
@@ -370,6 +379,36 @@ function appendSourceFields(fd, errRef) {
     fd.append('serverPath', serverPath.value.trim())
   }
   return true
+}
+
+// loadGroups 读取当前所选日志的 group 列去重结果并列出勾选框。
+// 选定日志后自动调用（换文件/改服务器路径都会重新拉），不依赖价格检查。
+async function loadGroups() {
+  groupsError.value = ''
+  const fd = new FormData()
+  if (!appendSourceFields(fd, groupsError)) return
+
+  loadingGroups.value = true
+  try {
+    const resp = await fetch('/api/log-groups', { method: 'POST', body: fd })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      groupsError.value = data.error || `读取分组失败（${resp.status}）`
+      return
+    }
+    groups.value = data.groups || []
+    // 保留已勾选、且这次日志里仍然存在的分组，重跑不用重勾。
+    const nextSelected = {}
+    for (const g of groups.value) {
+      if (selectedDomesticGroups.value[g]) nextSelected[g] = true
+    }
+    selectedDomesticGroups.value = nextSelected
+  } catch (err) {
+    groupsError.value = '读取分组失败：' + err.message
+  } finally {
+    loadingGroups.value = false
+  }
 }
 
 async function checkMissingPrices() {
@@ -633,7 +672,12 @@ async function handleSubmit() {
       <div class="field" v-else>
         <label>服务器文件路径（绝对或相对路径）</label>
         <div class="path-row">
-          <input v-model="serverPath" type="text" placeholder="例如 logs/2026-08.xlsx 或 /data/logs/2026-08.xlsx" />
+          <input
+            v-model="serverPath"
+            type="text"
+            placeholder="例如 logs/2026-08.xlsx 或 /data/logs/2026-08.xlsx"
+            @blur="loadGroups"
+          />
           <button type="button" class="btn-browse" @click="openBrowser">浏览服务器文件</button>
         </div>
         <span class="hint">相对路径基于服务器配置的浏览根目录（BILL_BROWSE_ROOT），也可填写该目录下的绝对路径</span>
@@ -676,8 +720,10 @@ async function handleSubmit() {
             </span>
           </div>
         </div>
+        <span class="hint" v-else-if="loadingGroups">正在读取日志分组…</span>
+        <p class="error" v-else-if="groupsError">{{ groupsError }}</p>
         <span class="hint" v-else>
-          先点「检查模型价格覆盖」，这里会列出日志里的分组供勾选。
+          选定日志文件（或填好服务器路径）后，这里会自动列出该日志里的分组供勾选。
         </span>
         <input
           v-model="domesticModelPrefixes"

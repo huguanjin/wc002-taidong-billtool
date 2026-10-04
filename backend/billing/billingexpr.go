@@ -288,6 +288,21 @@ type ExprRates struct {
 	Pure bool
 }
 
+// divideBy 把各档单价按同一除数归一（币种换算），Pure 标记原样保留。
+func (r ExprRates) divideBy(divisor float64) ExprRates {
+	if divisor == 0 || divisor == 1 {
+		return r
+	}
+	return ExprRates{
+		InputPerM:        r.InputPerM / divisor,
+		OutputPerM:       r.OutputPerM / divisor,
+		CacheReadPerM:    r.CacheReadPerM / divisor,
+		CacheWritePerM:   r.CacheWritePerM / divisor,
+		CacheWrite1hPerM: r.CacheWrite1hPerM / divisor,
+		Pure:             r.Pure,
+	}
+}
+
 // ExtractExprRates 求表达式在给定上下文长度下的等效单价，用于账单里的单价列。
 //
 // 表达式含 img/ai/ao 这类附加项时，这部分无法用每百万 token 单价表达，
@@ -386,7 +401,12 @@ func exprCoeffsAt(c *compiledExpr, at time.Time, inputLen float64) ([5]float64, 
 // 此时调用方必须留空单价列并把 X 标为「否」，而不是把金额反算成单价把误差藏起来。
 //
 // 判据与 ADAPT_TIERED_BILLING.md 一致：|Σ(单价_i × 用量_i) / 1e6 − 官方美金刊例| < 1e-6。
-func ExprRowReconcile(exprStr string, agg *AggRow, at time.Time) (ExprRates, bool) {
+//
+// exchangeRate 用于把人民币计价的表达式系数归一成美金（见 AggRow.ExprUnitCurrency）：
+// 国产模型在站上按人民币报价（p*1 就是「每百万 1 元」），而单价列与官方美金刊例都是
+// 美金口径，不归一的话「单价×用量」会比刊例大整整一个汇率倍数，本函数恒判 false，
+// 账单上那一列单价也就一直留着人民币数字被当成美金。
+func ExprRowReconcile(exprStr string, agg *AggRow, at time.Time, exchangeRate float64) (ExprRates, bool) {
 	if exprStr == "" || agg == nil {
 		return ExprRates{}, false
 	}
@@ -409,6 +429,8 @@ func ExprRowReconcile(exprStr string, agg *AggRow, at time.Time) (ExprRates, boo
 	if err != nil || !rates.Pure {
 		return ExprRates{}, false
 	}
+	// 先归一到美金口径再与 OfficialUSD 比：两边同量纲，判据才有意义。
+	rates = rates.divideBy(agg.ExprUnitDivisor(exchangeRate))
 	if math.Abs(ExprUnitAmountUSD(agg, rates)/1e6-agg.OfficialUSD) >= 1e-6 {
 		return ExprRates{}, false
 	}
