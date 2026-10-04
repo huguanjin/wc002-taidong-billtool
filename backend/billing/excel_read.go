@@ -247,22 +247,59 @@ func LoadPriceBook(path string) (*PriceBook, error) {
 	}
 
 	if len(sheets) > 1 {
-		rows2, err2 := f.GetRows(sheets[1])
+		discounts, err2 := loadDiscountSheet(f, sheets[1])
 		if err2 == nil {
-			for i, row := range rows2 {
-				if i < 7 {
-					continue
-				}
-				category := strings.TrimSpace(cellAt(row, 4))
-				if category == "" {
-					continue
-				}
-				if d, ok := ParseDiscountText(cellAt(row, 6)); ok {
-					book.Discounts[category] = d
-				}
+			for family, d := range discounts {
+				book.Discounts[family] = d
 			}
 		}
 	}
 
 	return book, nil
+}
+
+// LoadPriceTableDiscounts 只读报价表第二个 sheet（厂商家族折扣，如「国产模型」sheet 里
+// DeepSeek=6折），不加载模型单价。PriceSource=db 时 LoadDBPriceCache 不读 price_table.xlsx，
+// 这里单独把价表折扣补进 book.Discounts，避免价表配置好的折扣在 db 模式下形同虚设、
+// 整组掉进「Σ结算/Σ总金额」反推（反推对走 billing_expr 的自定义计费模型并不可靠）。
+func LoadPriceTableDiscounts(path string) (map[string]float64, error) {
+	if path == "" {
+		return map[string]float64{}, nil
+	}
+	if _, err := os.Stat(path); err != nil {
+		return map[string]float64{}, nil
+	}
+	f, err := excelize.OpenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	sheets := f.GetSheetList()
+	if len(sheets) < 2 {
+		return map[string]float64{}, nil
+	}
+	return loadDiscountSheet(f, sheets[1])
+}
+
+// loadDiscountSheet 解析报价表折扣 sheet：第 8 行起，第 5 列是厂商家族名，第 7 列是折扣文本。
+func loadDiscountSheet(f *excelize.File, sheetName string) (map[string]float64, error) {
+	rows, err := f.GetRows(sheetName)
+	if err != nil {
+		return nil, err
+	}
+	discounts := map[string]float64{}
+	for i, row := range rows {
+		if i < 7 { // 对应 openpyxl min_row=8（1-indexed）
+			continue
+		}
+		category := strings.TrimSpace(cellAt(row, 4))
+		if category == "" {
+			continue
+		}
+		if d, ok := ParseDiscountText(cellAt(row, 6)); ok {
+			discounts[category] = d
+		}
+	}
+	return discounts, nil
 }

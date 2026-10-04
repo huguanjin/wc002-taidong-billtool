@@ -28,6 +28,18 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		if err != nil {
 			return nil, err
 		}
+		// LoadDBPriceCache 只读数据库实时价格，不含 price_table.xlsx 人工维护的厂商家族
+		// 折扣 sheet（如「国产模型」sheet 里 DeepSeek=6折）；不补上的话这些分组会整组掉进
+		// ComputeGroupDiscounts 的「Σ结算/Σ总金额」反推——对走 billing_expr 阶梯表达式计费
+		// 的自定义模型，反推出来的折扣不可信（反推用的"官方刊例"并非真正的官方对标价）。
+		// 加载失败不影响出账，只是这些分组会退回反推。
+		if discounts, derr := LoadPriceTableDiscounts(priceTablePath); derr == nil {
+			for family, d := range discounts {
+				if _, exists := book.Discounts[family]; !exists {
+					book.Discounts[family] = d
+				}
+			}
+		}
 	default:
 		book, err = LoadPriceBook(priceTablePath)
 		if err != nil {

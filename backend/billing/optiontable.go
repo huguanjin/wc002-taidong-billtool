@@ -171,8 +171,16 @@ func LoadDBPriceCache(cachePath string) (*PriceBook, *BillingExprSetting, time.T
 
 	book := NewPriceBook()
 	for model, p := range file.Prices {
+		// ModelRatio/CompletionRatio 换算出来的数值默认按美元计；但国产供应商家
+		// （VendorFamily 能识别的 DeepSeek/GLM/Minimax/可灵/Kimi/Qwen）在这套系统里
+		// 是按人民币报价（充值比例 1 元=1 美金，不走真实汇率），标成 CNY 后
+		// ResolvePrice 会正确除回 exchangeRate，避免后续换回人民币时被多乘一次汇率。
+		currency := "USD"
+		if VendorFamily(model) != "" {
+			currency = "CNY"
+		}
 		book.ByModel[model] = ModelPrice{
-			InputPerM: p.InputPerM, OutputPerM: p.OutputPerM, Currency: "USD",
+			InputPerM: p.InputPerM, OutputPerM: p.OutputPerM, Currency: currency,
 			Source: "option_table_db_file", Category: "数据库实时", Channel: "options",
 		}
 	}

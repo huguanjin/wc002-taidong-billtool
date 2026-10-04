@@ -180,6 +180,12 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 				billingMode = "token"
 			} else {
 				listUSD = res.USD / 1_000_000
+				if VendorFamily(model) != "" {
+					// 国产供应商家族的 billing_expr 系数是人民币、不是美元；这里先除回
+					// exchangeRate，下游 OfficialListCNY = officialUSD * exchangeRate 才能正确
+					// 换回原始人民币刃例，否则会被多乘一次汇率，把国产模型的“官方刃例”放大约 exchangeRate 倍。
+					listUSD /= exchangeRate
+				}
 				exprUsed = exprStr
 				matchedTier = res.MatchedTier
 			}

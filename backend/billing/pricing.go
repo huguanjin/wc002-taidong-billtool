@@ -616,6 +616,8 @@ var vendorModelPrefixes = []struct {
 	{"minimax", "Minimax"},
 	{"kling", "可灵"},
 	{"可灵", "可灵"},
+	{"kimi", "Kimi"},
+	{"qwen", "Qwen"},
 }
 
 // VendorFamily 从模型名推断厂商家族，用于匹配价表折扣；无法判断时返回 ""。
