@@ -3,6 +3,7 @@ package billing
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"math"
 	"sort"
 	"strconv"
@@ -80,6 +81,100 @@ func ParseCacheTokens(other string) (cacheRead, cacheWrite5m, cacheWrite1h float
 		cc = float64(*creation)
 	}
 	return cr, cc, 0
+}
+
+// ParseRowDetails 解析脱敏日志新增的逐条明细列（3.1/3.2 契约），全部来自 other
+// 的单次 JSON 解析，复用 jsonNumber 取值，不为每个字段单独 Unmarshal。
+// 非 JSON / 空字符串时返回零值，不报错、不 panic——缓存族字段的容错解析仍由
+// ParseCacheTokens 的回退路径负责，与本函数相互独立。
+func ParseRowDetails(other string, includeBilling bool) RowDetails {
+	var details RowDetails
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return details
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return details
+	}
+
+	if s, ok := data["usage_semantic"].(string); ok {
+		details.UsageSemantic = s
+	}
+	details.InputTokensTotal = optFloat(data, "input_tokens_total")
+	details.CacheWriteTokens = optFloat(data, "cache_write_tokens")
+	details.TextInput = optFloat(data, "text_input")
+	details.TextOutput = optFloat(data, "text_output")
+	details.AudioOutput = optFloat(data, "audio_output")
+	details.ImageOutput = optFloat(data, "image_output")
+
+	details.AudioInput = optFloat(data, "audio_input")
+	if details.AudioInput == nil || *details.AudioInput == 0 {
+		if fallback := optFloat(data, "audio_input_token_count"); fallback != nil {
+			details.AudioInput = fallback
+		}
+	}
+
+	if compDetails, ok := data["completion_tokens_details"].(map[string]interface{}); ok {
+		details.ReasoningTokens = optFloat(compDetails, "reasoning_tokens")
+	}
+	if details.ReasoningTokens == nil {
+		// 主库当前多数日志形态不写 completion_tokens_details.reasoning_tokens；
+		// 顶层 reasoning_tokens 是否存在由实际日志决定，留这个兜底以便将来自动生效。
+		details.ReasoningTokens = optFloat(data, "reasoning_tokens")
+	}
+
+	if arr, ok := data["tool_surcharges"].([]interface{}); ok {
+		var parts []string
+		for _, item := range arr {
+			m, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := m["name"].(string)
+			countRaw, hasCount := m["count"]
+			priceRaw, hasPrice := m["price"]
+			if name == "" || !hasCount || !hasPrice || countRaw == nil || priceRaw == nil {
+				continue // count/price 缺失的元素跳过，不整体报错
+			}
+			parts = append(parts, fmt.Sprintf("%s×%s@%s", name, formatFloat(jsonNumber(countRaw)), formatFloat(jsonNumber(priceRaw))))
+		}
+		details.ToolSurcharges = strings.Join(parts, ";")
+	}
+
+	if includeBilling {
+		details.Billing = BillingDetails{
+			ModelRatio:           optFloat(data, "model_ratio"),
+			CompletionRatio:      optFloat(data, "completion_ratio"),
+			GroupRatio:           optFloat(data, "group_ratio"),
+			UserGroupRatio:       optFloat(data, "user_group_ratio"),
+			CacheRatio:           optFloat(data, "cache_ratio"),
+			CacheCreationRatio:   optFloat(data, "cache_creation_ratio"),
+			CacheCreationRatio5m: optFloat(data, "cache_creation_ratio_5m"),
+			CacheCreationRatio1h: optFloat(data, "cache_creation_ratio_1h"),
+			ModelPrice:           optFloat(data, "model_price"),
+			PreConsumedQuota:     optFloat(data, "pre_consumed_quota"),
+			ActualQuota:          optFloat(data, "actual_quota"),
+		}
+		if s, ok := data["billing_mode"].(string); ok {
+			details.Billing.BillingMode = s
+		}
+		if s, ok := data["matched_tier"].(string); ok {
+			details.Billing.MatchedTier = s
+		}
+	}
+
+	return details
+}
+
+// optFloat 取 data[key]；缺失或为 null 时返回 nil（表示「没有这个字段」，与「值为 0」区分）。
+func optFloat(data map[string]interface{}, key string) *float64 {
+	v, ok := data[key]
+	if !ok || v == nil {
+		return nil
+	}
+	f := jsonNumber(v)
+	return &f
 }
 
 func ratioOrDefault(v interface{}, def float64) float64 {

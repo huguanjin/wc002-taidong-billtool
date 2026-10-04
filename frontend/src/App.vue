@@ -228,6 +228,7 @@ const form = ref({
   priceSource: 'db',
   sanitizedLog: true,
   sanitizedFormat: 'tsv',
+  includeBillingParams: false,
   keepLog: false,
 })
 
@@ -403,6 +404,7 @@ async function handleSubmit() {
   fd.append('priceSource', form.value.priceSource)
   fd.append('sanitizedLog', String(form.value.sanitizedLog))
   fd.append('sanitizedFormat', form.value.sanitizedFormat)
+  fd.append('includeBillingParams', String(form.value.includeBillingParams))
   fd.append('keepLog', String(form.value.keepLog))
 
   const manualEntries = {}
@@ -706,6 +708,7 @@ async function handleSubmit() {
           <option value="csv">csv（纯文本，无行数上限，适合超大日志）</option>
           <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
         </select>
+        <label><input v-model="form.includeBillingParams" type="checkbox" /> 附带计费参数列（模型/分组倍率等内部参数，默认不导出）</label>
       </div>
 
       <button type="submit" :disabled="loading">{{ loading ? '生成中…' : '生成账单' }}</button>

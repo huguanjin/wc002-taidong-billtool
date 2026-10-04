@@ -189,7 +189,7 @@ func TestAggregateUsesOptionTableExpr(t *testing.T) {
 	}
 	setting := &BillingExprSetting{Exprs: map[string]string{"gpt-5.4": exprGPT54}}
 
-	result, err := AggregateFromRows(rows, headers, nil, 7.2, false, setting, nil)
+	result, err := AggregateFromRows(rows, headers, nil, 7.2, false, setting, false, nil)
 	if err != nil {
 		t.Fatalf("AggregateFromRows 失败: %v", err)
 	}

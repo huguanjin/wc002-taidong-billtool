@@ -116,12 +116,114 @@ var SanitizedCacheColumns = []string{
 	"cache_creation_tokens_1h",
 }
 
+// SanitizedDetailColumns 脱敏日志在缓存列之后追加的明细列（顺序即输出顺序），
+// 全部从 other 里提出来，不恢复 other 本身。
+var SanitizedDetailColumns = []string{
+	"uncached_input_tokens",
+	"input_tokens_total",
+	"usage_semantic",
+	"cache_write_tokens",
+	"text_input_tokens",
+	"text_output_tokens",
+	"audio_input_tokens",
+	"audio_output_tokens",
+	"image_output_tokens",
+	"reasoning_tokens",
+	"web_search_calls",
+	"tool_surcharges",
+}
+
+// SanitizedBillingColumns 可选输出的站点内部计费参数列（需 Params.IncludeBillingParams
+// 开启才会追加；默认不输出，这些字段暴露站点内部定价倍率，是否对客户可见属于商务决定）。
+var SanitizedBillingColumns = []string{
+	"model_ratio",
+	"completion_ratio",
+	"group_ratio",
+	"user_group_ratio",
+	"cache_ratio",
+	"cache_creation_ratio",
+	"cache_creation_ratio_5m",
+	"cache_creation_ratio_1h",
+	"model_price",
+	"billing_mode",
+	"matched_tier",
+	"pre_consumed_quota",
+	"actual_quota",
+}
+
+// SanitizedColumns 返回脱敏日志在原始列（已去除 other 与 SanitizedDropColumns）之后
+// 追加的列集合：缓存列 + 明细列，includeBilling 为真时再追加计费参数列。
+func SanitizedColumns(includeBilling bool) []string {
+	cols := make([]string, 0, len(SanitizedCacheColumns)+len(SanitizedDetailColumns)+len(SanitizedBillingColumns))
+	cols = append(cols, SanitizedCacheColumns...)
+	cols = append(cols, SanitizedDetailColumns...)
+	if includeBilling {
+		cols = append(cols, SanitizedBillingColumns...)
+	}
+	return cols
+}
+
+// SanitizedDropColumns 脱敏日志整体丢弃的原始列。SanitizedDetailColumns /
+// SanitizedBillingColumns 是从 other 里提出来的新列，other 本身仍整体丢弃，
+// 不因新增列而改变脱敏策略。
 var SanitizedDropColumns = map[string]bool{
 	"other":                    true,
 	"cache_tokens":             true,
 	"cache_creation_tokens":    true,
 	"cache_creation_tokens_5m": true,
 	"cache_creation_tokens_1h": true,
+}
+
+// detailCells 按 SanitizedDetailColumns 顺序返回明细列的值：float64 表示数字、
+// string 表示文本、nil 表示该字段缺失（数字留空、文本也留空，不写成 0 或空串占位）。
+func detailCells(d RowDetails) []interface{} {
+	return []interface{}{
+		d.UncachedInputTokens,
+		ptrCell(d.InputTokensTotal),
+		strCell(d.UsageSemantic),
+		ptrCell(d.CacheWriteTokens),
+		ptrCell(d.TextInput),
+		ptrCell(d.TextOutput),
+		ptrCell(d.AudioInput),
+		ptrCell(d.AudioOutput),
+		ptrCell(d.ImageOutput),
+		ptrCell(d.ReasoningTokens),
+		d.WebSearchCalls,
+		strCell(d.ToolSurcharges),
+	}
+}
+
+// billingCells 按 SanitizedBillingColumns 顺序返回计费参数列的值，语义同 detailCells。
+func billingCells(b BillingDetails) []interface{} {
+	return []interface{}{
+		ptrCell(b.ModelRatio),
+		ptrCell(b.CompletionRatio),
+		ptrCell(b.GroupRatio),
+		ptrCell(b.UserGroupRatio),
+		ptrCell(b.CacheRatio),
+		ptrCell(b.CacheCreationRatio),
+		ptrCell(b.CacheCreationRatio5m),
+		ptrCell(b.CacheCreationRatio1h),
+		ptrCell(b.ModelPrice),
+		strCell(b.BillingMode),
+		strCell(b.MatchedTier),
+		ptrCell(b.PreConsumedQuota),
+		ptrCell(b.ActualQuota),
+	}
+}
+
+func ptrCell(v *float64) interface{} {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func strCell(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 const (

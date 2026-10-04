@@ -86,6 +86,47 @@ type Params struct {
 	// ManualPrices 缺失定价模型的手动补全价格，键为日志里的原始模型名，
 	// 生成账单时会合并进 PriceBook.ByModel（Source: "manual_override"）。
 	ManualPrices map[string]ManualPriceInput
+	// IncludeBillingParams 控制脱敏日志是否附带站点内部计费参数列（见 SanitizedBillingColumns）。
+	// 默认 false：这些字段暴露内部定价倍率，是否对客户可见属于商务决定。
+	IncludeBillingParams bool
+}
+
+// RowDetails 脱敏日志需要额外展开的单行明细，全部来自日志 other 字段
+// 或聚合循环已算出的计费口径值。指针字段为 nil 表示「该日志没有这个字段」，
+// 写出时留空，不要写成 0；UncachedInputTokens / WebSearchCalls 是计费口径值，
+// 与现有 4 个缓存列行为一致，始终写数字（含 0）。
+type RowDetails struct {
+	UncachedInputTokens float64
+	UsageSemantic       string
+	InputTokensTotal    *float64
+	CacheWriteTokens    *float64
+	TextInput           *float64
+	TextOutput          *float64
+	AudioInput          *float64
+	AudioOutput         *float64
+	ImageOutput         *float64
+	ReasoningTokens     *float64
+	WebSearchCalls      float64
+	ToolSurcharges      string
+	// Billing 仅当 Params.IncludeBillingParams 为真时才会被填充。
+	Billing BillingDetails
+}
+
+// BillingDetails 站点内部计费参数（可选输出，默认关闭，见 SanitizedBillingColumns）。
+type BillingDetails struct {
+	ModelRatio           *float64
+	CompletionRatio      *float64
+	GroupRatio           *float64
+	UserGroupRatio       *float64
+	CacheRatio           *float64
+	CacheCreationRatio   *float64
+	CacheCreationRatio5m *float64
+	CacheCreationRatio1h *float64
+	ModelPrice           *float64
+	BillingMode          string
+	MatchedTier          string
+	PreConsumedQuota     *float64
+	ActualQuota          *float64
 }
 
 // Summary 返回给前端展示的结果摘要。

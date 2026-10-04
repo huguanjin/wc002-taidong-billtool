@@ -248,11 +248,11 @@ func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 }
 
 // mergeColumnPermutation 返回把 src 表的列重排成 base 表顺序的映射：
-// perm[i] 是 base 第 i 列在 src 中的下标。列名集合必须完全一致。
+// perm[i] 是 base 第 i 列在 src 中的下标，-1 表示 src 缺少这一列（按空值补齐）。
+// src 里出现 base 没有的列（基准没有的新列）仍然报错，避免默默丢弃数据——
+// 这专门用于兼容「脱敏日志新增列后，旧版/新版产物混合合并」的场景：
+// 旧版缺的新列允许留空，但不允许新版文件反过来悄悄缺列。
 func mergeColumnPermutation(base, src []string) ([]int, error) {
-	if len(base) != len(src) {
-		return nil, fmt.Errorf("表头列数不一致（基准 %d 列，该文件 %d 列）", len(base), len(src))
-	}
 	index := make(map[string]int, len(src))
 	for i, h := range src {
 		key := strings.TrimSpace(h)
@@ -264,6 +264,17 @@ func mergeColumnPermutation(base, src []string) ([]int, error) {
 		}
 		index[key] = i
 	}
+	baseSet := make(map[string]bool, len(base))
+	for _, h := range base {
+		if key := strings.TrimSpace(h); key != "" {
+			baseSet[key] = true
+		}
+	}
+	for key := range index {
+		if !baseSet[key] {
+			return nil, fmt.Errorf("表头存在基准没有的列: %s", key)
+		}
+	}
 	perm := make([]int, len(base))
 	for i, h := range base {
 		key := strings.TrimSpace(h)
@@ -273,7 +284,8 @@ func mergeColumnPermutation(base, src []string) ([]int, error) {
 		}
 		j, ok := index[key]
 		if !ok {
-			return nil, fmt.Errorf("缺少列: %s（与首个日志的列名不一致）", key)
+			perm[i] = -1 // 该文件缺少这一列，合并时按空值补齐
+			continue
 		}
 		perm[i] = j
 	}

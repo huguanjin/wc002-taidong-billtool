@@ -11,7 +11,7 @@ import (
 
 // SanitizedRowWriter 脱敏日志的行写入接口，由 excel_write.go / csv_write.go 实现。
 type SanitizedRowWriter interface {
-	WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64) error
+	WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64, details RowDetails) error
 }
 
 // SanitizedWriter 脱敏日志写出器：在 SanitizedRowWriter 基础上要求实现收尾关闭。
@@ -37,7 +37,10 @@ var cstLocation = time.FixedZone("CST", 8*3600)
 //
 // exprSetting 提供 options 表里的阶梯计费表达式（可为 nil）。命中表达式的模型，
 // 其官方美金刊例直接由表达式算出，不再依赖 ModelRatio/ModelPrice 那套表。
-func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, exchangeRate float64, preferPriceTable bool, exprSetting *BillingExprSetting, sanitizedWriter SanitizedRowWriter) (*AggregateResult, error) {
+//
+// includeBilling 控制写给 sanitizedWriter 的 RowDetails 是否附带站点内部计费参数
+// （见 BillingDetails），不影响聚合/账单逻辑。
+func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, exchangeRate float64, preferPriceTable bool, exprSetting *BillingExprSetting, includeBilling bool, sanitizedWriter SanitizedRowWriter) (*AggregateResult, error) {
 	col := map[string]int{}
 	for i, h := range headers {
 		if h != "" {
@@ -108,12 +111,6 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
 		}
 
-		if sanitizedWriter != nil {
-			if err := sanitizedWriter.WriteRow(row, cacheRead, cacheWrite5m, cacheWrite1h); err != nil {
-				return nil, err
-			}
-		}
-
 		if cacheRead != 0 || cacheWrite5m != 0 || cacheWrite1h != 0 {
 			cacheHitRows++
 		}
@@ -124,6 +121,15 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		wsCalls, wsPrice := ParseWebSearch(other)
 		if wsCalls > 0 {
 			webSearchRows++
+		}
+
+		if sanitizedWriter != nil {
+			details := ParseRowDetails(other, includeBilling)
+			details.UncachedInputTokens = uncached
+			details.WebSearchCalls = wsCalls
+			if err := sanitizedWriter.WriteRow(row, cacheRead, cacheWrite5m, cacheWrite1h, details); err != nil {
+				return nil, err
+			}
 		}
 
 		// 该请求发生的时间：日志的 created_at 是 Unix 秒。出账面对历史日志，

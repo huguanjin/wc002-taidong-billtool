@@ -52,9 +52,9 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		ext, delimiter, isDelimited := sanitizedFormatInfo(params.SanitizedFormat)
 		sanitizedPath = filepath.Join(outputDir, defaultSanitizedName(stem)+ext)
 		if isDelimited {
-			sanitizedWriter, err = NewCSVSanitizedWriter(sanitizedPath, headers, delimiter)
+			sanitizedWriter, err = NewCSVSanitizedWriter(sanitizedPath, headers, delimiter, params.IncludeBillingParams)
 		} else {
-			sanitizedWriter, err = NewExcelSanitizedWriter(sanitizedPath, headers)
+			sanitizedWriter, err = NewExcelSanitizedWriter(sanitizedPath, headers, params.IncludeBillingParams)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("初始化脱敏日志写出失败: %w", err)
@@ -71,7 +71,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		writerIface = sanitizedWriter
 	}
 
-	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, preferPriceTable, exprSetting, writerIface)
+	agg, aggErr := AggregateFromRows(rows, headers, book, exchangeRate, preferPriceTable, exprSetting, params.IncludeBillingParams, writerIface)
 	if sanitizedWriter != nil {
 		if closeErr := sanitizedWriter.Close(); closeErr != nil && aggErr == nil {
 			return nil, fmt.Errorf("写出脱敏日志失败: %w", closeErr)

@@ -368,6 +368,7 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 		params.SanitizedLog = v == "true"
 	}
 	params.SanitizedFormat = formValue(form, "sanitizedFormat")
+	params.IncludeBillingParams = formValue(form, "includeBillingParams") == "true"
 	params.Sheet = formValue(form, "sheet")
 	params.Encoding = formValue(form, "encoding")
 	if v := formValue(form, "manualPrices"); v != "" {

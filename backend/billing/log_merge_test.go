@@ -100,7 +100,7 @@ func TestMergeLogsColumnOrderDiffers(t *testing.T) {
 	}
 }
 
-// TestMergeLogsHeaderMismatch 覆盖列名缺失时报错，而不是默默地拼出错位的日志。
+// TestMergeLogsHeaderMismatch 覆盖源文件出现基准没有的列时报错，而不是默默地拼出错位的日志。
 func TestMergeLogsHeaderMismatch(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "日志A.tsv")
@@ -109,7 +109,32 @@ func TestMergeLogsHeaderMismatch(t *testing.T) {
 	writeTSVLog(t, b, "model_name\tgroup\tprompt_tokens\nmodel-b\tdefault\t50\n")
 
 	if _, err := MergeLogs([]string{a, b}, MergeParams{Format: "xlsx", OutDir: dir}); err == nil {
-		t.Fatal("期望列名不一致时报错，实际未报错")
+		t.Fatal("期望出现基准没有的列时报错，实际未报错")
+	}
+}
+
+// TestMergeLogsMissingColumnFilledEmpty 覆盖脱敏日志新增列后，旧版产物缺少新列时
+// 应按空值补齐合并，而不是报错中断——这是脱敏日志列集随版本变化后的兼容行为。
+func TestMergeLogsMissingColumnFilledEmpty(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "新版日志.tsv") // 基准：比旧版多一列 uncached_input_tokens
+	b := filepath.Join(dir, "旧版日志.tsv")
+	writeTSVLog(t, a, "model_name\tgroup\tquota\tuncached_input_tokens\nmodel-a\tdefault\t100\t80\n")
+	writeTSVLog(t, b, "model_name\tgroup\tquota\nmodel-b\tdefault\t200\n")
+
+	result, err := MergeLogs([]string{a, b}, MergeParams{Format: "tsv", OutDir: dir})
+	if err != nil {
+		t.Fatalf("MergeLogs 失败: %v", err)
+	}
+	_, rows, err := LoadLogRows(result.Path, "", "")
+	if err != nil {
+		t.Fatalf("读取合并结果失败: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("合并结果行数期望 2，实际 %d", len(rows))
+	}
+	if rows[1][0] != "model-b" || rows[1][3] != "" {
+		t.Errorf("旧版文件缺的新列期望留空，实际: %v", rows[1])
 	}
 }
 

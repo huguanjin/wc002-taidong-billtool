@@ -15,6 +15,7 @@ import (
 type ExcelSanitizedWriter struct {
 	headers          []string
 	sanitizedHeaders []string
+	includeBilling   bool
 	file             *excelize.File
 	sheetBase        string
 	sheetIndex       int
@@ -24,15 +25,15 @@ type ExcelSanitizedWriter struct {
 	path             string
 }
 
-func NewExcelSanitizedWriter(path string, headers []string) (*ExcelSanitizedWriter, error) {
-	sanitizedHeaders := buildSanitizedHeaders(headers)
+func NewExcelSanitizedWriter(path string, headers []string, includeBilling bool) (*ExcelSanitizedWriter, error) {
+	sanitizedHeaders := buildSanitizedHeaders(headers, includeBilling)
 	f := excelize.NewFile()
 	sheetBase := "日志查询"
 	if err := f.SetSheetName(f.GetSheetName(0), sheetBase); err != nil {
 		return nil, err
 	}
 	w := &ExcelSanitizedWriter{
-		headers: headers, sanitizedHeaders: sanitizedHeaders,
+		headers: headers, sanitizedHeaders: sanitizedHeaders, includeBilling: includeBilling,
 		file: f, sheetBase: sheetBase, path: path,
 	}
 	if err := w.startSheet(sheetBase); err != nil {
@@ -60,18 +61,18 @@ func (w *ExcelSanitizedWriter) startSheet(name string) error {
 	return nil
 }
 
-func buildSanitizedHeaders(headers []string) []string {
+func buildSanitizedHeaders(headers []string, includeBilling bool) []string {
 	base := make([]string, 0, len(headers))
 	for _, h := range headers {
 		if h != "" && !SanitizedDropColumns[h] {
 			base = append(base, h)
 		}
 	}
-	return append(base, SanitizedCacheColumns...)
+	return append(base, SanitizedColumns(includeBilling)...)
 }
 
 // WriteRow 实现 SanitizedRowWriter。
-func (w *ExcelSanitizedWriter) WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64) error {
+func (w *ExcelSanitizedWriter) WriteRow(row []string, cacheRead, cacheWrite5m, cacheWrite1h float64, details RowDetails) error {
 	if w.rowNum >= ExcelMaxRowsPerSheet {
 		if err := w.stream.Flush(); err != nil {
 			return err
@@ -93,6 +94,10 @@ func (w *ExcelSanitizedWriter) WriteRow(row []string, cacheRead, cacheWrite5m, c
 		values = append(values, cellValueForSanitized(cellAt(row, i)))
 	}
 	values = append(values, cacheRead, cacheWrite5m+cacheWrite1h, cacheWrite5m, cacheWrite1h)
+	values = append(values, detailCells(details)...)
+	if w.includeBilling {
+		values = append(values, billingCells(details.Billing)...)
+	}
 	w.rowNum++
 	w.totalRows++
 	axis, err := excelize.CoordinatesToCellName(1, w.rowNum)
