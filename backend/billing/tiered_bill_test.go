@@ -87,6 +87,11 @@ func exprTieredAgg(t *testing.T, model, group, expr string, tiers []string, tok 
 		BillingExpr: expr,
 		ExprTiers:   tiers,
 		LastAt:      exprAt(),
+		// 这个辅助函数只填用量与金额，不管口径来源。空来源会让判据退化成
+		// 「有刊例就能反推」，与生产不一致（生产在 aggregate.go 里一定会落一个
+		// ListOrigin），所以显式给成外部对标价，让需要验「表达式行不反推」的
+		// 测试自己去覆盖这个字段。
+		ListOrigin: ListOriginExternal,
 	}
 }
 
@@ -131,13 +136,17 @@ func formula(t *testing.T, f *excelize.File, sheet string, col, row int) string 
 }
 
 func writeTieredBill(t *testing.T, rows []*AggRow, discount *float64, book *PriceBook) (*excelize.File, string) {
+	return writeTieredBillMarked(t, rows, discount, book, nil)
+}
+
+func writeTieredBillMarked(t *testing.T, rows []*AggRow, discount *float64, book *PriceBook, markers []string) (*excelize.File, string) {
 	t.Helper()
 	dir := t.TempDir()
 	templatePath := filepath.Join(dir, "template.xlsx")
 	outPath := filepath.Join(dir, "bill.xlsx")
 	buildBillFixtureTemplate(t, templatePath)
 
-	_, err := WriteBillFromTemplate(templatePath, outPath, rows, 2026, 9, book, discount, 7.0, true)
+	_, err := WriteBillFromTemplate(templatePath, outPath, rows, 2026, 9, book, discount, 7.0, true, markers)
 	require.NoError(t, err, "写出账单失败")
 	return readBill(t, outPath)
 }
@@ -263,26 +272,36 @@ func TestTieredBillBlanksOneHourCacheWriteWhenCoefficientZero(t *testing.T) {
 
 // TestGroupDiscountPrefersPriceTable 折扣优先取价表：价表里有该厂商家族的折扣时不再反推。
 func TestGroupDiscountPrefersPriceTable(t *testing.T) {
-	agg := exprTieredAgg(t, "deepseek-v3", "国产A", testExprAstra, []string{"base"}, astraBaseTok)
+	// 用显式金额而不是 exprTieredAgg 的合成比例：真实日志里 quota 折算出来的人民币
+	// 就是刊例人民币乘以实际折扣（这里 1 美金刊例 × 7 汇率 × 0.5 = 3.5 元 = 1,750,000 quota）。
+	// 借 ExprQuota 造 quota 会得到一个与刊例无关的量级，站点倍率兜底那条路径就验不出东西。
+	row := &AggRow{
+		Model: "deepseek-v3", Group: "国产A",
+		Uncached: 1_000_000, Output: 100_000, Rows: 1,
+		OfficialUSD: 1.0, Quota: 1_750_000,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra, ListOrigin: ListOriginExpr,
+	}
 
 	book := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{"DeepSeek": 0.6}}
-	discounts, derived := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, nil, true)
+	result := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, nil, true, nil)
 
-	assert.Equal(t, 0.6, discounts["国产A"], "价表里有 DeepSeek 家族折扣，必须直接采用")
-	assert.False(t, derived["国产A"], "走了价表就不算反推值")
+	assert.Equal(t, 0.6, result.Discounts["国产A"], "价表里有 DeepSeek 家族折扣，必须直接采用")
+	assert.False(t, result.Derived["国产A"], "走了价表就不算反推值")
 
-	// 价表里没有该家族时退回反推，并标记为反推值。
+	// 价表里没有该家族时不再硬推：表达式行的刊例是站内公式自算的，没有外部对标价，
+	// 反推出来的只是式子里的 group_ratio。折扣退到该行实际计费倍率，并记入 Underivable。
 	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
-	discounts2, derived2 := ComputeGroupDiscounts([]*AggRow{agg}, empty, 7.0, nil, true)
-	assert.True(t, derived2["国产A"], "价表没有该家族时必须标记为反推值")
-	wantDerived := round((ExprQuota(agg.OfficialUSD, 1.0)/QuotaPerCNY)/(agg.OfficialUSD*7.0), DiscountDecimals)
-	assert.Equal(t, wantDerived, discounts2["国产A"])
+	result2 := ComputeGroupDiscounts([]*AggRow{row}, empty, 7.0, nil, true, nil)
+	assert.False(t, result2.Derived["国产A"], "站内表达式行不可反推")
+	assert.Equal(t, 0.5, result2.Discounts["国产A"], "应退回站点实际计费倍率（3.5/(1×7)）")
+	assert.Contains(t, result2.Underivable["国产A"], "无法反推折扣", "必须写明不可反推的原因")
 
-	// 强制折扣优先级最高，且不算反推。
+	// 强制折扣优先级最高，且不算反推，也不留 Underivable 备注。
 	forced := 0.42
-	discounts3, derived3 := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, &forced, true)
-	assert.Equal(t, 0.42, discounts3["国产A"])
-	assert.False(t, derived3["国产A"])
+	result3 := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, &forced, true, nil)
+	assert.Equal(t, 0.42, result3.Discounts["国产A"])
+	assert.False(t, result3.Derived["国产A"])
+	assert.Empty(t, result3.Underivable)
 }
 
 // TestGroupDiscountNoDivisionByZero 零用量行不能让折扣变成 0/0。
@@ -290,11 +309,156 @@ func TestGroupDiscountNoDivisionByZero(t *testing.T) {
 	agg := exprTieredAgg(t, "gpt-6-astra", "空分组", testExprAstra, nil, [5]float64{})
 	book := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
 
-	discounts, derived := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, nil, true)
-	got := discounts["空分组"]
+	result := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, nil, true, nil)
+	got := result.Discounts["空分组"]
 	assert.False(t, math.IsNaN(got), "零用量时折扣不能是 NaN")
-	assert.Equal(t, 0.0, got)
-	assert.True(t, derived["空分组"])
+	assert.Equal(t, 0.0, got, "零用量行的站点倍率折算是 0")
+	assert.False(t, result.Derived["空分组"], "零用量不可反推")
+	assert.NotEmpty(t, result.Underivable["空分组"], "零用量分组也必须提示人工确认")
+}
+
+// TestDerivableListPriceSkipsExpressionRows 判据本身：只有外部对标价才可反推。
+// 这是「国产模型折扣反推异常」的真正根因——与模型是不是国产无关，
+// 任何走站内表达式计费的行都没有外部对标价，拿它当分母恢复出来的是 group_ratio。
+func TestDerivableListPriceSkipsExpressionRows(t *testing.T) {
+	exprRow := &AggRow{
+		Model: "deepseek-v4.1-flash", Group: "国产模型", OfficialUSD: 1.0,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra, ListOrigin: ListOriginExpr,
+	}
+	assert.True(t, HasKnownListPrice(exprRow), "表达式算出过刊例，仍算「有价」供展示")
+	assert.False(t, DerivableListPrice(exprRow, nil), "站内表达式刊例不可作反推分母")
+
+	externalRow := &AggRow{
+		Model: "claude-sonnet-5", Group: "海外", OfficialUSD: 1.0, ListOrigin: ListOriginExternal,
+	}
+	assert.True(t, DerivableListPrice(externalRow, nil), "外部对标价可反推")
+
+	mixedRow := &AggRow{
+		Model: "claude-sonnet-5", Group: "混用", OfficialUSD: 1.0, ListOrigin: ListOriginMixed,
+	}
+	assert.False(t, DerivableListPrice(mixedRow, nil), "账期内混用两种口径的桶不可反推")
+
+	noPrice := &AggRow{Model: "unknown-x", Group: "未知", ListOrigin: ListOriginNone}
+	assert.False(t, DerivableListPrice(noPrice, nil), "没有刊例不可反推")
+}
+
+// TestDerivableListPriceHonorsManualMarkers 人工标识兜底：模型名前缀推不出的
+// 站内定价分组，由用户显式标注后同样排除出反推。
+func TestDerivableListPriceHonorsManualMarkers(t *testing.T) {
+	row := &AggRow{
+		Model: "doubao-pro-32k", Group: "国产模型", OfficialUSD: 1.0, ListOrigin: ListOriginExternal,
+	}
+	assert.Equal(t, "", VendorFamily(row.Model), "doubao 不在内置厂商前缀表里，自动识别不到")
+	assert.True(t, DerivableListPrice(row, nil), "未标记时可反推")
+
+	// 按分组名标记（精确匹配）。
+	assert.False(t, DerivableListPrice(row, []string{"国产模型"}), "分组名命中即排除")
+	// 按模型名前缀标记（前缀匹配，大小写不敏感）。
+	assert.False(t, DerivableListPrice(row, []string{"DOUBAO"}), "模型前缀命中即排除")
+	// 无关标识不影响。
+	assert.True(t, DerivableListPrice(row, []string{"qianwen", "海外分组"}), "无关标识不影响判定")
+}
+
+// TestAggregateMarksExpressionRowAsExprOrigin 聚合阶段就必须把口径记到行上，
+// 否则下游拿不到「这个数字是站内公式算的」这一事实。
+func TestAggregateMarksExpressionRowAsExprOrigin(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	other := `{"expr_b64":"bGVuIDw9IDI3MjAwMCA/IHRpZXIoImJhc2UiLCBwICogMTAgKyBjICogNTApIDogdGllcigidGllcl8yIiwgcCAqIDIwICsgYyAqIDc1KQ==","cache_tokens":0}`
+	rows := [][]string{{"deepseek-v4.1-flash", "国产模型", "100000", "2000", "12345", other, "1755000000"}}
+
+	result, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	assert.Equal(t, ListOriginExpr, result.Rows[0].ListOrigin, "表达式行必须标成 expr 来源")
+	assert.False(t, DerivableListPrice(result.Rows[0], nil), "该行不可参与反推")
+}
+
+// TestAggregateMarksRatioRowAsExternalOrigin ratio 快照的换算基准是官方锚点
+// （ratio=1 → $2/MTok），不是站内自有公式，因此仍算外部对标价、可参与反推。
+func TestAggregateMarksRatioRowAsExternalOrigin(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	other := `{"model_ratio":1,"completion_ratio":4,"cache_ratio":0.1,"cache_tokens":0}`
+	rows := [][]string{{"claude-sonnet-5", "海外", "100000", "2000", "12345", other, "1755000000"}}
+
+	result, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	assert.Equal(t, ListOriginExternal, result.Rows[0].ListOrigin, "ratio 快照应标成外部对标价")
+	assert.True(t, DerivableListPrice(result.Rows[0], nil), "ratio 行可参与反推")
+}
+
+// TestAggregateMarksMixedOriginWhenRowShapesDiffer 同一个 (模型,分组) 内两种口径混用时，
+// 整桶记成 mixed 并退出反推——半截分母算出来的折扣比不反推更危险。
+func TestAggregateMarksMixedOriginWhenRowShapesDiffer(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	exprOther := `{"expr_b64":"bGVuIDw9IDI3MjAwMCA/IHRpZXIoImJhc2UiLCBwICogMTAgKyBjICogNTApIDogdGllcigidGllcl8yIiwgcCAqIDIwICsgYyAqIDc1KQ=="}`
+	ratioOther := `{"model_ratio":1,"completion_ratio":4,"cache_ratio":0.1}`
+	rows := [][]string{
+		{"deepseek-v4.1-flash", "国产模型", "100000", "2000", "12345", exprOther, "1755000000"},
+		{"deepseek-v4.1-flash", "国产模型", "50000", "1000", "6789", ratioOther, "1755100000"},
+	}
+
+	result, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	assert.Equal(t, ListOriginMixed, result.Rows[0].ListOrigin, "两种口径混用应标成 mixed")
+	assert.False(t, DerivableListPrice(result.Rows[0], nil), "mixed 桶不可反推")
+}
+
+// TestBillNotesUndeterminableDiscount 账单备注必须写清楚折扣是怎么来的：
+// 不可反推的分组不能只留一个看起来像谈定值的数字。
+func TestBillNotesUndeterminableDiscount(t *testing.T) {
+	agg := &AggRow{
+		Model: "deepseek-v4.1-flash", Group: "国产模型",
+		Uncached: 1_000_000, Output: 100_000, Rows: 1,
+		OfficialUSD: 1.0, Quota: 1_750_000,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra,
+		ExprTiers: []string{"base"}, ListOrigin: ListOriginExpr, LastAt: exprAt(),
+	}
+	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
+
+	f, sheet := writeTieredBill(t, []*AggRow{agg}, nil, empty)
+	note := cell(t, f, sheet, 28, 3)
+	assert.Contains(t, note, "无法反推折扣", "备注要写明不可反推")
+	assert.Contains(t, note, "人工确认", "备注要要求人工确认合同折扣")
+	assert.NotContains(t, note, "折扣取自价表", "不可反推时不能声称折扣来自价表")
+}
+
+// TestBillNotesManualMarkerExcludedFromDerivation 人工标识命中的分组：
+// 折扣退回站点倍率，且在备注里说明是被标记排除的。
+//
+// 用 gpt-4o（价表里有价）而不是造一个查不到价的模型名：账单写出时
+// ResolvePrice 为 nil 会走不到备注分支，测试就绕开了要验的逻辑。
+func TestBillNotesManualMarkerExcludedFromDerivation(t *testing.T) {
+	agg := &AggRow{
+		Model: "claude-sonnet-5", Group: "国产模型",
+		Uncached: 1_000_000, Output: 100_000, Quota: 3_500_000, Rows: 1,
+		OfficialUSD: 1.0, ListOrigin: ListOriginExternal, BillingMode: "token",
+	}
+	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
+
+	f, sheet := writeTieredBillMarked(t, []*AggRow{agg}, nil, empty, []string{"国产模型"})
+	note := cell(t, f, sheet, 28, 3)
+	assert.Contains(t, note, "站内定价标识", "备注要写明是被人工标记排除的")
+	assert.Contains(t, note, "人工确认")
+}
+
+// TestAutoVendorFamilyDoesNotSuppressDerivation 自动厂商识别不能影响折扣反推。
+// 国产厂商模型只要挂的是第三方部署、有官方对标价，就照样能反推；
+// 「是不是国产」和「有没有外部对标价」是两回事，判据以后者为准。
+func TestAutoVendorFamilyDoesNotSuppressDerivation(t *testing.T) {
+	agg := &AggRow{
+		Model: "deepseek-v3", Group: "deepseek组",
+		Uncached: 1_000_000, Quota: 3_500_000, Rows: 1,
+		OfficialUSD: 1.0, ListOrigin: ListOriginExternal, BillingMode: "token",
+	}
+	assert.Equal(t, "DeepSeek", VendorFamily(agg.Model), "厂商家族仍能自动识别（用于币种与价表折扣）")
+	assert.False(t, IsDomesticMarked(agg.Model, agg.Group, nil), "自动识别不产生人工标记")
+
+	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
+	result := ComputeGroupDiscounts([]*AggRow{agg}, empty, 7.0, nil, true, nil)
+	assert.True(t, result.Derived["deepseek组"], "有外部对标价的国产模型仍可反推")
+	assert.Empty(t, result.Underivable)
 }
 
 // TestTieredPricesCoverExpressionModels 表达式模型的兜底价表不能被漏掉，

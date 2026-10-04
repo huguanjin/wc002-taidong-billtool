@@ -379,6 +379,8 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 		}
 		params.ManualPrices = manual
 	}
+	// 国产/站内定价标识：一行一个，前端用多行文本框填写；空行自动丢弃。
+	params.DomesticMarkers = parseMarkers(formValue(form, "domesticMarkers"))
 
 	templatePath := filepath.Join(dataDir, "bill_template.xlsx")
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
@@ -472,6 +474,29 @@ func formValue(form map[string][]string, key string) string {
 		return v[0]
 	}
 	return ""
+}
+
+// parseMarkers 把多行文本拆成标识列表：按换行切分、逐条去空白、丢掉空行，
+// 并去掉重复项（同一标识写两遍没有额外含义）。逗号也当分隔符，
+// 便于用户顺手把一列标识粘进来。
+func parseMarkers(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == '，'
+	})
+	seen := map[string]bool{}
+	var markers []string
+	for _, f := range fields {
+		m := strings.TrimSpace(f)
+		if m == "" || seen[m] {
+			continue
+		}
+		seen[m] = true
+		markers = append(markers, m)
+	}
+	return markers
 }
 
 // handleDownload 仅按已生成任务的内存记录取路径，避免用户输入直接拼接文件路径。

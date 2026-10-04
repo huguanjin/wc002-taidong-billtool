@@ -109,7 +109,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		year = agg.Year
 	}
 
-	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, params.Discount, exchangeRate, preferPriceTable)
+	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers)
 	if err != nil {
 		return nil, fmt.Errorf("写出账单失败: %w", err)
 	}
@@ -120,7 +120,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		}
 	}
 
-	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices)
+	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices, params.DomesticMarkers)
 
 	return &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}, nil
 }
@@ -136,10 +136,10 @@ func mergeManualPrices(book *PriceBook, manual map[string]ManualPriceInput) {
 	}
 }
 
-func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string) Summary {
+func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string, manualMarkers []string) Summary {
 	rowSummaries := make([]RowSummary, 0, len(agg.Rows))
 	settleTotal, listTotal := 0.0, 0.0
-	groupDiscounts, _ := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable)
+	groupDiscounts := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable, manualMarkers).Discounts
 
 	for _, a := range agg.Rows {
 		list := 0.0

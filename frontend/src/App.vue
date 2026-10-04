@@ -230,6 +230,7 @@ const form = ref({
   sanitizedFormat: 'tsv',
   includeBillingParams: false,
   keepLog: false,
+  domesticMarkers: '',
 })
 
 const loading = ref(false)
@@ -415,6 +416,10 @@ async function handleSubmit() {
   }
   if (Object.keys(manualEntries).length > 0) {
     fd.append('manualPrices', JSON.stringify(manualEntries))
+  }
+  // 国产/站内定价标识：原样传给后端，空行与重复项由后端统一处理。
+  if (form.value.domesticMarkers.trim() !== '') {
+    fd.append('domesticMarkers', form.value.domesticMarkers)
   }
 
   loading.value = true
@@ -628,6 +633,18 @@ async function handleSubmit() {
       </div>
 
       <div class="field">
+        <label>国产/站内定价标识（可选，一行一个）</label>
+        <textarea
+          v-model="form.domesticMarkers"
+          rows="3"
+          placeholder="填分组标识（精确匹配）或模型名前缀，例如：&#10;国产模型&#10;doubao"
+        ></textarea>
+        <span class="hint">
+          这些分组不参与折扣反推，折扣改取站点实际计费倍率，并在账单备注里要求人工确认。
+          走站内表达式（billing_expr）计费的分组本来就不会被反推，这里只用来兜住模型名认不出的站内定价。
+        </span>
+      </div>
+      <div class="field">
         <label>模型单价来源</label>
         <select v-model="form.priceSource">
           <option value="official">内置官方价（覆盖不到的模型自动回退报价表）</option>
@@ -649,8 +666,7 @@ async function handleSubmit() {
         <p class="error" v-if="checkPricesError">{{ checkPricesError }}</p>
         <span class="hint" v-if="priceCheckDone && missingModels.length === 0">
           已检查 {{ checkedModelCount }} 个模型，当前价格来源均能匹配到定价。
-        </span>
-        <span class="hint" v-if="priceCheckDone && exprModels.length > 0">
+        </span>        <span class="hint" v-if="priceCheckDone && exprModels.length > 0">
           其中 {{ exprModels.length }} 个模型由阶梯计费表达式定价（不依赖 ModelRatio/ModelPrice），详见下方。
         </span>
       </div>

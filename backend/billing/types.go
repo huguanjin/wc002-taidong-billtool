@@ -39,6 +39,43 @@ type AggRow struct {
 	// 折算表达式单价时必须用它，而不是出账时刻——deepseek-v4.1-flash 这类
 	// 表达式带 hour("Asia/Shanghai") 峰谷倍率，用 now() 会得到与账期无关的单价。
 	LastAt time.Time
+	// ListOrigin 本行 OfficialUSD 的来源（见 ListOrigin* 常量）。
+	// 只有外部对标价才能当折扣反推的分母；站内公式自算出来的数字反推不出商务折扣。
+	ListOrigin ListOrigin
+}
+
+// ListOrigin 标出官方刊例（AggRow.OfficialUSD）是从哪里来的。
+//
+// 这个区分是「能不能反推折扣」的唯一依据，比按厂商名猜国产/海外更可靠：
+// 反推的分母必须是一份与站点自身定价无关的外部对标价，否则 Σ结算/Σ总金额
+// 恢复出来的只是站点自己的 group_ratio，不是商务谈定的折扣。
+type ListOrigin string
+
+const (
+	// ListOriginExternal 外部对标价：内置官网价、人工维护报价表、业务库实时价、
+	// 阶梯绝对价、按次固定价，或日志自带的 ratio 快照。
+	// 注意 ratio 快照虽由日志给出，换算基准（ratio=1 → $2/MTok）是官方锚点，
+	// 不是站内自定的公式，因此算外部对标价。
+	ListOriginExternal ListOrigin = "external"
+	// ListOriginExpr 站内 billing_expr 表达式自算的刊例：站点自己的定价公式。
+	// 拿它当分母反推，得到的是式子里隐含的 group_ratio，与商务折扣无关。
+	ListOriginExpr ListOrigin = "expr"
+	// ListOriginMixed 该 (模型,分组) 行内部混用了多种来源，分母口径不统一，不可反推。
+	ListOriginMixed ListOrigin = "mixed"
+	// ListOriginNone 一点价都取不到。
+	ListOriginNone ListOrigin = "none"
+)
+
+// mergesListOrigin 把新出现的来源并入桶上已记录的来源：
+// 只有整桶来源一致且为外部对标价时，这一桶的分母口径才可信。
+func mergesListOrigin(current, incoming ListOrigin) ListOrigin {
+	if current == "" {
+		return incoming
+	}
+	if current == incoming {
+		return current
+	}
+	return ListOriginMixed
 }
 
 // SiteCNY 站点人民币 = quota / 500000。
@@ -89,6 +126,11 @@ type Params struct {
 	// IncludeBillingParams 控制脱敏日志是否附带站点内部计费参数列（见 SanitizedBillingColumns）。
 	// 默认 false：这些字段暴露内部定价倍率，是否对客户可见属于商务决定。
 	IncludeBillingParams bool
+	// DomesticMarkers 人工标记的国产/站内定价标识：一条一个，可以是分组标识
+	// （精确匹配，如「国产模型」），也可以是模型名前缀（前缀匹配，如「doubao」）。
+	// 命中的 (模型,分组) 不参与折扣反推——模型名推厂商家族覆盖不全，识别不到时
+	// 会静默按海外处理、折扣悄悄算错，这里给用户一个显式兜底。
+	DomesticMarkers []string
 }
 
 // RowDetails 脱敏日志需要额外展开的单行明细，全部来自日志 other 字段

@@ -272,6 +272,28 @@ func ParseMatchedTier(other string) string {
 	return ""
 }
 
+// ParseRowRatioPricing 取日志 other 里直接记录的 ModelRatio/CompletionRatio/CacheRatio——
+// 这是该请求「计费当时」真实生效的定价快照，与 ParseBillingExpr 同样优先于 options 表现在
+// 的配置：同一个模型在账期内可能从 ratio 计费切换成 billing_expr 阶梯计费，options 表现在的
+// expr 配置不能倒推套用到切换前仍按 ratio 计费的历史行上。
+// ok=false 表示 other 没有同时给出 model_ratio 与 completion_ratio（非这套计费方式，或解析失败）。
+func ParseRowRatioPricing(other string) (modelRatio, completionRatio, cacheRatio float64, ok bool) {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return 0, 0, 0, false
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(text), &data); err != nil || data == nil {
+		return 0, 0, 0, false
+	}
+	mrRaw, hasMR := data["model_ratio"]
+	crRaw, hasCR := data["completion_ratio"]
+	if !hasMR || !hasCR {
+		return 0, 0, 0, false
+	}
+	return jsonNumber(mrRaw), jsonNumber(crRaw), jsonNumber(data["cache_ratio"]), true
+}
+
 // ParseExtraTokens 从日志 other 里取图片/音频的 token 明细，供 gpt-realtime 一类
 // 表达式（引用 img/img_o/ai/ao）计价。日志里没有这些字段时一律返回 0，
 // 此时这些 token 仍留在 p/c 里按基础价计费，不会凭空多算费用。
@@ -315,7 +337,13 @@ func IsOpenAIOrGeminiModel(model string) bool {
 	m := strings.ToLower(model)
 	return strings.HasPrefix(m, "gpt-") || strings.HasPrefix(m, "o1") ||
 		strings.HasPrefix(m, "o3") || strings.HasPrefix(m, "o4") ||
-		strings.HasPrefix(m, "gemini-") || strings.HasPrefix(m, "kimi-")
+		strings.HasPrefix(m, "gemini-") || strings.HasPrefix(m, "kimi-") ||
+		// 国产供应商家族（DeepSeek/GLM/Minimax/Qwen）走的都是 OpenAI 兼容接口，
+		// prompt_tokens 口径同样含缓存部分，需要按 openai 语义扣减，不能落到
+		// anthropic 分支的兜底（兜底会把整段 prompt 都当成未命中，重复计费）。
+		strings.HasPrefix(m, "deepseek") || strings.HasPrefix(m, "glm") ||
+		strings.HasPrefix(m, "chatglm") || strings.HasPrefix(m, "minimax") ||
+		strings.HasPrefix(m, "qwen")
 }
 
 func IsAnthropicModel(model string) bool {
@@ -522,24 +550,65 @@ func HasKnownListPrice(agg *AggRow) bool {
 	return agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
 }
 
+// DerivableListPrice 判断该行的刊例能不能当折扣反推的分母。
+//
+// 反推要成立，分母必须是一份**与站点自身定价无关的外部对标价**。站内
+// billing_expr 表达式算出来的刊例是站点自己的定价公式，拿它去除站内结算额，
+// 恢复出来的只是式子里隐含的 group_ratio，不是商务谈定的折扣——这正是国产模型
+// 反推失真的根因，与模型是不是国产无关：任何走表达式计费的行都一样。
+//
+// 命中的排除条件（按优先级）：
+//  1. 完全没有刊例（连表达式都没有）；
+//  2. 刊例由站内表达式或混合口径算出（ListOriginExpr / ListOriginMixed）；
+//  3. 被人工标记为国产/站内定价的分组或模型（manualMarkers）。
+//
+// 第三种是兜底：模型名推厂商家族本来就覆盖不全（doubao/ernie/hunyuan 等都没有
+// 前缀），而识别不到时的失败方向是静默按海外处理、折扣悄悄算错。所以判定不靠
+// 猜厂商，而由用户对具体分组显式标注。
+func DerivableListPrice(agg *AggRow, manualMarkers []string) bool {
+	if !HasKnownListPrice(agg) {
+		return false
+	}
+	switch agg.ListOrigin {
+	case ListOriginExpr, ListOriginMixed:
+		return false
+	}
+	return !IsDomesticMarked(agg.Model, agg.Group, manualMarkers)
+}
+
+// DiscountResult ComputeGroupDiscounts 的结果。
+type DiscountResult struct {
+	// Discounts 分组 → 折扣。
+	Discounts map[string]float64
+	// Derived 折扣来自「Σ结算/Σ总金额」反推的分组。
+	Derived map[string]bool
+	// Underivable 既没有价表折扣、又不能反推的分组 → 原因，供账单备注写清楚
+	// 折扣是从哪来的、为什么这个数需要人工确认。
+	Underivable map[string]string
+}
+
 // ComputeGroupDiscounts 每个分组标识的折扣。
 //
 // 口径优先级（高到低）：
 //  1. forcedDiscount：调用方显式指定的统一折扣，直接覆盖，不做任何查表；
 //  2. 价表折扣 sheet：按模型厂商家族（见 VendorFamily）匹配，命中即用价表值；
-//  3. 反推：该组 Σ结算人民币 / Σ总金额人民币。
+//  3. 反推：该组 Σ结算人民币 / Σ总金额人民币，只累加 DerivableListPrice 为真的行。
 //
 // 只有走到第 3 步的分组才算「折扣为反推值」，需要由调用方在账单备注里写明——
 // 反推值只能保证账面对得上，并不能说明商务上谈定的折扣是多少。
 //
-// 返回值第二项是「靠反推得到折扣」的分组集合，供写账单时标注。
-func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool) (map[string]float64, map[string]bool) {
+// 既查不到价表折扣、又没有一行可反推的分组（整组走站内表达式计费，或被人工标记为
+// 站内定价），不能编一个数塞进账单：折扣回退到「分组实际倍率」对应的站点折扣
+// （quota 折算额 ÷ 清单刊例），并记入 Underivable 由调用方在备注里要求人工确认。
+func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool, manualMarkers []string) DiscountResult {
 	if forcedDiscount != nil {
-		result := make(map[string]float64, len(rows))
+		result := map[string]float64{}
 		for _, agg := range rows {
 			result[agg.Group] = round(*forcedDiscount, DiscountDecimals)
 		}
-		return result, map[string]bool{}
+		return DiscountResult{
+			Discounts: result, Derived: map[string]bool{}, Underivable: map[string]string{},
+		}
 	}
 
 	discounts := map[string]float64{}
@@ -558,10 +627,13 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 		}
 	}
 
+	// 分母只累加口径可信的行。整组都不可信时下面会退到站点折扣，不会拿半截分母做除法。
 	settleByGroup := map[string]float64{}
 	listByGroup := map[string]float64{}
+	skippedByGroup := map[string]int{}
 	for _, agg := range rows {
-		if !HasKnownListPrice(agg) {
+		if !DerivableListPrice(agg, manualMarkers) {
+			skippedByGroup[agg.Group]++
 			continue
 		}
 		settleByGroup[agg.Group] += SettleCNY(agg)
@@ -569,20 +641,58 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 	}
 
 	derived := map[string]bool{}
-	for group, settle := range settleByGroup {
-		if _, ok := discounts[group]; ok {
+	underivable := map[string]string{}
+	for _, agg := range rows {
+		if _, ok := discounts[agg.Group]; ok {
+			if skippedByGroup[agg.Group] > 0 {
+				underivable[agg.Group] = underivableReason(agg, manualMarkers)
+			}
 			continue
 		}
-		listing := listByGroup[group]
-		raw := 0.0
-		// 分母为 0（整组零用量）时不反推，避免 0/0 把折扣写成 0。
-		if listing > 0 {
-			raw = settle / listing
+		listing := listByGroup[agg.Group]
+		if listing <= 0 {
+			// 一行都不可反推（或整组零用量）：不编折扣，退到站点实际倍率。
+			discounts[agg.Group] = round(siteDiscount(agg, exchangeRate), DiscountDecimals)
+			underivable[agg.Group] = underivableReason(agg, manualMarkers)
+			continue
 		}
-		discounts[group] = round(raw, DiscountDecimals)
-		derived[group] = true
+		raw := settleByGroup[agg.Group] / listing
+		discounts[agg.Group] = round(raw, DiscountDecimals)
+		derived[agg.Group] = true
+		if skippedByGroup[agg.Group] > 0 {
+			underivable[agg.Group] = underivableReason(agg, manualMarkers)
+		}
 	}
-	return discounts, derived
+	return DiscountResult{Discounts: discounts, Derived: derived, Underivable: underivable}
+}
+
+// siteDiscount 分组实际倍率对应的折扣：quota 折算人民币 ÷ 该行清单刊例人民币。
+// 分子分母都换成人民币比较，量纲才对得上——拿人民币除美金会得出一个
+// 被汇率放大的数（如 3.5 而不是 0.5），那种数字写进账单比不写更误导。
+// 这是「站点实际上按几折在收」，属于账实相符的兜底值，不是商务谈定的折扣，
+// 因此调用方必须配合 Underivable 的备注要求人工确认。
+func siteDiscount(agg *AggRow, exchangeRate float64) float64 {
+	if agg.OfficialUSD <= 0 || exchangeRate <= 0 {
+		return 0
+	}
+	return (agg.Quota / QuotaPerCNY) / (agg.OfficialUSD * exchangeRate)
+}
+
+// underivableReason 生成「该组不能反推」的原因说明，写进账单备注。
+//
+// 口径类原因（站内公式/混合口径/无刊例）优先于标记类原因：前两者是这一行客观上
+// 就没有外部对标价，说清楚比归咎于人工标记有用得多，也便于事后核对。
+func underivableReason(agg *AggRow, manualMarkers []string) string {
+	switch agg.ListOrigin {
+	case ListOriginExpr:
+		return "该分组按站内表达式（billing_expr）计费，刊例由站点自有公式算出，不具备外部对标价，无法反推折扣"
+	case ListOriginMixed:
+		return "该分组内混用了站内表达式与外部价两种口径，分母不统一，无法反推折扣"
+	}
+	if IsDomesticMarked(agg.Model, agg.Group, manualMarkers) {
+		return "该分组在「国产/站内定价标识」里被指定为站内定价，不参与折扣反推"
+	}
+	return "该分组没有可用的外部对标刊例，无法反推折扣"
 }
 
 // tableDiscount 按模型厂商家族在价表折扣 sheet 里查折扣。
@@ -637,6 +747,33 @@ func VendorFamily(model string) string {
 // DiscountFromPriceTable 按模型厂商家族取价表折扣（供单行标注使用）。
 func DiscountFromPriceTable(book *PriceBook, model string) (float64, bool) {
 	return tableDiscount(book, model)
+}
+
+// IsDomesticMarked 判断某 (model, group) 是否被用户人工标记为国产/站内定价：
+// manualMarkers 里一条可以是分组名（精确匹配）或模型名前缀（前缀匹配，大小写不敏感）。
+//
+// 这里**只**认人工标记，不掺厂商前缀的自动识别。自动识别那条路走的是刊例来源
+// （ListOrigin）：模型叫不叫 deepseek 和它有没有外部对标价是两件事——
+// 挂第三方部署的 deepseek 一样有官方对标价，而站内自建的任何模型都没有。
+// 把厂商名当判据会在两个方向同时出错，所以它只保留在币种换算与价表折扣匹配上用。
+//
+// 仅用于排除折扣反推，不改变折扣的计算口径与数值来源优先级。
+func IsDomesticMarked(model, group string, manualMarkers []string) bool {
+	modelLower := strings.ToLower(strings.TrimSpace(model))
+	groupTrimmed := strings.TrimSpace(group)
+	for _, raw := range manualMarkers {
+		marker := strings.TrimSpace(raw)
+		if marker == "" {
+			continue
+		}
+		if marker == groupTrimmed {
+			return true
+		}
+		if strings.HasPrefix(modelLower, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseDiscountText 对应 parse_discount_text：兼容百分数、"6折"、纯小数写法。

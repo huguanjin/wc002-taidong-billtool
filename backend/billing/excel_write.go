@@ -130,7 +130,7 @@ func (w *ExcelSanitizedWriter) Close() error {
 func strPtr(s string) *string { return &s }
 
 // WriteBillFromTemplate 按账单模板列写出账单，返回缺少定价的 (model/group) 列表。
-func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool) ([]string, error) {
+func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
 	if _, err := os.Stat(templatePath); err != nil {
 		return nil, fmt.Errorf("账单模板不存在: %s", templatePath)
 	}
@@ -184,7 +184,10 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 	}
 
 	firstDataRow := 3
-	groupDiscounts, derivedDiscounts := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable)
+	discountResult := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable, manualMarkers)
+	groupDiscounts := discountResult.Discounts
+	derivedDiscounts := discountResult.Derived
+	underivable := discountResult.Underivable
 	periodDate := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
 
 	axisOf := func(col, r int) string {
@@ -380,12 +383,17 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		}
 		// 折扣来源必须可追：价表/合同里查到的折扣是商务谈定值，
 		// 反推值只能保证账面对得上，不等于谈定的折扣。
+		// 不可反推的分组（站内表达式计费/人工标记为国产）要写明折扣是怎么来的，
+		// 否则账单上那个数看起来和谈定折扣一样，实际来源完全不同。
+		if reason, bad := underivable[agg.Group]; bad {
+			notes = appendNote(notes, reason+"；本行折扣取站点实际计费倍率，请人工确认合同折扣")
+		}
 		if derivedDiscounts[agg.Group] {
-			notes = append(notes, "折扣为反推值（价表无该分组折扣，按 Σ结算/Σ总金额倒算）")
+			notes = appendNote(notes, "折扣为反推值（价表无该分组折扣，按 Σ结算/Σ总金额倒算）")
 		} else if discount != nil {
-			notes = append(notes, "折扣为手工指定值")
-		} else {
-			notes = append(notes, "折扣取自价表")
+			notes = appendNote(notes, "折扣为手工指定值")
+		} else if _, bad := underivable[agg.Group]; !bad {
+			notes = appendNote(notes, "折扣取自价表")
 		}
 		if len(notes) > 0 {
 			setStr(28, r, strings.Join(notes, "；"))
@@ -418,6 +426,14 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		return nil, err
 	}
 	return missingPrices, nil
+}
+
+// appendNote 追加一条备注，空串忽略，避免在账单 AB 列留下孤立的「；」。
+func appendNote(notes []string, note string) []string {
+	if strings.TrimSpace(note) == "" {
+		return notes
+	}
+	return append(notes, note)
 }
 
 // formatFloat 生成不带科学计数法的十进制字符串，供拼接进 Excel 公式。

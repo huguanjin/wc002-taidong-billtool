@@ -143,16 +143,23 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 
 		var perCall, listUSD float64
 		var exprUsed, matchedTier string
+		// 本行刊例的来源，决定它能不能当折扣反推的分母（见 ListOrigin）。
+		listOrigin := ListOriginNone
 		billingMode := imgMode
 		if billingMode == "" {
 			billingMode = "token"
 		}
 
-		// 表达式优先取日志自带的（计费当时生效的规则），其次取 options 表当前配置。
+		// 表达式优先取日志自带的（计费当时生效的规则），其次取 options 表当前配置——
+		// 但只有当日志自己既没有 expr_b64、也没有 model_ratio/completion_ratio 快照时，
+		// 才允许回落到 options 表现在的配置。模型在账期内可能从 ratio 计费切换成
+		// billing_expr 阶梯计费，若日志本身是切换前的 ratio 快照，绝不能套用「现在」的表达式，
+		// 否则会把整条历史请求按今天才生效的计费口径重算，刊例严重失真。
 		exprStr := ""
+		rowModelRatio, rowCompletionRatio, rowCacheRatio, hasRowRatio := ParseRowRatioPricing(other)
 		if imgMode != "per_call" {
 			exprStr = ParseBillingExpr(other)
-			if exprStr == "" && exprSetting != nil {
+			if exprStr == "" && !hasRowRatio && exprSetting != nil {
 				exprStr = exprSetting.Expr(model)
 			}
 			if exprStr != "" {
@@ -163,6 +170,8 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		if imgMode == "per_call" {
 			if mp := ParseModelPrice(other); mp > 0 {
 				listUSD = mp
+				// 按次计费的固定美金价来自日志 model_price，是一份外部刊例。
+				listOrigin = ListOriginExternal
 			}
 			perCall = 1.0
 		} else if exprStr != "" {
@@ -178,34 +187,64 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 				}
 				listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
 				billingMode = "token"
+				listOrigin = ListOriginExternal
 			} else {
 				listUSD = res.USD / 1_000_000
 				if VendorFamily(model) != "" {
 					// 国产供应商家族的 billing_expr 系数是人民币、不是美元；这里先除回
 					// exchangeRate，下游 OfficialListCNY = officialUSD * exchangeRate 才能正确
-					// 换回原始人民币刃例，否则会被多乘一次汇率，把国产模型的“官方刃例”放大约 exchangeRate 倍。
+					// 换回原始人民币刊例，否则会被多乘一次汇率，把国产模型的"官方刊例"放大约 exchangeRate 倍。
 					listUSD /= exchangeRate
 				}
 				exprUsed = exprStr
 				matchedTier = res.MatchedTier
+				// 刊例由站内表达式算出，不是外部对标价：这一行不能参与折扣反推。
+				listOrigin = ListOriginExpr
 			}
+		} else if hasRowRatio {
+			// 该请求当时是按 ModelRatio/CompletionRatio/CacheRatio 直接计费（未命中
+			// billing_expr），系数换算方式与 fetchModelPricesFromDB 保持一致：
+			// ratio=1 对应官方基准 $0.002/1K token（$2/MTok）。国产供应商家族的
+			// ModelRatio 在这套系统里是按人民币报价（1 元=1 美金充值），同样需要
+			// 先除回 exchangeRate，避免换回人民币时被多乘一次汇率。
+			inp := rowModelRatio * 2
+			outp := inp * rowCompletionRatio
+			crp := inp * rowCacheRatio
+			if VendorFamily(model) != "" {
+				inp, outp, crp = inp/exchangeRate, outp/exchangeRate, crp/exchangeRate
+			}
+			listUSD = (uncached*inp + cacheRead*crp + completion*outp) / 1_000_000
+			if wsCalls > 0 && wsPrice > 0 {
+				listUSD += wsCalls * wsPrice / 1000.0
+			}
+			billingMode = "token"
+			// ratio 快照的换算基准是官方锚点（ratio=1 → $2/MTok），算外部对标价。
+			listOrigin = ListOriginExternal
 		} else {
 			basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
 			if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
 				basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
 			}
 			listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
+			if listUSD > 0 {
+				listOrigin = ListOriginExternal
+			}
 		}
 
 		key := [2]string{model, group}
 		agg, exists := buckets[key]
 		if !exists {
-			agg = &AggRow{Model: model, Group: group, BillingMode: billingMode}
+			agg = &AggRow{Model: model, Group: group, BillingMode: billingMode, ListOrigin: listOrigin}
 			buckets[key] = agg
 			if !groupSeen[group] {
 				groupSeen[group] = true
 				groupOrder = append(groupOrder, group)
 			}
+		} else {
+			// 同一 (模型,分组) 内可能混着两种口径：账期中途从 ratio 计费切到表达式，
+			// 或表达式降级行按价表算。整桶来源只有在完全一致时才可信，
+			// 不一致就记成 mixed，让折扣反推跳过这一桶而不是用半截分母算出个错数。
+			agg.ListOrigin = mergesListOrigin(agg.ListOrigin, listOrigin)
 		}
 		if exprUsed != "" {
 			agg.BillingExpr = exprUsed

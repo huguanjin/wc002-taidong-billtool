@@ -143,3 +143,36 @@ func TestGenerateBillMergesPriceTableDiscountsUnderDBSource(t *testing.T) {
 	assert.Equal(t, 0.6, result.Summary.Rows[0].Discount,
 		"db 价格源下也应采用价表里的 DeepSeek=6折，而不是反推值")
 }
+
+// TestIsOpenAIOrGeminiModelRecognizesDomesticVendors 国产供应商家族
+// （DeepSeek/GLM/Minimax/Qwen，Kimi 已覆盖）走的都是 OpenAI 兼容接口，
+// prompt_tokens 含缓存部分，必须按 openai 语义扣减，不能落到 anthropic 兜底分支
+// （兜底会把整段 prompt 都当未命中，相当于把缓存部分重复计了一次价）。
+func TestIsOpenAIOrGeminiModelRecognizesDomesticVendors(t *testing.T) {
+	for _, model := range []string{"deepseek-v4.1-flash", "glm-5", "chatglm-pro", "minimax-m2.5", "qwen3.8-max", "kimi-k3", "gpt-5.4", "gemini-2.5-pro"} {
+		assert.True(t, IsOpenAIOrGeminiModel(model), "%s 应识别为 openai 语义", model)
+		assert.Equal(t, "openai", InferUsageSemantic(model, ""), "%s 应推断为 openai 语义", model)
+	}
+	assert.False(t, IsOpenAIOrGeminiModel("claude-sonnet-5"))
+}
+
+// TestAggregateFromRowsSubtractsCacheForDomesticVendorModel 覆盖本次修复：国产供应商家族
+// 模型（如 deepseek-v4.1-flash）的 uncached 必须扣减 cache_tokens，不能按 anthropic 语义
+// 直接取整段 prompt_tokens——否则缓存命中的 token 会被同时计入"未命中"与"缓存读取"两档，
+// 把官方刊例严重高估（本次真实客户日志里曾因此导致刊例虚高约 5 倍）。
+func TestAggregateFromRowsSubtractsCacheForDomesticVendorModel(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	other := `{"model_ratio":1,"completion_ratio":4,"cache_ratio":0.1,"cache_tokens":57216,"group_ratio":0.75}`
+	rows := [][]string{{"deepseek-v4.1-flash", "国产模型", "57945", "914", "7580", other, "1755000000"}}
+
+	result, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Rows, 1)
+	agg := result.Rows[0]
+	assert.Equal(t, 729.0, agg.Uncached, "uncached 应为 prompt_tokens 扣减 cache_tokens 后的值")
+	assert.Equal(t, 57216.0, agg.CacheRead)
+	// 官方刊例（未计入 group_ratio）应与真实 quota 换算的口径同数量级：
+	// 真实结算 quota/500000/group_ratio ≈ 0.75/0.75=0.0202（CNY，未打折前）。
+	assert.InDelta(t, 0.0202, OfficialListCNY(agg, 7.0), 0.001)
+}
+
