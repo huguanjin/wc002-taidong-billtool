@@ -230,7 +230,6 @@ const form = ref({
   sanitizedFormat: 'tsv',
   includeBillingParams: false,
   keepLog: false,
-  domesticMarkers: '',
 })
 
 const loading = ref(false)
@@ -247,6 +246,13 @@ const priceCheckDone = ref(false)
 const checkedModelCount = ref(0)
 const missingModels = ref([])
 const exprModels = ref([])
+// 日志里去重后的分组标识，由「检查模型价格覆盖」带回来，用于渲染勾选列表。
+const groups = ref([])
+// selectedDomesticGroups 是勾选为「国产/站内定价」的分组名集合。
+const selectedDomesticGroups = ref({})
+// domesticModelPrefixes 兜住按分组名勾不准的情况：整组里只有部分模型是站内定价时，
+// 用模型名前缀排除更精确。分组勾选覆盖大多数场景，这里保持成可选的补充项。
+const domesticModelPrefixes = ref('')
 const manualPrices = ref({})
 
 async function pullDbPrices() {
@@ -338,6 +344,14 @@ const hasMissingPrice = computed(
   () => result.value && result.value.summary.missingPriceModels && result.value.summary.missingPriceModels.length > 0
 )
 
+const selectedDomesticGroupCount = computed(
+  () => Object.values(selectedDomesticGroups.value).filter(Boolean).length
+)
+
+function clearDomesticGroups() {
+  selectedDomesticGroups.value = {}
+}
+
 // appendSourceFields 把当前选择的日志来源（上传文件 或 服务器路径）写入 FormData，
 // 供生成账单和检查价格覆盖两个请求共用。返回 false 表示校验未通过（已写入 errorMsg）。
 function appendSourceFields(fd, errRef) {
@@ -379,6 +393,13 @@ async function checkMissingPrices() {
     checkedModelCount.value = data.modelCount || 0
     missingModels.value = data.missingModels || []
     exprModels.value = data.exprModels || []
+    groups.value = data.groups || []
+    // 已勾选过、这次日志里仍然存在的分组保留勾选状态，重新检查不用重勾。
+    const nextSelected = {}
+    for (const g of groups.value) {
+      if (selectedDomesticGroups.value[g]) nextSelected[g] = true
+    }
+    selectedDomesticGroups.value = nextSelected
     const nextManual = {}
     for (const model of missingModels.value) {
       nextManual[model] = manualPrices.value[model] || { input: '', output: '' }
@@ -417,9 +438,14 @@ async function handleSubmit() {
   if (Object.keys(manualEntries).length > 0) {
     fd.append('manualPrices', JSON.stringify(manualEntries))
   }
-  // 国产/站内定价标识：原样传给后端，空行与重复项由后端统一处理。
-  if (form.value.domesticMarkers.trim() !== '') {
-    fd.append('domesticMarkers', form.value.domesticMarkers)
+  // 国产/站内定价标识：勾选的分组名 + 手填的模型名前缀，合并后交给后端
+  // （后端统一做去空白、去重与前缀匹配）。
+  const domesticMarkers = [
+    ...Object.keys(selectedDomesticGroups.value).filter((g) => selectedDomesticGroups.value[g]),
+    ...domesticModelPrefixes.value.split(/[\n,，]/).map((s) => s.trim()).filter(Boolean),
+  ]
+  if (domesticMarkers.length > 0) {
+    fd.append('domesticMarkers', domesticMarkers.join('\n'))
   }
 
   loading.value = true
@@ -633,16 +659,31 @@ async function handleSubmit() {
       </div>
 
       <div class="field">
-        <label>国产/站内定价标识（可选，一行一个）</label>
-        <textarea
-          v-model="form.domesticMarkers"
-          rows="3"
-          placeholder="填分组标识（精确匹配）或模型名前缀，例如：&#10;国产模型&#10;doubao"
-        ></textarea>
+        <label>国产/站内定价标识（可选）</label>
         <span class="hint">
-          这些分组不参与折扣反推，折扣改取站点实际计费倍率，并在账单备注里要求人工确认。
+          勾选的分组不参与折扣反推，折扣改取站点实际计费倍率，并在账单备注里要求人工确认；
           走站内表达式（billing_expr）计费的分组本来就不会被反推，这里只用来兜住模型名认不出的站内定价。
         </span>
+        <div class="group-picker" v-if="groups.length > 0">
+          <label class="group-item" v-for="g in groups" :key="g">
+            <input type="checkbox" v-model="selectedDomesticGroups[g]" />
+            <span>{{ g }}</span>
+          </label>
+          <div class="group-actions">
+            <button type="button" class="btn-link" @click="clearDomesticGroups">清空勾选</button>
+            <span class="hint" v-if="selectedDomesticGroupCount > 0">
+              已勾选 {{ selectedDomesticGroupCount }} 个分组
+            </span>
+          </div>
+        </div>
+        <span class="hint" v-else>
+          先点「检查模型价格覆盖」，这里会列出日志里的分组供勾选。
+        </span>
+        <input
+          v-model="domesticModelPrefixes"
+          type="text"
+          placeholder="补充：模型名前缀，多个用逗号分隔（如 doubao,ernie）"
+        />
       </div>
       <div class="field">
         <label>模型单价来源</label>
@@ -887,6 +928,40 @@ async function handleSubmit() {
   background: #2c6ef2;
   color: #fff;
   border-color: #2c6ef2;
+}
+.group-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 8px 10px;
+  margin: 6px 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.group-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #444;
+  cursor: pointer;
+}
+.group-actions {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #2c6ef2;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: underline;
 }
 textarea {
   width: 100%;

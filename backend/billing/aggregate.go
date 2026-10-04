@@ -340,6 +340,35 @@ func ExtractDistinctModels(headers []string, rows [][]string) ([]string, error) 
 	return models, nil
 }
 
+// ExtractDistinctGroups 提取日志中出现的去重分组标识（按名称排序），
+// 供出账前勾选「国产/站内定价」分组——分组名是客户自己的业务分组，
+// 事先无法枚举，只能从待出账的日志里现取。
+func ExtractDistinctGroups(headers []string, rows [][]string) ([]string, error) {
+	col := map[string]int{}
+	for i, h := range headers {
+		if h != "" {
+			col[h] = i
+		}
+	}
+	idxGroup, ok := col["group"]
+	if !ok {
+		return nil, fmt.Errorf("日志缺少列: [group]；实际列: %v", headers)
+	}
+
+	seen := map[string]bool{}
+	var groups []string
+	for _, row := range rows {
+		group := strings.TrimSpace(cellAt(row, idxGroup))
+		if group == "" || seen[group] {
+			continue
+		}
+		seen[group] = true
+		groups = append(groups, group)
+	}
+	sort.Strings(groups)
+	return groups, nil
+}
+
 func containsString(list []string, v string) bool {
 	for _, item := range list {
 		if item == v {

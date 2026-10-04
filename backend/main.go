@@ -221,10 +221,18 @@ func handleCheckMissingPrices(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 分组标识同样去重返回：前端按它渲染勾选框，让用户勾出国产/站内定价的分组。
+	// 分组名取不到不是致命错误（老日志可能没有 group 列），降级成空列表即可。
+	groups, gerr := billing.ExtractDistinctGroups(headers, rows)
+	if gerr != nil {
+		groups = nil
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"modelCount":    len(models),
 		"missingModels": missingModels,
 		"exprModels":    exprModels,
+		"groups":        groups,
 	})
 }
 

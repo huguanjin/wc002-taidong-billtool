@@ -443,7 +443,47 @@ func TestBillNotesManualMarkerExcludedFromDerivation(t *testing.T) {
 	assert.Contains(t, note, "人工确认")
 }
 
-// TestAutoVendorFamilyDoesNotSuppressDerivation 自动厂商识别不能影响折扣反推。
+// TestExtractDistinctGroups 分组列表供前端勾选国产/站内定价：
+// 必须去重、去空白、按名称排序，且缺列时报错而不是静默返回空。
+func TestExtractDistinctGroups(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens"}
+	rows := [][]string{
+		{"deepseek-v4.1-flash", "国产模型", "100"},
+		{"qwen3.8-max", "国产模型", "200"},
+		{"gpt-5.4", " AZ定制 ", "300"},
+		{"gemini-2.5-pro", "vip", "400"},
+		{"claude-sonnet-5", "", "500"},
+		{"claude-sonnet-5", "vip", "600"},
+	}
+
+	groups, err := ExtractDistinctGroups(headers, rows)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"AZ定制", "vip", "国产模型"}, groups,
+		"应按名称排序、去重，并去掉分组名两端的空白；空分组不计入")
+
+	// 缺列必须报错，否则前端会把「没有分组列」当成「日志里没有分组」而静默放行。
+	_, err = ExtractDistinctGroups([]string{"model_name"}, rows)
+	assert.Error(t, err)
+}
+
+// TestExtractDistinctGroupsFeedsDomesticMarkers 分组列表勾出来的名字必须能被
+// DerivableListPrice 认出来：列表给用户看的是 trimmed 名字，判定用的也是 trimmed 名字。
+func TestExtractDistinctGroupsFeedsDomesticMarkers(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens"}
+	rows := [][]string{{"doubao-pro-32k", " 国产模型 ", "100"}}
+
+	groups, err := ExtractDistinctGroups(headers, rows)
+	require.NoError(t, err)
+	require.Equal(t, []string{"国产模型"}, groups)
+
+	row := &AggRow{
+		Model: "doubao-pro-32k", Group: strings.TrimSpace(rows[0][1]),
+		OfficialUSD: 1.0, ListOrigin: ListOriginExternal,
+	}
+	assert.False(t, DerivableListPrice(row, groups), "勾选该分组后不再参与反推")
+}
+
+
 // 国产厂商模型只要挂的是第三方部署、有官方对标价，就照样能反推；
 // 「是不是国产」和「有没有外部对标价」是两回事，判据以后者为准。
 func TestAutoVendorFamilyDoesNotSuppressDerivation(t *testing.T) {
