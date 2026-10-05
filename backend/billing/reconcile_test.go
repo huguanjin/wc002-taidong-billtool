@@ -365,3 +365,57 @@ func TestParseCacheWritePrices(t *testing.T) {
 	}
 	_ = rate
 }
+
+// TestAggregateRowsGroupedTogether 账单行的排序必须让同一分组连续。
+//
+// 排序键曾经用的是 agg.Group，而 Group 在按倍率拆桶后是「分组|倍率」复合键，
+// 拿它去查「原始分组名 → 序号」的表一律查不到、全为 0，排序退化成只按模型名排。
+// 结果就是客户看到的「标识一、标识二、又回到标识一」——
+// 同一分组的行被别的分组插在中间，人工核对时极难对上。
+func TestAggregateRowsGroupedTogether(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+	mk := func(model, group string, gr float64) []string {
+		return []string{model, group, "100", "10", "1000",
+			fmt.Sprintf(`{"group_ratio":%v}`, gr), "1789470821"}
+	}
+	// 故意交错输入：两个分组各两条，且 AWS 组内还含两种倍率。
+	rows := [][]string{
+		mk("claude-opus-4-8", "AWS-专供分组", 4.62),
+		mk("claude-sonnet-5", "ClaudeCode-Max（Pro）", 1.4),
+		mk("claude-opus-4-7", "AWS-专供分组", 4.62),
+		mk("claude-opus-5", "ClaudeCode-Max（Pro）", 1.4),
+		mk("claude-opus-4-8", "AWS-专供分组", 1.0),
+	}
+
+	agg, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, agg.Rows, 5, "两种分组、AWS 两种倍率 → 5 桶")
+
+	// 同一分组的所有行必须落在连续区间里。
+	seen := map[string]bool{}
+	var order []string
+	for _, a := range agg.Rows {
+		if len(order) == 0 || order[len(order)-1] != a.KeyGroup {
+			order = append(order, a.KeyGroup)
+		}
+	}
+	for _, g := range order {
+		require.False(t, seen[g], "分组 %q 被拆成了不连续的多段：%v", g, order)
+		seen[g] = true
+	}
+	assert.Equal(t, 2, len(order), "应只有两个分组的连续区段，实际 %v", order)
+
+	// 同一分组内按倍率升序，倍率相同再按模型名——顺序必须可复现。
+	var aws []*AggRow
+	for _, a := range agg.Rows {
+		if a.KeyGroup == "AWS-专供分组" {
+			aws = append(aws, a)
+		}
+	}
+	require.Len(t, aws, 3)
+	assert.Equal(t, 1.0, aws[0].GroupRatio)
+	assert.Equal(t, 4.62, aws[1].GroupRatio)
+	assert.Equal(t, 4.62, aws[2].GroupRatio)
+	assert.Equal(t, "claude-opus-4-7", aws[1].Model, "同倍率内按模型名排序")
+	assert.Equal(t, "claude-opus-4-8", aws[2].Model)
+}

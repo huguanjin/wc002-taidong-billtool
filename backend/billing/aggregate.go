@@ -342,10 +342,22 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 	for _, agg := range buckets {
 		result = append(result, agg)
 	}
+	// 排序键是 KeyGroup（原始分组名）而不是 Group：Group 现在是含倍率的桶键
+	// （如 "AWS-专供分组|4.62"），拿它去查 groupRank 一律查不到、全为 0，
+	// 结果退化成只按模型名排——同一分组的行被别的分组插在中间，
+	// 客户看到「标识一、标识二、又回到标识一」。
+	//
+	// 同一个分组拆出的多个倍率桶排在一起，桶内按倍率、再按模型名，保证顺序稳定。
 	sort.Slice(result, func(i, j int) bool {
-		ri, rj := groupRank[result[i].Group], groupRank[result[j].Group]
+		ri, rj := groupRank[result[i].KeyGroup], groupRank[result[j].KeyGroup]
 		if ri != rj {
 			return ri < rj
+		}
+		if result[i].KeyGroup != result[j].KeyGroup {
+			return result[i].KeyGroup < result[j].KeyGroup
+		}
+		if result[i].GroupRatio != result[j].GroupRatio {
+			return result[i].GroupRatio < result[j].GroupRatio
 		}
 		return result[i].Model < result[j].Model
 	})
