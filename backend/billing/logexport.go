@@ -2,10 +2,13 @@ package billing
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -237,14 +240,47 @@ func buildLogExportQuery(table string, params LogExportParams) (string, []interf
 	return query, args
 }
 
-// ExportLogFileName 导出文件名：日志查询_<起始日>_<结束日>.tsv。
+// ExportLogFileName 导出文件名：日志查询_<起始日>_<结束日>_<账号指纹>.tsv。
 //
-// 取起止时刻本身的日期，不做任何偏移：区间是双闭的，EndTime 已经是最后一个
+// 日期取起止时刻本身，不做任何偏移：区间是双闭的，EndTime 已经是最后一个
 // 算在内的时刻，减一秒会把「结束于某天 00:00:00」错标成前一天。
+//
+// 末尾的账号指纹是必需的，不是装饰：同一时间段给不同客户导出时，
+// 只按日期命名会得到完全相同的文件名，而落盘走的是 os.Rename——
+// 后一次导出会**静默覆盖**前一次的文件，数据直接丢，且没有任何提示。
+// 指纹取账号/用户 ID/起止时刻的短哈希，既能区分又不会把客户账号名写进文件名。
+//
 // 含「日志查询」字样，出账时 defaultOutputName 会据此把名字换成「账单」。
-func ExportLogFileName(start, end time.Time) string {
-	return fmt.Sprintf("日志查询_%s_%s.tsv",
-		start.Format("2006-01-02"), end.Format("2006-01-02"))
+func ExportLogFileName(params LogExportParams) string {
+	return fmt.Sprintf("日志查询_%s_%s_%s.tsv",
+		params.StartTime.Format("2006-01-02"), params.EndTime.Format("2006-01-02"),
+		exportFingerprint(params))
+}
+
+// exportFingerprint 账号集合与区间的短指纹。
+//
+// 只做区分用，不追求密码学强度：同样的导出条件得到同样的名字（便于覆盖自己上次的结果），
+// 条件不同则名字不同（不会误覆盖别人的）。账号名先排序并小写化，
+// 这样「A,B」与「B,a」视为同一组，不会因为输入顺序不同就产生两个文件。
+func exportFingerprint(params LogExportParams) string {
+	parts := make([]string, 0, len(params.Usernames)+len(params.UserIDs)+3)
+	for _, u := range params.Usernames {
+		parts = append(parts, "u:"+strings.ToLower(strings.TrimSpace(u)))
+	}
+	ids := make([]int, len(params.UserIDs))
+	copy(ids, params.UserIDs)
+	sort.Ints(ids)
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("i:%d", id))
+	}
+	sort.Strings(parts)
+	parts = append(parts,
+		fmt.Sprintf("s:%d", params.StartTime.Unix()),
+		fmt.Sprintf("e:%d", params.EndTime.Unix()),
+		fmt.Sprintf("uid:%v", params.IncludeUserID))
+
+	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))
+	return hex.EncodeToString(sum[:])[:8]
 }
 
 // ExportLogsFromDB 连业务库把消费日志导出为 mysql 批处理模式的 tsv，
@@ -279,8 +315,8 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
 	}
-	// 文件名里的日期直接取起止时刻本身（见 ExportLogFileName）。
-	name := ExportLogFileName(params.StartTime, params.EndTime)
+	// 文件名含账号指纹，避免同时间段不同客户互相覆盖（见 ExportLogFileName）。
+	name := ExportLogFileName(params)
 	finalPath := filepath.Join(outDir, name)
 	tmp, err := os.CreateTemp(outDir, ".logexport-*.tmp")
 	if err != nil {

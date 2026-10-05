@@ -440,6 +440,8 @@ async function exportLogs() {
       return
     }
     exportResult.value = data
+    // 刚导出的文件直接出现在下面的列表里，不用再点一次刷新。
+    loadDataLogs()
   } catch (err) {
     exportError.value = '导出失败：' + err.message
   } finally {
@@ -451,6 +453,105 @@ async function exportLogs() {
 function useExportAsBillInput() {
   if (!exportResult.value) return
   serverPath.value = exportResult.value.exportedPath
+  sourceMode.value = 'server'
+  loadGroups()
+}
+
+// 已导出的日志文件列表：查看与手动清理 data 目录。
+const dataLogs = ref([])
+const dataLogDir = ref('')
+const dataLogsLoaded = ref(false)
+const loadingDataLogs = ref(false)
+const dataLogsError = ref('')
+const dataLogsMessage = ref('')
+const deletingLogs = ref(false)
+const selectedDataLogs = ref([])
+
+const allDataLogsSelected = computed(
+  () => dataLogs.value.length > 0 && selectedDataLogs.value.length === dataLogs.value.length
+)
+
+function fmtSize(bytes) {
+  if (bytes === undefined || bytes === null) return '-'
+  const kb = bytes / 1024
+  if (kb < 1024) return `${kb.toFixed(1)} KB`
+  return `${(kb / 1024).toFixed(1)} MB`
+}
+
+async function loadDataLogs() {
+  dataLogsError.value = ''
+  dataLogsMessage.value = ''
+  loadingDataLogs.value = true
+  try {
+    const resp = await fetch('/api/data-logs')
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      dataLogsError.value = data.error || `读取失败（${resp.status}）`
+      return
+    }
+    dataLogs.value = data.files || []
+    dataLogDir.value = data.dataDir || ''
+    dataLogsLoaded.value = true
+    // 列表刷新后丢掉已经不存在的勾选项，避免删到别人。
+    const present = new Set(dataLogs.value.map((f) => f.name))
+    selectedDataLogs.value = selectedDataLogs.value.filter((n) => present.has(n))
+  } catch (err) {
+    dataLogsError.value = '读取失败：' + err.message
+  } finally {
+    loadingDataLogs.value = false
+  }
+}
+
+function toggleAllDataLogs(checked) {
+  selectedDataLogs.value = checked ? dataLogs.value.map((f) => f.name) : []
+}
+
+// 删除是不可逆操作，逐个确认并明确列出文件名——批量静默删除日志太危险。
+async function deleteSelectedLogs() {
+  const names = [...selectedDataLogs.value]
+  if (names.length === 0) return
+
+  const list = names.length <= 5 ? names.map((n) => `· ${n}`).join('\n') : `· ${names.slice(0, 5).join('\n· ')}\n…… 共 ${names.length} 个`
+  if (typeof confirm === 'function' && !confirm(`确认删除以下 ${names.length} 个日志文件？此操作不可恢复。\n\n${list}`)) {
+    return
+  }
+
+  dataLogsError.value = ''
+  dataLogsMessage.value = ''
+  deletingLogs.value = true
+  const failed = []
+  let okCount = 0
+  try {
+    for (const name of names) {
+      const fd = new FormData()
+      fd.append('name', name)
+      const resp = await fetch('/api/delete-log-file', { method: 'POST', body: fd })
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}))
+        if (resp.status === 401) authenticated.value = false
+        failed.push(`${name}：${data.error || resp.status}`)
+        continue
+      }
+      okCount++
+    }
+  } catch (err) {
+    failed.push('请求失败：' + err.message)
+  } finally {
+    deletingLogs.value = false
+  }
+
+  if (failed.length > 0) {
+    dataLogsError.value = `删除完成 ${okCount} 个，失败 ${failed.length} 个：${failed.join('；')}`
+  } else {
+    dataLogsMessage.value = `已删除 ${okCount} 个文件。`
+  }
+  selectedDataLogs.value = []
+  await loadDataLogs()
+}
+
+function useDataLogAsInput(f) {
+  serverPath.value = f.path
   sourceMode.value = 'server'
   loadGroups()
 }
@@ -804,6 +905,69 @@ async function handleSubmit() {
         <p class="hint">文件位置：{{ exportResult.exportedPath }}</p>
       </div>
     </form>
+
+    <div class="card">
+      <h2>已导出的日志文件</h2>
+      <p class="hint">
+        列出服务器 data 目录里由本工具导出的日志，可勾选清理。这里只会列出并允许删除
+        「日志查询_」开头的文件——账单模板、报价表、价格缓存不在清理范围内。
+      </p>
+
+      <div class="path-row">
+        <button type="button" class="btn-browse" @click="loadDataLogs" :disabled="loadingDataLogs">
+          {{ loadingDataLogs ? '读取中…' : '刷新列表' }}
+        </button>
+        <button
+          type="button"
+          class="btn-browse"
+          v-if="selectedDataLogs.length > 0"
+          @click="deleteSelectedLogs"
+          :disabled="deletingLogs"
+        >
+          {{ deletingLogs ? '删除中…' : `删除选中（${selectedDataLogs.length}）` }}
+        </button>
+      </div>
+      <p class="error" v-if="dataLogsError">{{ dataLogsError }}</p>
+      <span class="hint" v-if="dataLogsMessage">{{ dataLogsMessage }}</span>
+      <p class="hint" v-if="dataLogDir">目录：{{ dataLogDir }}</p>
+
+      <table v-if="dataLogs.length > 0">
+        <thead>
+          <tr>
+            <th>
+              <input
+                type="checkbox"
+                :checked="allDataLogsSelected"
+                @change="toggleAllDataLogs($event.target.checked)"
+              />
+            </th>
+            <th>文件名</th>
+            <th>大小</th>
+            <th>导出时间</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="f in dataLogs" :key="f.name">
+            <td>
+              <input type="checkbox" v-model="selectedDataLogs" :value="f.name" />
+            </td>
+            <td>{{ f.name }}</td>
+            <td>{{ fmtSize(f.sizeBytes) }}</td>
+            <td>{{ new Date(f.modifiedAt).toLocaleString('zh-CN') }}</td>
+            <td>
+              <button type="button" class="btn-link" @click="useDataLogAsInput(f)">作为账单输入</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="hint" v-else-if="!loadingDataLogs && dataLogsLoaded">
+        目录里还没有导出的日志文件。
+      </span>
+      <span class="hint" v-else-if="!dataLogsLoaded">
+        点「刷新列表」查看已导出的日志文件。
+      </span>
+    </div>
 
     <form class="card" @submit.prevent="handleSubmit">
       <div class="field" v-if="sourceMode === 'upload'">

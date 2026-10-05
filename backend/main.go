@@ -84,6 +84,8 @@ func main() {
 	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
 	mux.HandleFunc("/api/log-groups", withCORS(requireAuth(handleLogGroups)))
 	mux.HandleFunc("/api/export-logs", withCORS(requireAuth(handleExportLogs)))
+	mux.HandleFunc("/api/data-logs", withCORS(requireAuth(handleDataLogs)))
+	mux.HandleFunc("/api/delete-log-file", withCORS(requireAuth(handleDeleteLogFile)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -425,6 +427,54 @@ func parseIntList(items []string) ([]int, error) {
 		out = append(out, n)
 	}
 	return out, nil
+}
+
+// handleDataLogs 列出 data 目录下由本工具导出的日志文件，供页面查看与清理。
+func handleDataLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	files, err := billing.ListDataLogs(dataDir)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"files":  files,
+		"dataDir": dataDir,
+	})
+}
+
+// handleDeleteLogFile 删除一个导出的日志文件。
+// 只允许删 data 目录下「日志查询_」前缀的 tsv/csv/xlsx，
+// 账单模板、报价表、价格缓存不在可删范围内。
+func handleDeleteLogFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		httpError(w, http.StatusBadRequest, "解析表单失败: "+err.Error())
+		return
+	}
+	name := r.FormValue("name")
+	removed, err := billing.DeleteDataLog(dataDir, name)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 把已删文件从任务记录里摘掉，避免下载接口继续指向不存在的路径。
+	jobsMu.Lock()
+	for id, rec := range jobs {
+		if rec.exportedPath == removed {
+			delete(jobs, id)
+		}
+	}
+	jobsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": filepath.Base(removed)})
 }
 
 // handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。

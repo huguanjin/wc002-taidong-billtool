@@ -502,23 +502,79 @@ func TestExportFilenameUsesGivenDays(t *testing.T) {
 		name      string
 		start     string
 		end       string
-		wantSuffix string
+		wantPrefix string
 	}{
-		{"整段", "2026-09-01 00:00:00", "2026-09-30 23:59:59", "日志查询_2026-09-01_2026-09-30.tsv"},
-		{"结束在当天零点", "2026-09-01 00:00:00", "2026-09-29 00:00:00", "日志查询_2026-09-01_2026-09-29.tsv"},
-		{"只填日期", "2026-09-24", "2026-09-29", "日志查询_2026-09-24_2026-09-29.tsv"},
-		{"秒级窗口", "2026-09-24 10:30:05", "2026-09-24 10:30:08", "日志查询_2026-09-24_2026-09-24.tsv"},
+		{"整段", "2026-09-01 00:00:00", "2026-09-30 23:59:59", "日志查询_2026-09-01_2026-09-30_"},
+		{"结束在当天零点", "2026-09-01 00:00:00", "2026-09-29 00:00:00", "日志查询_2026-09-01_2026-09-29_"},
+		{"只填日期", "2026-09-24", "2026-09-29", "日志查询_2026-09-24_2026-09-29_"},
+		{"秒级窗口", "2026-09-24 10:30:05", "2026-09-24 10:30:08", "日志查询_2026-09-24_2026-09-24_"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			start, end, err := ResolveExportRange(tc.start, tc.end)
 			require.NoError(t, err)
-			got := ExportLogFileName(start, end)
-			assert.Equal(t, tc.wantSuffix, got)
+			got := ExportLogFileName(LogExportParams{
+				Usernames: []string{"test02"}, StartTime: start, EndTime: end,
+			})
+			assert.True(t, strings.HasPrefix(got, tc.wantPrefix),
+				"文件名应以 %q 开头（日期段），实际 %q", tc.wantPrefix, got)
+			assert.True(t, strings.HasSuffix(got, ".tsv"))
 			// 含「日志查询」，以便出账时被 defaultOutputName 改名为「账单」。
 			assert.Contains(t, got, "日志查询")
 		})
 	}
+}
+
+// TestExportFileNameDistinguishesAccounts 同名覆盖回归。
+//
+// 修复前文件名只有日期段：同一时间段给不同客户导出会得到完全相同的名字，
+// 而落盘走 os.Rename——后一次导出静默覆盖前一次，数据直接丢且无任何提示。
+func TestExportFileNameDistinguishesAccounts(t *testing.T) {
+	start, end, err := ResolveExportRange("2026-09-01 00:00:00", "2026-09-30 23:59:59")
+	require.NoError(t, err)
+
+	nameOf := func(usernames []string, ids []int, includeUID bool) string {
+		return ExportLogFileName(LogExportParams{
+			Usernames: usernames, UserIDs: ids,
+			IncludeUserID: includeUID, StartTime: start, EndTime: end,
+		})
+	}
+
+	accA := nameOf([]string{"a37836323"}, nil, false)
+	accB := nameOf([]string{"test02"}, nil, false)
+	accAB := nameOf([]string{"a37836323", "test02"}, nil, false)
+
+	assert.NotEqual(t, accA, accB, "不同账号必须得到不同文件名，否则会互相覆盖")
+	assert.NotEqual(t, accA, accAB, "账号集合不同也必须区分开")
+	assert.NotEqual(t, accB, accAB)
+
+	// 同一小段日期前缀，便于人工按时间排序查找。
+	assert.Contains(t, accA, "2026-09-01_2026-09-30")
+
+	// 账号输入顺序不同视为同一组，不产生多余文件。
+	assert.Equal(t, accAB, nameOf([]string{"test02", "a37836323"}, nil, false),
+		"账号顺序不同应得到同一个名字（先排序再算指纹）")
+	assert.Equal(t, nameOf([]string{"Test02"}, nil, false), nameOf([]string{"test02"}, nil, false),
+		"大小写不同视为同一账号")
+
+	// 用户 ID、是否带 user_id 列、时间区间变化都要体现在名字里。
+	assert.NotEqual(t, nameOf(nil, []int{42}, false), nameOf(nil, []int{43}, false),
+		"不同用户 ID 必须区分")
+	assert.NotEqual(t, accA, nameOf([]string{"a37836323"}, nil, true),
+		"是否追加 user_id 列会影响列结构，名字也要不同")
+	otherStart, _, err := ResolveExportRange("2026-08-01 00:00:00", "2026-08-31 23:59:59")
+	require.NoError(t, err)
+	assert.NotEqual(t, accA, ExportLogFileName(LogExportParams{
+		Usernames: []string{"a37836323"}, StartTime: otherStart, EndTime: otherStart.Add(24 * time.Hour),
+	}), "不同时间段必须区分")
+
+	// 指纹不带账号明文——文件名会出现在日志与页面里，不该直接暴露客户账号。
+	assert.NotContains(t, accA, "a37836323")
+	assert.NotContains(t, accB, "test02")
+
+	// 指纹定长 8 位，名字长度稳定。
+	parts := strings.Split(strings.TrimSuffix(accA, ".tsv"), "_")
+	assert.Len(t, parts[len(parts)-1], 8, "指纹应为 8 位十六进制")
 }
 
 func indexOfHeader(headers []string, name string) int {
