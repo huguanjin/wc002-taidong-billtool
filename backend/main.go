@@ -107,7 +107,9 @@ func main() {
 	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
 	mux.HandleFunc("/api/delete-customer", withCORS(requireAuth(handleDeleteCustomer)))
 	mux.HandleFunc("/api/bill-tasks", withCORS(requireAuth(handleBillTasks)))
-	mux.HandleFunc("/api/run-bill-task", withCORS(requireAuth(handleRunBillTask)))
+	mux.HandleFunc("/api/save-bill-task", withCORS(requireAuth(handleSaveBillTask)))
+	mux.HandleFunc("/api/validate-bill-tasks", withCORS(requireAuth(handleValidateBillTasks)))
+	mux.HandleFunc("/api/run-bill-tasks", withCORS(requireAuth(handleRunBillTasks)))
 	mux.HandleFunc("/api/delete-bill-task", withCORS(requireAuth(handleDeleteBillTask)))
 	mux.HandleFunc("/api/bill-task-settings", withCORS(requireAuth(handleBillTaskSettings)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
@@ -631,11 +633,204 @@ func handleBillTasks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRunBillTask 一键执行：导出该客户日志 → 出账 →（可选）成本利润表 → 落库。
+// taskInput 新建/编辑计划的请求体。
 //
-// 这条链路是同步的，可能要跑几十秒（导日志 + 聚合上百万行）。
-// 不引入任务队列：出账结果是用户马上要下载的东西，排到后台再回来找反而更麻烦。
-func handleRunBillTask(w http.ResponseWriter, r *http.Request) {
+// 时段用两个日期字符串而不是时间戳：前端是 <input type="date">，
+// 按北京时间解析（ParseExportTime 内部走 +08:00），与导出日志同一套口径。
+type taskInput struct {
+	ID                int64  `json:"id"` // 0 = 新建
+	CustomerID        int64  `json:"customerId"`
+	Name              string `json:"name"`
+	StartDate         string `json:"startDate"`
+	EndDate           string `json:"endDate"`
+	GenerateSanitized bool   `json:"generateSanitized"`
+	GenerateCost      bool   `json:"generateCost"`
+}
+
+// handleSaveBillTask 新建或编辑一条账单计划。
+//
+// 只写计划字段，不碰上次的执行结果——改个时段或名字不该把已经出过的账清掉。
+func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	var in taskInput
+	if !decodeJSONBody(w, r, &in) {
+		return
+	}
+	if in.CustomerID <= 0 {
+		httpError(w, http.StatusBadRequest, "请选择客户")
+		return
+	}
+
+	// 解析时段。两个都空是允许的（先建计划、后补时段），
+	// 但只填一个没意义——查库区间缺一端。
+	hasStart := strings.TrimSpace(in.StartDate) != ""
+	hasEnd := strings.TrimSpace(in.EndDate) != ""
+	if hasStart != hasEnd {
+		httpError(w, http.StatusBadRequest, "开始日期与结束日期必须同时填写")
+		return
+	}
+
+	task := billing.BillTask{
+		ID:                in.ID,
+		CustomerID:        in.CustomerID,
+		Name:              strings.TrimSpace(in.Name),
+		GenerateSanitized: in.GenerateSanitized,
+		GenerateCost:      in.GenerateCost,
+	}
+
+	if hasStart && hasEnd {
+		// ResolveExportRange 复用导出日志的同一套解析：一律按 +08:00，
+		// 只给日期时结束日补到当天 23:59:59（含），与手动导出的区间语义一致。
+		// 它只校验起止顺序，跨度上限由 billing 侧的 validatePlanRange 兜。
+		start, end, err := billing.ResolveExportRange(in.StartDate, in.EndDate)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		task.StartTime = &start
+		task.EndTime = &end
+		// 归属账期由开始日推导（跨月任务整个计入开始月）。
+		task.PeriodYear, task.PeriodMonth = billing.PeriodFromStartTime(start)
+	}
+
+	// 客户名存成冗余快照，让计划列表在客户改名后仍读得懂。
+	customer, err := billing.GetCustomer(*pgConfig, in.CustomerID)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "客户不存在，请先在客户信息页新增")
+		return
+	}
+	task.CustomerName = customer.Name
+
+	if in.ID == 0 {
+		saved, err := billing.CreateBillTask(*pgConfig, task)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"task": saved})
+		return
+	}
+
+	// 编辑：时段为空时不清掉已有时段（前端没传就意味着不改这两项之外的字段）。
+	// 但 PeriodYear/Month 必须保留，否则按归属账期筛选会漏掉这条计划。
+	if task.StartTime == nil {
+		existing, err := billing.GetBillTask(*pgConfig, in.ID)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "任务不存在（可能已被删除）")
+			return
+		}
+		task.StartTime = existing.StartTime
+		task.EndTime = existing.EndTime
+		task.PeriodYear = existing.PeriodYear
+		task.PeriodMonth = existing.PeriodMonth
+	}
+	if err := billing.UpdateBillTask(*pgConfig, task); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := billing.GetBillTask(*pgConfig, in.ID)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"task": updated})
+}
+
+// loadTasksAndCustomers 取计划与客户表，供预检与批量执行共用。
+//
+// 客户一次查好装进 map：预检要逐条看客户有没有配账号，
+// 每条各查一次库就是 N+1。
+func loadTasksAndCustomers(ids []int64) ([]billing.BillTask, map[int64]billing.Customer, error) {
+	tasks := make([]billing.BillTask, 0, len(ids))
+	for _, id := range ids {
+		t, err := billing.GetBillTask(*pgConfig, id)
+		if err != nil {
+			return nil, nil, fmt.Errorf("任务 %d 不存在（可能已被删除）", id)
+		}
+		tasks = append(tasks, t)
+	}
+
+	list, err := billing.ListCustomers(*pgConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	byID := make(map[int64]billing.Customer, len(list))
+	for _, c := range list {
+		byID[c.ID] = c
+	}
+	return tasks, byID, nil
+}
+
+// handleValidateBillTasks 批量执行前的整体预检。
+//
+// 一次把问题列全再让用户决定：批量执行是同步的，跑到第 4 条才报错，
+// 前 3 条已经真地导了日志、出了账。
+func handleValidateBillTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	var in struct {
+		TaskIDs []int64 `json:"taskIds"`
+	}
+	if !decodeJSONBody(w, r, &in) {
+		return
+	}
+	if len(in.TaskIDs) == 0 {
+		httpError(w, http.StatusBadRequest, "请先勾选要执行的任务")
+		return
+	}
+
+	tasks, customers, err := loadTasksAndCustomers(in.TaskIDs)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	// 渠道倍率只影响「勾了成本利润表」的计划，读不到时按空表处理即可——
+	// 读失败不该让整个预检挂掉，那会变成「因为读不到倍率所以什么都不让跑」。
+	ratios, err := billing.ChannelRatioMap(*pgConfig)
+	if err != nil {
+		log.Printf("警告: 预检时读取渠道倍率失败，成本相关检查将按「未维护」处理: %v", err)
+		ratios = map[int]float64{}
+	}
+
+	validations := billing.ValidateTasksForRun(tasks, customers, ratios)
+	blocked := 0
+	for _, v := range validations {
+		if !v.OK() {
+			blocked++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"validations": validations,
+		"runnable":    len(validations) - blocked,
+		"blocked":     blocked,
+	})
+}
+
+// handleRunBillTasks 批量执行：一次请求顺序跑完所有勾选的任务。
+//
+// 同步执行（可能几分钟），不引入任务队列：出账结果是用户马上要下载的东西，
+// 排到后台再回来找反而更麻烦。
+//
+// **单个任务失败不影响其他任务**：逐条跑，失败的把原因记进该条结果，
+// 已成功的那几条照常落库。这也是「失败不落库」约定的延伸——
+// 失败的那条保持原样，不会把上次的好数字冲掉。
+func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -650,105 +845,160 @@ func handleRunBillTask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var in struct {
-		CustomerID        int64 `json:"customerId"`
-		Year              int   `json:"year"`
-		Month             int   `json:"month"`
-		GenerateSanitized bool  `json:"generateSanitized"`
-		GenerateCost      bool  `json:"generateCost"`
+		TaskIDs []int64 `json:"taskIds"`
 	}
 	if !decodeJSONBody(w, r, &in) {
 		return
 	}
-	if in.CustomerID <= 0 {
-		httpError(w, http.StatusBadRequest, "请选择客户")
-		return
-	}
-	if in.Year == 0 || in.Month == 0 {
-		httpError(w, http.StatusBadRequest, "请选择账期月份")
+	if len(in.TaskIDs) == 0 {
+		httpError(w, http.StatusBadRequest, "请先勾选要执行的任务")
 		return
 	}
 
+	results := make([]map[string]interface{}, 0, len(in.TaskIDs))
+	okCount, failCount := 0, 0
+
+	for _, id := range in.TaskIDs {
+		one := map[string]interface{}{"taskId": id}
+
+		task, err := billing.GetBillTask(*pgConfig, id)
+		if err != nil {
+			one["ok"] = false
+			one["error"] = fmt.Sprintf("任务 %d 不存在（可能已被删除）", id)
+			results = append(results, one)
+			failCount++
+			continue
+		}
+		one["taskName"] = task.DisplayName()
+
+		res, err := runOneBillTask(id)
+		if err != nil {
+			one["ok"] = false
+			one["error"] = err.Error()
+			results = append(results, one)
+			failCount++
+			continue
+		}
+
+		one["ok"] = true
+		one["jobId"] = res.jobID
+		one["task"] = res.task
+		one["billFileName"] = res.billFileName
+		one["billUrl"] = "/api/download/" + res.jobID + "/bill"
+		one["logPath"] = res.logPath
+		one["logRowCount"] = res.logRowCount
+		one["summary"] = res.summary
+		one["summaryPersisted"] = res.persistErr == nil
+		if res.sanitizedFileName != "" {
+			one["sanitizedFileName"] = res.sanitizedFileName
+			one["sanitizedUrl"] = "/api/download/" + res.jobID + "/sanitized"
+		}
+		if res.costFileName != "" {
+			one["costFileName"] = res.costFileName
+			one["costUrl"] = "/api/download/" + res.jobID + "/cost"
+			one["costSummary"] = res.costSummary
+		}
+		if res.costBlocked {
+			one["costBlocked"] = true
+			one["missingChannels"] = res.missingChannels
+		}
+		if len(res.unknownChannelIDs) > 0 {
+			one["unknownChannelIds"] = res.unknownChannelIDs
+		}
+		results = append(results, one)
+		okCount++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results":   results,
+		"okCount":   okCount,
+		"failCount": failCount,
+	})
+}
+
+// taskRunOutcome 单条任务的执行产出，供批量循环拼响应。
+type taskRunOutcome struct {
+	jobID             string
+	task              billing.BillTask
+	billFileName      string
+	sanitizedFileName string
+	costFileName      string
+	costSummary       string
+	logPath           string
+	logRowCount       int64
+	summary           billing.Summary
+	costBlocked       bool
+	missingChannels   []billing.ChannelInfo
+	unknownChannelIDs []int
+	persistErr        error
+}
+
+// runOneBillTask 跑一条计划：出账 → 登记下载 → 落库。
+//
+// 失败时清掉 job 目录并返回 error，**不落库**（上一次的结果保持原样）。
+func runOneBillTask(taskID int64) (*taskRunOutcome, error) {
 	jobID := newJobID()
 	jobPath := filepath.Join(jobDir, jobID)
 	if err := os.MkdirAll(jobPath, 0o755); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
+		return nil, err
 	}
 
 	result, err := billing.RunBillExportTask(billing.TaskRunDeps{
-		DB:                *dbConfig,
-		PG:                *pgConfig,
-		DataDir:           dataDir,
-		JobDir:            jobPath,
-		TemplatePath:      filepath.Join(dataDir, "bill_template.xlsx"),
-		PriceTablePath:    filepath.Join(dataDir, "price_table.xlsx"),
-		DBPriceCachePath:  dbPriceCachePath(),
-		CustomerID:        in.CustomerID,
-		Year:              in.Year,
-		Month:             in.Month,
-		GenerateCost:      in.GenerateCost,
-		GenerateSanitized: in.GenerateSanitized,
+		DB:               *dbConfig,
+		PG:               *pgConfig,
+		DataDir:          dataDir,
+		JobDir:           jobPath,
+		TemplatePath:     filepath.Join(dataDir, "bill_template.xlsx"),
+		PriceTablePath:   filepath.Join(dataDir, "price_table.xlsx"),
+		DBPriceCachePath: dbPriceCachePath(),
+		TaskID:           taskID,
 	})
 	if err != nil {
-		// 失败就把刚建的 job 目录清掉，不留空目录。
-		// 注意这时**不落库**——任务是按 (客户,账期) 覆盖写的，
-		// 失败也写会把上次的好数字冲掉。
 		_ = os.RemoveAll(jobPath)
-		httpError(w, http.StatusUnprocessableEntity, err.Error())
-		return
+		return nil, err
 	}
 
 	// 登记下载。产物在 jobDir 里，6 小时后由 cleanupOldJobs 连同记录一起清掉——
 	// 这正是「没下载就要重新执行」的语义。
-	rec := jobRecord{
+	jobsMu.Lock()
+	jobs[jobID] = jobRecord{
 		billPath:      result.BillPath,
 		sanitizedPath: result.SanitizedPath,
 		costPath:      result.CostPath,
 		createdAt:     time.Now(),
 	}
-	jobsMu.Lock()
-	jobs[jobID] = rec
 	jobsMu.Unlock()
 
-	// 落库：同一客户同一账期覆盖更新。
+	// 落库：只更新结果列，计划字段保持用户设置的样子。
 	task := result.Task
 	task.JobID = jobID
-	persistErr := billing.UpsertBillTask(*pgConfig, task)
+	persistErr := billing.SaveBillTaskResult(*pgConfig, task)
 	if persistErr != nil {
-		// 产物已经生成好了，落库失败不该让用户白跑一趟：把文件链接照常返回，
-		// 只提示统计没记上。
-		log.Printf("警告: 账单任务落库失败（产物已生成）: %v", persistErr)
+		// 产物已经生成好了，落库失败不该让用户白跑一趟：
+		// 文件链接照常返回，只提示统计没记上。
+		log.Printf("警告: 账单任务 %d 落库失败（产物已生成）: %v", taskID, persistErr)
 	}
 
-	resp := map[string]interface{}{
-		"jobId":            jobID,
-		"task":             task,
-		"billFileName":     filepath.Base(result.BillPath),
-		"billUrl":          "/api/download/" + jobID + "/bill",
-		"logPath":          result.LogPath,
-		"logRowCount":      result.LogRowCount,
-		"summary":          result.Summary,
-		"summaryPersisted": persistErr == nil,
+	out := &taskRunOutcome{
+		jobID:             jobID,
+		task:              task,
+		billFileName:      filepath.Base(result.BillPath),
+		costSummary:       result.CostSummary,
+		logPath:           result.LogPath,
+		logRowCount:       result.LogRowCount,
+		summary:           result.Summary,
+		costBlocked:       result.CostBlocked,
+		missingChannels:   result.MissingChannelInfos,
+		unknownChannelIDs: result.UnknownChannelIDs,
+		persistErr:        persistErr,
 	}
 	if result.SanitizedPath != "" {
-		resp["sanitizedFileName"] = filepath.Base(result.SanitizedPath)
-		resp["sanitizedUrl"] = "/api/download/" + jobID + "/sanitized"
+		out.sanitizedFileName = filepath.Base(result.SanitizedPath)
 	}
 	if result.CostPath != "" {
-		resp["costFileName"] = filepath.Base(result.CostPath)
-		resp["costUrl"] = "/api/download/" + jobID + "/cost"
-		resp["costSummary"] = result.CostSummary
+		out.costFileName = filepath.Base(result.CostPath)
 	}
-	// 成本利润表被拦下不是错误：账单已生成，只是有渠道没维护倍率。
-	// 这种情况任务仍然落库，但成本字段为空，页面要显示「缺成本」。
-	if result.CostBlocked {
-		resp["costBlocked"] = true
-		resp["missingChannels"] = result.MissingChannelInfos
-	}
-	if len(result.UnknownChannelIDs) > 0 {
-		resp["unknownChannelIds"] = result.UnknownChannelIDs
-	}
-	writeJSON(w, http.StatusOK, resp)
+	return out, nil
 }
 
 // handleDeleteBillTask 删除一条任务记录。**只删记录，不删文件**：

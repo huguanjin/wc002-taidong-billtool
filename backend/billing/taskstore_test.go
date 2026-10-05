@@ -3,6 +3,7 @@ package billing
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -10,10 +11,16 @@ import (
 
 func fptr(v float64) *float64 { return &v }
 
+// runAt 造一个「已执行过」的计划所需的时间戳。
+func runAt() *time.Time {
+	t := time.Date(2026, 9, 15, 10, 0, 0, 0, cstLocation)
+	return &t
+}
+
 // TestSummarizeTasksProfitUsesCostedSettle 汇总口径的核心：利润必须用
 // **参与成本核算的结算额**（costed_settle）减去成本，不能用全部结算额（settle）。
 //
-// 构造一个刻意让两者不等的场景：一个任务里，部分渠道没维护倍率，于是
+// 构造一个刻意让两者不等的场景：部分渠道没维护倍率，于是
 //
 //	settle_cny        = 10000（客户要付的全部）
 //	costed_settle_cny =  6000（成本能对应上的那部分）
@@ -24,9 +31,10 @@ func fptr(v float64) *float64 { return &v }
 func TestSummarizeTasksProfitUsesCostedSettle(t *testing.T) {
 	tasks := []BillTask{{
 		CustomerName: "某客户", PeriodYear: 2026, PeriodMonth: 9,
-		SettleCNY: 10000, CostedSettleCNY: fptr(6000), CostCNY: fptr(4000),
+		SettleCNY: fptr(10000), CostedSettleCNY: fptr(6000), CostCNY: fptr(4000),
 		ProfitCNY: fptr(2000), CostComplete: false,
 		PricedRows: 8, TotalCostRows: 12,
+		LastRunAt: runAt(),
 	}}
 
 	sums := SummarizeTasks(tasks)
@@ -52,19 +60,54 @@ func TestSummarizeTasksProfitUsesCostedSettle(t *testing.T) {
 		"毛利率分母若用全部结算额会得到 %.2f，与正确值明显不同", wrongMargin)
 }
 
-// TestSummarizeTasksSkipsTasksWithoutCost 没有成本的任务（未勾选成本表、
-// 或渠道倍率被拦）**一个数都不该进成本链路**。
+// TestSummarizeTasksSkipsUnrunPlans 回归：**还没执行过的计划不计入汇总**。
+//
+// 计划可以「先建好、之后批量执行」，所以列表里必然存在一堆没跑过的。
+// 它们没有金额，计进 TaskCount 会让「这个月导了几张账单」虚高，
+// 而且呈现成「3 张账单、金额 0」这种自相矛盾的行。
+func TestSummarizeTasksSkipsUnrunPlans(t *testing.T) {
+	tasks := []BillTask{
+		{
+			Name: "9月整月", CustomerName: "甲", PeriodYear: 2026, PeriodMonth: 9,
+			SettleCNY: fptr(1000), CostedSettleCNY: fptr(1000), CostCNY: fptr(400),
+			ProfitCNY: fptr(600), CostComplete: true, LastRunAt: runAt(),
+		},
+		{
+			// 同一账期的另一个计划，还没跑：时段设了，但没有任何金额。
+			Name: "9月第1周", CustomerName: "甲", PeriodYear: 2026, PeriodMonth: 9,
+			// 三个成本字段与结算额都是 nil
+		},
+	}
+
+	sums := SummarizeTasks(tasks)
+	require.Len(t, sums, 1)
+	s := sums[0]
+
+	assert.Equal(t, 1, s.TaskCount, "只数已执行的")
+	assert.Equal(t, 1000.0, s.SettleCNY)
+	assert.Equal(t, 400.0, s.CostCNY)
+	assert.Equal(t, 600.0, s.ProfitCNY)
+	assert.Equal(t, 1, s.UnrunCount, "未执行的单独计数")
+	assert.Equal(t, 0, s.MissingCostCount,
+		"未执行 ≠ 缺成本：前者根本没跑，后者跑了但没算出成本")
+
+	// 反证：若把未执行的也算进 TaskCount，这里会是 2。
+	assert.NotEqual(t, 2, s.TaskCount)
+}
+
+// TestSummarizeTasksSkipsTasksWithoutCost 执行过但没有成本口径的计划
+// （未勾选成本表、或渠道倍率被拦）**一个数都不该进成本链路**。
 func TestSummarizeTasksSkipsTasksWithoutCost(t *testing.T) {
 	tasks := []BillTask{
 		{
 			CustomerName: "甲", PeriodYear: 2026, PeriodMonth: 9,
-			SettleCNY: 1000, CostedSettleCNY: fptr(1000), CostCNY: fptr(400),
-			ProfitCNY: fptr(600), CostComplete: true, PricedRows: 5, TotalCostRows: 5,
+			SettleCNY: fptr(1000), CostedSettleCNY: fptr(1000), CostCNY: fptr(400),
+			ProfitCNY: fptr(600), CostComplete: true, LastRunAt: runAt(),
 		},
 		{
-			// 未勾选生成成本利润表：三个成本字段都是 nil，只有结算额。
+			// 执行过、只有结算额，没有成本三件套。
 			CustomerName: "乙", PeriodYear: 2026, PeriodMonth: 9,
-			SettleCNY: 8000,
+			SettleCNY: fptr(8000), LastRunAt: runAt(),
 		},
 	}
 
@@ -74,12 +117,13 @@ func TestSummarizeTasksSkipsTasksWithoutCost(t *testing.T) {
 
 	assert.Equal(t, 2, s.TaskCount)
 	assert.Equal(t, 9000.0, s.SettleCNY, "两个任务的结算额都要计入对外口径")
-	assert.Equal(t, 400.0, s.CostCNY, "只有有成本的那个任务贡献成本")
+	assert.Equal(t, 400.0, s.CostCNY, "只有有成本的那个贡献成本")
 	assert.Equal(t, 1000.0, s.CostedSettleCNY, "同口径结算额只含那一个任务")
 	assert.Equal(t, 600.0, s.ProfitCNY)
 
 	assert.Equal(t, 1, s.MissingCostCount, "缺成本的任务数要报出来")
 	assert.Equal(t, 0, s.PartialCostCount, "它不算 partial——它压根没成本")
+	assert.Equal(t, 0, s.UnrunCount)
 
 	// 关键反证：若把 8000 也算进利润链路，利润会变成 8600。
 	assert.NotEqual(t, 8600.0, s.ProfitCNY, "无成本任务的结算额不能进利润计算")
@@ -90,8 +134,8 @@ func TestSummarizeTasksSkipsTasksWithoutCost(t *testing.T) {
 func TestSummarizeTasksZeroCostTask(t *testing.T) {
 	tasks := []BillTask{{
 		CustomerName: "免费渠道客户", PeriodYear: 2026, PeriodMonth: 9,
-		SettleCNY: 500, CostedSettleCNY: fptr(500), CostCNY: fptr(0),
-		ProfitCNY: fptr(500), CostComplete: true, PricedRows: 3, TotalCostRows: 3,
+		SettleCNY: fptr(500), CostedSettleCNY: fptr(500), CostCNY: fptr(0),
+		ProfitCNY: fptr(500), CostComplete: true, LastRunAt: runAt(),
 	}}
 
 	s := SummarizeTasks(tasks)[0]
@@ -102,15 +146,20 @@ func TestSummarizeTasksZeroCostTask(t *testing.T) {
 }
 
 // TestSummarizeTasksGroupsByPeriod 按 (年,月) 分组，不同账期不能混在一起；
-// 结果按账期倒序（最新在前），与任务列表的排序一致。
+// 结果按账期倒序（最新在前），与计划列表的排序一致。
 func TestSummarizeTasksGroupsByPeriod(t *testing.T) {
+	mk := func(name string, y, m int, settle, cost float64) BillTask {
+		profit := settle - cost
+		return BillTask{
+			CustomerName: name, PeriodYear: y, PeriodMonth: m,
+			SettleCNY: fptr(settle), CostedSettleCNY: fptr(settle), CostCNY: fptr(cost),
+			ProfitCNY: fptr(profit), CostComplete: true, LastRunAt: runAt(),
+		}
+	}
 	tasks := []BillTask{
-		{CustomerName: "甲", PeriodYear: 2026, PeriodMonth: 8, SettleCNY: 100,
-			CostedSettleCNY: fptr(100), CostCNY: fptr(50), ProfitCNY: fptr(50), CostComplete: true},
-		{CustomerName: "乙", PeriodYear: 2026, PeriodMonth: 9, SettleCNY: 200,
-			CostedSettleCNY: fptr(200), CostCNY: fptr(100), ProfitCNY: fptr(100), CostComplete: true},
-		{CustomerName: "丙", PeriodYear: 2025, PeriodMonth: 12, SettleCNY: 300,
-			CostedSettleCNY: fptr(300), CostCNY: fptr(150), ProfitCNY: fptr(150), CostComplete: true},
+		mk("甲", 2026, 8, 100, 50),
+		mk("乙", 2026, 9, 200, 100),
+		mk("丙", 2025, 12, 300, 150),
 	}
 
 	sums := SummarizeTasks(tasks)
@@ -140,6 +189,13 @@ func TestSummarizeTasksEmpty(t *testing.T) {
 
 	sums = SummarizeTasks([]BillTask{})
 	assert.Empty(t, sums)
+
+	// 只有未执行计划时：汇总行存在但不含任何金额。
+	sums = SummarizeTasks([]BillTask{{PeriodYear: 2026, PeriodMonth: 9}})
+	require.Len(t, sums, 1)
+	assert.Equal(t, 0, sums[0].TaskCount)
+	assert.Equal(t, 1, sums[0].UnrunCount)
+	assert.Equal(t, 0.0, sums[0].SettleCNY)
 }
 
 // TestSummarizeTasksNoDivisionByZero 结算额为 0 时毛利率不该出现 NaN/Inf
@@ -147,10 +203,26 @@ func TestSummarizeTasksEmpty(t *testing.T) {
 func TestSummarizeTasksNoDivisionByZero(t *testing.T) {
 	tasks := []BillTask{{
 		CustomerName: "零消费", PeriodYear: 2026, PeriodMonth: 9,
-		SettleCNY: 0, CostedSettleCNY: fptr(0), CostCNY: fptr(0),
-		ProfitCNY: fptr(0), CostComplete: true,
+		SettleCNY: fptr(0), CostedSettleCNY: fptr(0), CostCNY: fptr(0),
+		ProfitCNY: fptr(0), CostComplete: true, LastRunAt: runAt(),
 	}}
 	s := SummarizeTasks(tasks)[0]
 	assert.Equal(t, 0.0, s.Margin)
 	assert.False(t, s.Margin != s.Margin, "毛利率不能是 NaN")
+}
+
+// TestBillTaskDisplayName 计划没起名时用「客户 + 时段」兜底，
+// 让列表里每条都读得懂，而不是一排空白。
+func TestBillTaskDisplayName(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, cstLocation)
+	end := time.Date(2026, 9, 7, 23, 59, 59, 0, cstLocation)
+
+	withName := BillTask{Name: "9月第1周", CustomerName: "示例科技", StartTime: &start, EndTime: &end}
+	assert.Equal(t, "9月第1周", withName.DisplayName())
+
+	noName := BillTask{CustomerName: "示例科技", StartTime: &start, EndTime: &end}
+	assert.Equal(t, "示例科技 09-01~09-07", noName.DisplayName())
+
+	noBoth := BillTask{CustomerName: "示例科技"}
+	assert.Equal(t, "示例科技", noBoth.DisplayName(), "连时段都没有时至少给出客户名")
 }

@@ -1,11 +1,11 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 
-// 账单导出任务：选客户 + 账期，一键导出账单 / 脱敏日志 / 成本利润表，并把数字沉淀下来。
+// 账单导出任务：**可维护的计划** + 选择性批量执行。
 //
-// 产物本身仍是一次性的（落在 jobDir，6 小时后自动清理），这里**只沉淀数字**：
-// 账期、结算额、成本、利润。这样「这个月导了几张账单、成本多少利润多少」
-// 不依赖任何文件是否还在磁盘上。
+// 与上一版的区别：任务不再是「填参数 → 立刻跑」的一次性动作，而是先建好计划
+// （客户 + 时段 + 勾选），再勾选执行。一个客户可以有多条计划——
+// 月度对账一条，按周导的每周一条——这也是唯一键从 (客户, 账期) 改成任务自身的原因。
 
 const emit = defineEmits(['unauthorized'])
 
@@ -16,17 +16,36 @@ const settings = ref(null)
 const jobRetentionHours = ref(6)
 
 const loading = ref(false)
+const savingPlan = ref(false)
+const validating = ref(false)
 const running = ref(false)
 const savingSettings = ref(false)
 const showSettings = ref(false)
+const showPlanForm = ref(false)
 const error = ref('')
 const message = ref('')
 
-// 执行表单
-const runForm = ref({ customerId: 0, period: '', generateSanitized: true, generateCost: true })
-// 上一次执行的结果（用于显示下载链接）
-const runResult = ref(null)
+// 计划表单。id 为 0 表示新建。
+const planForm = ref({
+  id: 0,
+  customerId: 0,
+  name: '',
+  startDate: '',
+  endDate: '',
+  generateSanitized: true,
+  generateCost: true,
+})
+
+// 勾选与批量执行结果
+const selectedTasks = ref([])
+const runResults = ref([])
+const validationResults = ref([])
+// runResults 里带下载链接的那几条，用于展示
+const runFailures = computed(() => runResults.value.filter((r) => !r.ok))
+const runSuccesses = computed(() => runResults.value.filter((r) => r.ok))
+
 const copyState = ref('')
+const copyRef = ref(null)
 
 const settingsDraft = ref({
   priceSource: 'db',
@@ -37,11 +56,20 @@ const settingsDraft = ref({
 })
 
 const hasCustomers = computed(() => customers.value.length > 0)
+const isEditingPlan = computed(() => planForm.value.id > 0)
 
-// 汇总里有没有「缺成本」的任务——决定要不要显示解释性提示。
+const allSelected = computed(
+  () => tasks.value.length > 0 && selectedTasks.value.length === tasks.value.length
+)
+
+// 有勾选但还没执行过的计划数——用它提示「先执行再下载」。
+const selectedCount = computed(() => selectedTasks.value.length)
+
 const hasMissingCost = computed(() =>
   summaries.value.some((s) => (s.missingCostCount || 0) > 0 || (s.partialCostCount || 0) > 0)
 )
+
+const hasUnrun = computed(() => summaries.value.some((s) => (s.unrunCount || 0) > 0))
 
 async function loadAll() {
   error.value = ''
@@ -76,11 +104,9 @@ async function loadTasks() {
   summaries.value = data.summaries || []
   if (data.jobRetentionHours) jobRetentionHours.value = data.jobRetentionHours
 
-  // 首次进入时用后端给的「上月」做默认账期，避免前端自己算时区算错
-  // （服务器在 UTC、浏览器在东八区，两边各算一次必然有一边是错的）。
-  if (!runForm.value.period && data.defaultYear && data.defaultMonth) {
-    runForm.value.period = `${data.defaultYear}-${String(data.defaultMonth).padStart(2, '0')}`
-  }
+  // 列表刷新后丢掉已经不存在的勾选项，避免执行到已删除的计划。
+  const present = new Set(tasks.value.map((t) => t.id))
+  selectedTasks.value = selectedTasks.value.filter((id) => present.has(id))
 }
 
 async function loadSettings() {
@@ -146,35 +172,190 @@ async function saveSettings() {
   }
 }
 
-async function runTask() {
+// ---- 计划表单 ----
+
+// 快捷预设：只帮用户少敲几个日期，与账期解析无关（那在服务端按 +08:00 做）。
+function applyPreset(kind) {
+  const today = new Date()
+  const fmt = (d) => {
+    const p = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+  }
+  if (kind === 'lastMonth') {
+    const first = new Date(today.getFullYear(), today.getMonth() - 1, 1)
+    const last = new Date(today.getFullYear(), today.getMonth(), 0)
+    planForm.value.startDate = fmt(first)
+    planForm.value.endDate = fmt(last)
+  } else if (kind === 'lastWeek') {
+    // 上一整周（周一~周日）。getDay() 的 0 是周日，换算成 ISO 的周一为起点。
+    const dow = (today.getDay() + 6) % 7
+    const thisMonday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - dow)
+    const lastMonday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 7)
+    const lastSunday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 1)
+    planForm.value.startDate = fmt(lastMonday)
+    planForm.value.endDate = fmt(lastSunday)
+  } else if (kind === 'monthToDate') {
+    planForm.value.startDate = fmt(new Date(today.getFullYear(), today.getMonth(), 1))
+    planForm.value.endDate = fmt(today)
+  }
+}
+
+function resetPlanForm() {
+  planForm.value = {
+    id: 0,
+    customerId: planForm.value.customerId || 0,
+    name: '',
+    startDate: '',
+    endDate: '',
+    generateSanitized: planForm.value.generateSanitized,
+    generateCost: planForm.value.generateCost,
+  }
+}
+
+function startEditPlan(t) {
   error.value = ''
   message.value = ''
-  runResult.value = null
-  copyState.value = ''
+  showPlanForm.value = true
+  planForm.value = {
+    id: t.id,
+    customerId: t.customerId,
+    name: t.name || '',
+    startDate: t.startTime ? t.startTime.slice(0, 10) : '',
+    endDate: t.endTime ? t.endTime.slice(0, 10) : '',
+    generateSanitized: !!t.generateSanitized,
+    generateCost: !!t.generateCost,
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' })
+}
 
-  if (!runForm.value.customerId) {
+async function savePlan() {
+  error.value = ''
+  message.value = ''
+  if (!planForm.value.customerId) {
     error.value = '请选择客户'
     return
   }
-  const period = String(runForm.value.period || '').trim()
-  if (!/^\d{4}-\d{2}$/.test(period)) {
-    error.value = '请选择账期月份'
+  const hasStart = String(planForm.value.startDate || '').trim() !== ''
+  const hasEnd = String(planForm.value.endDate || '').trim() !== ''
+  if (hasStart !== hasEnd) {
+    error.value = '开始日期与结束日期必须同时填写'
     return
   }
-  const [y, m] = period.split('-').map((v) => Number(v))
 
-  running.value = true
+  savingPlan.value = true
   try {
-    const resp = await fetch('/api/run-bill-task', {
+    const resp = await fetch('/api/save-bill-task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        customerId: runForm.value.customerId,
-        year: y,
-        month: m,
-        generateSanitized: runForm.value.generateSanitized,
-        generateCost: runForm.value.generateCost,
+        id: planForm.value.id || 0,
+        customerId: planForm.value.customerId,
+        name: planForm.value.name,
+        startDate: planForm.value.startDate,
+        endDate: planForm.value.endDate,
+        generateSanitized: planForm.value.generateSanitized,
+        generateCost: planForm.value.generateCost,
       }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      error.value = data.error || `保存失败（${resp.status}）`
+      return
+    }
+    message.value = isEditingPlan.value ? '计划已更新' : '计划已新增'
+    resetPlanForm()
+    showPlanForm.value = false
+    await loadTasks()
+  } catch (err) {
+    error.value = '保存失败：' + err.message
+  } finally {
+    savingPlan.value = false
+  }
+}
+
+async function deletePlan(t) {
+  error.value = ''
+  message.value = ''
+  const ran = t.lastRunAt
+    ? `\n该计划已执行过 ${t.runCount || 1} 次，删除会同时丢掉它的结算额/成本/利润统计（不影响已下载的文件）。`
+    : ''
+  if (!window.confirm(`确定删除计划「${t.name || t.customerName}」？${ran}`)) return
+  try {
+    const resp = await fetch('/api/delete-bill-task', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: t.id }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      error.value = data.error || `删除失败（${resp.status}）`
+      return
+    }
+    message.value = '计划已删除'
+    await loadTasks()
+  } catch (err) {
+    error.value = '删除失败：' + err.message
+  }
+}
+
+// ---- 勾选与执行 ----
+
+function toggleAll(checked) {
+  selectedTasks.value = checked ? tasks.value.map((t) => t.id) : []
+}
+
+async function validateSelected() {
+  error.value = ''
+  message.value = ''
+  validationResults.value = []
+  if (selectedTasks.value.length === 0) {
+    error.value = '请先勾选要执行的任务'
+    return false
+  }
+
+  validating.value = true
+  try {
+    const resp = await fetch('/api/validate-bill-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskIds: selectedTasks.value }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      error.value = data.error || `校验失败（${resp.status}）`
+      return false
+    }
+    validationResults.value = data.validations || []
+    if (data.blocked > 0) {
+      // 有问题的先摆出来让用户改，不往下跑——批量执行是同步的，
+      // 跑到一半才报错，前面几条已经真地导了日志、出了账。
+      message.value = `有 ${data.blocked} 条计划暂时不能执行，请按下面的原因修改后再执行。`
+      return false
+    }
+    return true
+  } catch (err) {
+    error.value = '校验失败：' + err.message
+    return false
+  } finally {
+    validating.value = false
+  }
+}
+
+async function runSelected() {
+  if (!(await validateSelected())) return
+
+  error.value = ''
+  runResults.value = []
+  const ids = [...selectedTasks.value]
+  running.value = true
+  try {
+    const resp = await fetch('/api/run-bill-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskIds: ids }),
     })
     const data = await resp.json()
     if (!resp.ok) {
@@ -182,10 +363,10 @@ async function runTask() {
       error.value = data.error || `执行失败（${resp.status}）`
       return
     }
-    runResult.value = data
-    message.value = data.summaryPersisted === false
-      ? '任务已执行、文件已生成，但统计数字未能写入数据库，请检查 PostgreSQL'
-      : '任务执行完成，账单已生成'
+    runResults.value = data.results || []
+    message.value = data.failCount > 0
+      ? `执行完成：成功 ${data.okCount} 条，失败 ${data.failCount} 条`
+      : `执行完成：${data.okCount} 条全部成功`
     await loadTasks()
   } catch (err) {
     error.value = '执行失败：' + err.message
@@ -194,43 +375,48 @@ async function runTask() {
   }
 }
 
-// 重跑：把明细行里的客户和账期填回执行表单，再点一次一键执行即可。
-// 不做自动执行——产出文件需要用户明确动作，不该点一下就默默跑几十秒。
-function refillRun(row) {
-  runForm.value.customerId = row.customerId
-  runForm.value.period = `${row.periodYear}-${String(row.periodMonth).padStart(2, '0')}`
-  message.value = '已填入该任务参数，点「一键开始任务」重新生成文件'
-  runResult.value = null
-  window.scrollTo({ top: 0, behavior: 'smooth' })
+// 单条执行：复用批量接口，只传一个 id。少一套代码路径，行为必然一致。
+async function runOne(t) {
+  selectedTasks.value = [t.id]
+  await runSelected()
 }
 
-async function deleteTask(row) {
+async function deleteSelected() {
+  const ids = [...selectedTasks.value]
+  if (ids.length === 0) return
+  if (!window.confirm(`确定删除选中的 ${ids.length} 条计划？\n（只删统计记录，不影响已下载的文件）`)) return
   error.value = ''
   message.value = ''
-  if (!window.confirm(`确定删除「${row.customerName} ${periodLabel(row)}」这条任务记录？\n（只删统计记录，不影响已生成的文件）`)) return
+  const failed = []
+  let okCount = 0
   try {
-    const resp = await fetch('/api/delete-bill-task', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: row.id }),
-    })
-    const data = await resp.json()
-    if (!resp.ok) {
-      if (resp.status === 401) emit('unauthorized')
-      error.value = data.error || `删除失败（${resp.status}）`
-      return
+    for (const id of ids) {
+      const resp = await fetch('/api/delete-bill-task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      })
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({}))
+        if (resp.status === 401) emit('unauthorized')
+        failed.push(`${id}：${data.error || resp.status}`)
+        continue
+      }
+      okCount++
     }
-    message.value = '任务记录已删除'
-    await loadTasks()
   } catch (err) {
-    error.value = '删除失败：' + err.message
+    failed.push('请求失败：' + err.message)
   }
+  if (failed.length > 0) {
+    error.value = `删除完成 ${okCount} 条，失败 ${failed.length} 条：${failed.join('；')}`
+  } else {
+    message.value = `已删除 ${okCount} 条计划`
+  }
+  selectedTasks.value = []
+  await loadTasks()
 }
 
-const copyRef = ref(null)
-
-async function copyCostSummary() {
-  const text = runResult.value && runResult.value.costSummary
+async function copyText(text) {
   if (!text) return
   try {
     if (navigator.clipboard && window.isSecureContext) {
@@ -240,7 +426,7 @@ async function copyCostSummary() {
       return
     }
   } catch (err) {
-    // 落到下面的手动选中路径
+    // 落到手动选中
   }
   // http 部署下剪贴板 API 不可用（只在安全上下文存在），退化为选中文本。
   const el = copyRef.value
@@ -254,8 +440,35 @@ async function copyCostSummary() {
   copyState.value = 'fail'
 }
 
-function periodLabel(row) {
-  return `${row.periodYear}-${String(row.periodMonth).padStart(2, '0')}`
+// ---- 展示辅助 ----
+
+function accountCount(c) {
+  return String(c.usernames || '')
+    .split(/[\n\r,，;；\t ]+/)
+    .filter(Boolean).length
+}
+
+function periodLabel(t) {
+  if (!t.periodYear || !t.periodMonth) return '-'
+  return `${t.periodYear}-${String(t.periodMonth).padStart(2, '0')}`
+}
+
+function rangeLabel(t) {
+  if (!t.startTime || !t.endTime) return '未设置时段'
+  return `${t.startTime.slice(0, 10)} ~ ${t.endTime.slice(0, 10)}`
+}
+
+// 三态：未执行 / 已执行未核算成本 / 已执行有成本。
+// 前两者金额列都是空，含义完全不同，必须分开显示。
+function taskState(t) {
+  if (!t.lastRunAt) return 'unrun'
+  if (t.costCny === null || t.costCny === undefined) return 'nocost'
+  return 'done'
+}
+
+function qualityNote(t) {
+  if (taskState(t) !== 'done') return ''
+  return t.costComplete ? '' : '成本不全'
 }
 
 function fmtMoney(v) {
@@ -282,12 +495,13 @@ defineExpose({ loadAll })
   <div class="card">
     <h2>账单导出任务</h2>
     <p class="hint">
-      选客户 + 账期，一键导出该客户的账单、脱敏日志与成本利润表，
-      同时把账期、结算额、成本、利润记录到本地数据库，供下方按月汇总。
+      先建好计划（客户 + 时段 + 导出内容），再勾选执行。一个客户可以建多条计划——
+      月度对账一条、按周导的每周一条。
     </p>
     <p class="hint">
-      生成的文件只保留 {{ jobRetentionHours }} 小时，过期后自动清理——
-      没来得及下载就点该行的「重新执行」，数字记录不受影响。
+      执行时会自动按客户账号从业务库导出该时段的日志，产出账单 / 脱敏日志 / 成本利润表，
+      并把结算额、成本、利润记入下方汇总。生成的文件只保留 {{ jobRetentionHours }} 小时，
+      过期后点「执行」重跑即可，统计记录不受影响。
     </p>
 
     <!-- 默认出账参数 -->
@@ -297,7 +511,7 @@ defineExpose({ loadAll })
         {{ showSettings ? '收起' : '展开修改' }}
       </button>
       <span class="hint inline" v-if="settings">
-        当前：单价来源 {{ settings.priceSource }} ｜ 汇率 {{ settings.exchangeRate }} ｜
+        单价来源 {{ settings.priceSource }} ｜ 汇率 {{ settings.exchangeRate }} ｜
         折扣 {{ settings.discount === null || settings.discount === undefined ? '自动反推' : settings.discount }}
       </span>
     </div>
@@ -336,90 +550,198 @@ defineExpose({ loadAll })
       <button type="button" class="btn-primary" @click="saveSettings" :disabled="savingSettings">
         {{ savingSettings ? '保存中…' : '保存默认参数' }}
       </button>
-      <p class="hint">
-        单价来源选「数据库实时价格」前，需先在「生成账单」页点过「拉取最新数据库价格」。
-      </p>
+      <p class="hint">单价来源选「数据库实时价格」前，需先在「生成账单」页点过「拉取最新数据库价格」。</p>
     </div>
 
-    <!-- 执行任务 -->
-    <div class="run-box">
+    <!-- 新建/编辑计划 -->
+    <div class="section-head">
+      <strong>{{ isEditingPlan ? '编辑计划' : '新建计划' }}</strong>
+      <button type="button" class="btn-link" @click="showPlanForm = !showPlanForm">
+        {{ showPlanForm ? '收起' : '展开' }}
+      </button>
+      <button type="button" class="btn-link" v-if="isEditingPlan" @click="resetPlanForm(); showPlanForm = false">
+        取消编辑
+      </button>
+    </div>
+
+    <div v-if="showPlanForm" class="plan-box">
       <div class="form-grid">
         <label>
           <span>客户</span>
-          <select v-model.number="runForm.customerId">
+          <select v-model.number="planForm.customerId">
             <option :value="0" disabled>请选择客户</option>
             <option v-for="c in customers" :key="c.id" :value="c.id">
-              {{ c.name }}（{{ (c.usernames || '').split(/[\n\r,，;；\t ]+/).filter(Boolean).length }} 个账号）
+              {{ c.name }}（{{ accountCount(c) }} 个账号）
             </option>
           </select>
         </label>
         <label>
-          <span>账期月份</span>
-          <input v-model="runForm.period" type="month" />
+          <span>计划名称（可选）</span>
+          <input v-model="planForm.name" type="text" placeholder="例如：9月第1周" />
+        </label>
+        <label>
+          <span>开始日期</span>
+          <input v-model="planForm.startDate" type="date" />
+        </label>
+        <label>
+          <span>结束日期</span>
+          <input v-model="planForm.endDate" type="date" />
         </label>
       </div>
-      <div class="checkboxes">
-        <label><input v-model="runForm.generateSanitized" type="checkbox" /> 生成脱敏日志</label>
-        <label><input v-model="runForm.generateCost" type="checkbox" /> 生成成本利润表</label>
-      </div>
+
       <div class="path-row">
-        <button type="button" class="btn-primary" @click="runTask" :disabled="running">
-          {{ running ? '任务执行中…' : '一键开始任务' }}
-        </button>
-        <span class="hint inline" v-if="running">
-          正在导出日志并出账，日志量大时可能需要几十秒，请不要关闭页面。
-        </span>
+        <span class="hint inline">快捷：</span>
+        <button type="button" class="btn-browse" @click="applyPreset('lastMonth')">上月整月</button>
+        <button type="button" class="btn-browse" @click="applyPreset('lastWeek')">上周（周一~周日）</button>
+        <button type="button" class="btn-browse" @click="applyPreset('monthToDate')">本月至今</button>
       </div>
-      <p class="hint" v-if="!hasCustomers">
-        还没有客户，请先到「客户信息」页新增客户并填好业务库账号。
+
+      <div class="checkboxes">
+        <label><input v-model="planForm.generateSanitized" type="checkbox" /> 生成脱敏日志</label>
+        <label><input v-model="planForm.generateCost" type="checkbox" /> 生成成本利润表</label>
+      </div>
+
+      <div class="path-row">
+        <button type="button" class="btn-primary" @click="savePlan" :disabled="savingPlan">
+          {{ savingPlan ? '保存中…' : isEditingPlan ? '保存修改' : '新增计划' }}
+        </button>
+        <span class="hint inline">时段可留空先建计划，之后再补。单次跨度上限 92 天。</span>
+      </div>
+      <p class="hint">
+        归属账期按<strong>开始日期</strong>所在月计算，跨月计划（如 8/28~9/3）整个计入开始月。
       </p>
     </div>
 
     <p class="error" v-if="error">{{ error }}</p>
     <span class="hint" v-if="message">{{ message }}</span>
 
-    <!-- 执行结果 -->
-    <div v-if="runResult" class="run-result">
-      <div class="downloads">
-        <a class="btn" :href="runResult.billUrl">下载账单：{{ runResult.billFileName }}</a>
-        <a class="btn" v-if="runResult.sanitizedUrl" :href="runResult.sanitizedUrl">
-          下载脱敏日志：{{ runResult.sanitizedFileName }}
-        </a>
-        <a class="btn" v-if="runResult.costUrl" :href="runResult.costUrl">
-          下载成本利润表：{{ runResult.costFileName }}
-        </a>
-      </div>
+    <!-- 校验 / 执行结果 -->
+    <div v-if="validationResults.length > 0" class="result-box">
+      <strong>执行前校验</strong>
+      <ul class="result-list">
+        <li v-for="v in validationResults" :key="v.taskId" :class="{ bad: v.error }">
+          <span class="name">{{ v.taskName }}</span>
+          <span v-if="v.error" class="reason">{{ v.error }}</span>
+          <span v-else class="ok">可执行</span>
+        </li>
+      </ul>
+    </div>
+
+    <div v-if="runFailures.length > 0" class="result-box bad">
+      <strong>执行失败 {{ runFailures.length }} 条</strong>
+      <ul class="result-list">
+        <li v-for="r in runFailures" :key="r.taskId" class="bad">
+          <span class="name">{{ r.taskName || ('任务 ' + r.taskId) }}</span>
+          <span class="reason">{{ r.error }}</span>
+        </li>
+      </ul>
+      <p class="hint">失败的计划保持原样，不会覆盖上次的结果。修正后重新勾选执行即可。</p>
+    </div>
+
+    <div v-if="runSuccesses.length > 0" class="result-box ok">
+      <strong>执行成功 {{ runSuccesses.length }} 条</strong>
+      <ul class="result-list">
+        <li v-for="r in runSuccesses" :key="r.taskId">
+          <span class="name">{{ r.taskName || r.task?.name || ('任务 ' + r.taskId) }}</span>
+          <a class="btn small" :href="r.billUrl">下载账单</a>
+          <a class="btn small" v-if="r.sanitizedUrl" :href="r.sanitizedUrl">脱敏日志</a>
+          <a class="btn small" v-if="r.costUrl" :href="r.costUrl">成本利润表</a>
+          <span v-if="r.costBlocked" class="tag warn">成本表被拦下（渠道倍率未维护）</span>
+          <span v-if="r.summaryPersisted === false" class="tag warn">统计未落库</span>
+        </li>
+      </ul>
       <p class="hint">
-        以上文件只保留 {{ jobRetentionHours }} 小时，请及时下载。源日志：{{ runResult.logPath }}（{{
-          fmtNum(runResult.logRowCount)
-        }} 行）
+        文件只保留 {{ jobRetentionHours }} 小时，请及时下载。
       </p>
-
-      <div v-if="runResult.costBlocked" class="cost-blocked">
-        <p class="error">成本利润表未生成：有渠道还没维护上游倍率。账单已生成，补录后重新执行即可。</p>
-        <p v-if="runResult.missingChannels && runResult.missingChannels.length > 0">
-          <strong>待补录渠道</strong>：
-          <span v-for="c in runResult.missingChannels" :key="c.channelId">{{ c.name }}（{{ c.channelId }}）</span>
-        </p>
-        <p class="hint">本次任务的成本与利润会留空记录，补齐渠道倍率后重新执行即可补上。</p>
-      </div>
-
-      <div v-if="runResult.costSummary" class="cost-summary">
-        <div class="cost-summary-head">
-          <strong>成本利润摘要</strong>
-          <button type="button" class="btn-browse" @click="copyCostSummary">
-            {{ copyState === 'ok' ? '已复制 ✓' : copyState === 'fail' ? '复制失败，请手动选中' : '复制' }}
-          </button>
+      <div v-for="r in runSuccesses" :key="'sum-' + r.taskId">
+        <div v-if="r.costSummary" class="cost-summary">
+          <div class="cost-summary-head">
+            <strong>{{ r.taskName || ('任务 ' + r.taskId) }} 成本利润摘要</strong>
+            <button type="button" class="btn-browse" @click="copyText(r.costSummary)">
+              {{ copyState === 'ok' ? '已复制 ✓' : copyState === 'fail' ? '复制失败，请手动选中' : '复制' }}
+            </button>
+          </div>
+          <pre ref="copyRef" class="cost-summary-text">{{ r.costSummary }}</pre>
         </div>
-        <pre ref="copyRef" class="cost-summary-text">{{ runResult.costSummary }}</pre>
       </div>
     </div>
+  </div>
+
+  <!-- 计划列表 -->
+  <div class="card">
+    <h2>计划列表</h2>
+    <div class="path-row">
+      <button type="button" class="btn-browse" v-if="selectedCount > 0" @click="validateSelected" :disabled="validating">
+        {{ validating ? '校验中…' : `仅校验选中（${selectedCount}）` }}
+      </button>
+      <button type="button" class="btn-primary" v-if="selectedCount > 0" @click="runSelected" :disabled="running">
+        {{ running ? '执行中…' : `执行选中（${selectedCount}）` }}
+      </button>
+      <button type="button" class="btn-browse" v-if="selectedCount > 0" @click="deleteSelected">
+        {{ `删除选中（${selectedCount}）` }}
+      </button>
+      <span class="hint inline" v-if="running">
+        正在逐条导出日志并出账，日志量大时可能需要几分钟，请不要关闭页面。
+      </span>
+    </div>
+
+    <table v-if="tasks.length > 0">
+      <thead>
+        <tr>
+          <th class="pick">
+            <input type="checkbox" :checked="allSelected" @change="toggleAll($event.target.checked)" />
+          </th>
+          <th>计划</th>
+          <th>客户</th>
+          <th>时段</th>
+          <th>账期</th>
+          <th>状态</th>
+          <th>结算额(¥)</th>
+          <th>成本(¥)</th>
+          <th>利润(¥)</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="t in tasks" :key="t.id" :class="{ 'row-unrun': taskState(t) === 'unrun' }">
+          <td class="pick">
+            <input type="checkbox" v-model="selectedTasks" :value="t.id" />
+          </td>
+          <td class="name">{{ t.name || '（未命名）' }}</td>
+          <td>{{ t.customerName }}</td>
+          <td>{{ rangeLabel(t) }}</td>
+          <td>{{ periodLabel(t) }}</td>
+          <td>
+            <span v-if="taskState(t) === 'unrun'" class="tag">未执行</span>
+            <span v-else-if="taskState(t) === 'nocost'" class="tag warn">未核算成本</span>
+            <span v-else class="ok">已执行</span>
+            <span v-if="qualityNote(t)" class="tag warn">{{ qualityNote(t) }}</span>
+          </td>
+          <td>{{ fmtMoney(t.settleCny) }}</td>
+          <td>{{ fmtMoney(t.costCny) }}</td>
+          <td :class="{ negative: t.profitCny !== null && t.profitCny !== undefined && t.profitCny < 0 }">
+            {{ fmtMoney(t.profitCny) }}
+          </td>
+          <td class="ops">
+            <button type="button" class="btn-link" @click="runOne(t)" :disabled="running">执行</button>
+            <button type="button" class="btn-link" @click="startEditPlan(t)">编辑</button>
+            <button type="button" class="btn-link danger" @click="deletePlan(t)">删除</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <span class="hint" v-else-if="!loading">
+      还没有计划，先在上面新建一条。
+      <template v-if="!hasCustomers">（需要先到「客户信息」页新增客户并填好业务库账号）</template>
+    </span>
+    <span class="hint" v-else>正在读取计划…</span>
   </div>
 
   <!-- 按月汇总 -->
   <div class="card">
     <h2>按月汇总</h2>
     <p class="hint">
+      只统计<strong>已执行</strong>的计划，未执行的单独列在「未跑」里。
       利润用「参与成本核算的结算额」减去成本，<strong>不是</strong>用全部账单结算额减成本——
       渠道上游倍率没维护时，那些行既没有成本、也不该计入利润，否则利润会虚高。
     </p>
@@ -445,57 +767,28 @@ defineExpose({ loadAll })
           <td :class="{ negative: s.profitCny < 0 }">{{ fmtMoney(s.profitCny) }}</td>
           <td>{{ fmtNum(s.margin) }}%</td>
           <td class="note">
-            <span v-if="s.missingCostCount > 0" class="tag warn">{{ s.missingCostCount }} 个任务无成本</span>
-            <span v-if="s.partialCostCount > 0" class="tag warn">{{ s.partialCostCount }} 个任务成本不全</span>
-            <span v-if="s.missingCostCount === 0 && s.partialCostCount === 0" class="tag ok">成本完整</span>
+            <span v-if="s.missingCostCount > 0" class="tag warn">{{ s.missingCostCount }} 条无成本</span>
+            <span v-if="s.partialCostCount > 0" class="tag warn">{{ s.partialCostCount }} 条成本不全</span>
+            <span v-if="s.unrunCount > 0" class="tag">{{ s.unrunCount }} 条未跑</span>
+            <span
+              v-if="s.missingCostCount === 0 && s.partialCostCount === 0 && s.unrunCount === 0"
+              class="tag ok"
+            >成本完整</span>
           </td>
         </tr>
       </tbody>
     </table>
-    <span class="hint" v-else-if="!loading">还没有任务记录，执行一次任务后这里会出现汇总。</span>
+    <span class="hint" v-else-if="!loading">还没有已执行的计划，执行后这里会出现汇总。</span>
 
     <p class="hint" v-if="hasMissingCost">
-      「无成本」表示该任务没有生成成本利润表（未勾选，或渠道倍率没维护被拦）；
+      「无成本」表示该计划没有生成成本利润表（未勾选，或渠道倍率没维护被拦）；
       「成本不全」表示部分渠道没维护倍率、成本只覆盖了一部分行。
-      这两种情况下的利润**只覆盖有成本的那部分**，不等于整体毛利。
+      这两种情况下的利润<strong>只覆盖有成本的那部分</strong>，不等于整体毛利。
     </p>
-
-    <!-- 任务明细 -->
-    <h3 v-if="tasks.length > 0">任务明细</h3>
-    <table v-if="tasks.length > 0">
-      <thead>
-        <tr>
-          <th>客户</th>
-          <th>账期</th>
-          <th>结算额(¥)</th>
-          <th>成本(¥)</th>
-          <th>利润(¥)</th>
-          <th>日志行数</th>
-          <th>生成时间</th>
-          <th>操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="t in tasks" :key="t.id">
-          <td>{{ t.customerName }}</td>
-          <td>{{ periodLabel(t) }}</td>
-          <td>{{ fmtMoney(t.settleCny) }}</td>
-          <td>
-            <span v-if="t.costCny === null || t.costCny === undefined" class="tag warn">未核算</span>
-            <span v-else>{{ fmtMoney(t.costCny) }}</span>
-          </td>
-          <td :class="{ negative: t.profitCny !== null && t.profitCny < 0 }">
-            {{ fmtMoney(t.profitCny) }}
-          </td>
-          <td>{{ fmtNum(t.rowCount) }}</td>
-          <td>{{ fmtTime(t.generatedAt) }}</td>
-          <td class="ops">
-            <button type="button" class="btn-link" @click="refillRun(t)">重新执行</button>
-            <button type="button" class="btn-link danger" @click="deleteTask(t)">删除</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <p class="hint" v-if="hasUnrun">
+      标「未跑」的计划还没有执行过，不计入账单数与金额——它们的金额列是空的，
+      计进去会出现「有账单但金额为 0」这种对不上的行。
+    </p>
   </div>
 </template>
 
@@ -509,9 +802,8 @@ defineExpose({ loadAll })
   padding: 20px;
   margin-bottom: 20px;
 }
-.card h3 {
-  margin-bottom: 6px;
-  font-size: 15px;
+.card h2 {
+  margin-top: 0;
 }
 
 .hint {
@@ -521,7 +813,7 @@ defineExpose({ loadAll })
 }
 .hint.inline {
   display: inline;
-  margin-left: 8px;
+  margin-left: 4px;
 }
 
 .section-head {
@@ -534,12 +826,17 @@ defineExpose({ loadAll })
   border-top: 1px solid #eee;
 }
 
-.settings-box {
+.settings-box,
+.plan-box {
   padding: 12px;
   border: 1px solid #e2e2e2;
   border-radius: 6px;
   background: #fafbfc;
   margin-bottom: 14px;
+}
+.plan-box {
+  border-color: #d6e2f7;
+  background: #f7faff;
 }
 
 .form-grid {
@@ -572,14 +869,6 @@ defineExpose({ loadAll })
 .form-grid textarea {
   max-width: 100%;
   resize: vertical;
-}
-
-.run-box {
-  padding: 12px;
-  border: 1px solid #d6e2f7;
-  border-radius: 6px;
-  background: #f7faff;
-  margin-top: 14px;
 }
 
 .checkboxes {
@@ -645,18 +934,11 @@ defineExpose({ loadAll })
 .btn-link.danger {
   color: #d92626;
 }
+.btn-link:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 
-.run-result {
-  margin-top: 14px;
-  padding-top: 12px;
-  border-top: 1px solid #eee;
-}
-.downloads {
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-bottom: 8px;
-}
 .btn {
   display: inline-block;
   padding: 6px 14px;
@@ -667,21 +949,53 @@ defineExpose({ loadAll })
   text-decoration: none;
   font-size: 13px;
 }
-
-.cost-blocked {
-  margin-top: 10px;
-  padding: 8px 10px;
-  border: 1px solid #f0c36d;
-  border-radius: 4px;
-  background: #fffdf5;
+.btn.small {
+  padding: 2px 10px;
+  font-size: 12px;
+  margin-left: 6px;
 }
 
-.cost-summary {
+.result-box {
   margin-top: 12px;
   padding: 10px 12px;
   border: 1px solid #d6e2f7;
   border-radius: 6px;
   background: #f7faff;
+}
+.result-box.bad {
+  border-color: #f0c36d;
+  background: #fffdf5;
+}
+.result-box.ok {
+  border-color: #b7e0c2;
+  background: #f4fbf6;
+}
+.result-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.result-list li {
+  margin-bottom: 4px;
+  line-height: 1.7;
+}
+.result-list .name {
+  font-weight: 600;
+  margin-right: 8px;
+}
+.result-list .reason {
+  color: #d92626;
+}
+.result-list .ok {
+  color: #1f7a3d;
+}
+
+.cost-summary {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #d6e2f7;
+  border-radius: 6px;
+  background: #fff;
 }
 .cost-summary-head {
   display: flex;
@@ -722,11 +1036,19 @@ th {
   background: #fafbfc;
   font-weight: 600;
 }
-th:nth-child(1),
+th.pick,
+td.pick {
+  width: 34px;
+  text-align: center;
+}
 th:nth-child(2),
-td:nth-child(1),
-td:nth-child(2) {
+th:nth-child(3),
+td:nth-child(2),
+td:nth-child(3) {
   text-align: left;
+}
+td.name {
+  font-weight: 600;
 }
 td.note,
 td.ops {
@@ -737,6 +1059,10 @@ td.ops {
 }
 td.negative {
   color: #d92626;
+}
+.row-unrun {
+  background: #fbfbfc;
+  color: #666;
 }
 
 .tag {
@@ -754,6 +1080,9 @@ td.negative {
 }
 .tag.ok {
   background: #e8f7ec;
+  color: #1f7a3d;
+}
+.ok {
   color: #1f7a3d;
 }
 

@@ -46,3 +46,16 @@ func PreviousMonth(now time.Time) (year, month int) {
 	prev := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, cstLocation).AddDate(0, 0, -1)
 	return prev.Year(), int(prev.Month())
 }
+
+// PeriodFromStartTime 从一个时段的**开始时刻**推导归属账期（年、月）。
+//
+// 为什么用开始日而不是结束日：周度任务会跨月（8/28~9/3），两份口径都说得通，
+// 定成开始月是为了让「这一周的账」落在它开始的账期里，与「这个月的账赚多少」
+// 的直觉一致。跨月任务整个计入开始月，不拆分——拆了就要按天分配金额，
+// 而账单本身是一份不可分的文件。
+//
+// 按 cstLocation 取月，不用 UTC：北京时间月初那 8 小时若按 UTC 算会落到上月。
+func PeriodFromStartTime(start time.Time) (year, month int) {
+	t := start.In(cstLocation)
+	return t.Year(), int(t.Month())
+}
