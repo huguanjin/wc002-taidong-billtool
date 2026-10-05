@@ -32,6 +32,10 @@ type AggregateResult struct {
 
 var cstLocation = time.FixedZone("CST", 8*3600)
 
+// CSTLocation 北京时间固定时区。对外的入口：日期/时间一律按 +08:00 解释，
+// 与容器时区无关（容器通常是 UTC，用 time.Local 会整体偏 8 小时、错切账期）。
+func CSTLocation() *time.Location { return cstLocation }
+
 // AggregateFromRows 对应 log_to_bill.py 的 aggregate_from_rows：逐行解析缓存/语义/计费，
 // 按 (model, group) 聚合，同时可选地把展开缓存列后的脱敏行写给 sanitizedWriter。
 //

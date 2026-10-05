@@ -335,7 +335,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 
 		require.Len(t, args, 4, "2 个时间 + 2 个账号")
 		assert.Equal(t, start.Unix(), args[0])
-		assert.Equal(t, end.Unix(), args[1])
+		assert.Equal(t, end.Unix()+1, args[1], "右端点是 end+1s（闭区间语义）")
 		assert.Equal(t, "a37836323", args[2])
 		assert.Equal(t, "test02", args[3])
 	})
@@ -394,33 +394,131 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 	})
 }
 
-// TestBuildLogExportQueryInclusiveInterval 区间是左闭右开，与人工导出的
-// BETWEEN 当日 23:59:59 等价：start 含、end 不含，中间没有整数秒被漏掉。
+// TestBuildLogExportQueryInclusiveInterval 区间是**双闭**的，与人工导出的
+// BETWEEN a AND b 一致：起止两个时刻本身都算在内，边界那一秒的日志不会被漏掉。
+// SQL 里仍写半开 `< end+1s`，因为 created_at 是整数秒，两者完全等价。
 func TestBuildLogExportQueryInclusiveInterval(t *testing.T) {
-	start, err := time.ParseInLocation("2006-01-02", "2026-09-24", cstLocation)
+	// 模拟用户填「2026-09-24 00:00:00」到「2026-09-29 23:59:59」。
+	start, _, err := ParseExportTime("2026-09-24 00:00:00")
 	require.NoError(t, err)
-	endDay, err := time.ParseInLocation("2006-01-02", "2026-09-29", cstLocation)
+	end, _, err := ParseExportTime("2026-09-29 23:59:59")
 	require.NoError(t, err)
-	end := endDay.AddDate(0, 0, 1)
+	require.Equal(t, int64(1790697599), end.Unix(), "该时刻正是 09-29 23:59:59 +08:00")
 
 	_, args := buildLogExportQuery("logs", LogExportParams{
 		Usernames: []string{"u"}, StartTime: start, EndTime: end,
 	})
+	lo := args[0].(int64)
+	hi := args[1].(int64)
+	assert.Equal(t, int64(1790179200), lo, "起点是 09-24 00:00:00")
+	assert.Equal(t, int64(1790697600), hi, "右端点是 end+1s，即 09-30 00:00:00（不含）")
 
-	// 构造三种边界行，按 SQL 语义判断是否落在区间内。
-	inRange := func(ts int64) bool {
-		lo := args[0].(int64)
-		hi := args[1].(int64)
-		return ts >= lo && ts < hi
+	inRange := func(ts int64) bool { return ts >= lo && ts < hi }
+	assert.True(t, inRange(start.Unix()), "起始时刻本身必须在内")
+	assert.True(t, inRange(end.Unix()), "结束时刻本身必须在内（闭区间，这是关键）")
+	assert.True(t, inRange(end.Unix()-1))
+	assert.False(t, inRange(end.Unix()+1), "结束时刻之后一秒必须在外")
+	assert.False(t, inRange(start.Unix()-1), "起始时刻之前一秒必须在外")
+}
+
+// TestResolveExportRangeSecondsPrecision 起止时间要精确到秒，而不只是按天。
+// 排查某个具体事故时往往只要几个小时，按天切会把无关日志一起导出来。
+func TestResolveExportRangeSecondsPrecision(t *testing.T) {
+	t.Run("完整到秒", func(t *testing.T) {
+		start, end, err := ResolveExportRange("2026-09-24 10:30:05", "2026-09-24 10:30:08")
+		require.NoError(t, err)
+		assert.Equal(t, int64(3), int64(end.Sub(start).Seconds()), "3 秒的窗口要能表达出来")
+		assert.Equal(t, 5, start.Second())
+		assert.Equal(t, 8, end.Second())
+	})
+
+	t.Run("T分隔与空格分隔等价", func(t *testing.T) {
+		a, _, err := ResolveExportRange("2026-09-24T10:30:05", "2026-09-24T10:30:08")
+		require.NoError(t, err)
+		b, _, err := ResolveExportRange("2026-09-24 10:30:05", "2026-09-24 10:30:08")
+		require.NoError(t, err)
+		assert.Equal(t, a.Unix(), b.Unix(), "datetime-local 用 T，手填常用空格，两者应一致")
+	})
+
+	t.Run("缺秒段按0秒", func(t *testing.T) {
+		// datetime-local 在秒为 0 时会省略秒段。
+		start, _, err := ResolveExportRange("2026-09-24T10:30", "2026-09-24T10:31")
+		require.NoError(t, err)
+		assert.Equal(t, 0, start.Second())
+	})
+
+	t.Run("只填日期仍是整段", func(t *testing.T) {
+		start, end, err := ResolveExportRange("2026-09-24", "2026-09-29")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1790179200), start.Unix(), "起点是当天 00:00:00")
+		assert.Equal(t, int64(1790697599), end.Unix(), "终点补到当天 23:59:59（含）")
+		// 与旧的「按天导出」行为完全一致：含 24~29 共 6 天整。
+		assert.Equal(t, int64(6*24*3600-1), int64(end.Sub(start).Seconds()))
+	})
+
+	t.Run("时间倒置报错", func(t *testing.T) {
+		_, _, err := ResolveExportRange("2026-09-24 10:00:00", "2026-09-24 09:00:00")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "不能早于")
+	})
+
+	t.Run("同一时刻可用", func(t *testing.T) {
+		// 起止相同时表示「就看这一秒」，不是错误。
+		start, end, err := ResolveExportRange("2026-09-24 10:00:00", "2026-09-24 10:00:00")
+		require.NoError(t, err)
+		assert.True(t, end.Equal(start))
+	})
+
+	t.Run("非法格式报错", func(t *testing.T) {
+		_, _, err := ResolveExportRange("9/24/2026", "2026-09-29")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "开始时间")
+	})
+
+	t.Run("按北京时间解析而非UTC", func(t *testing.T) {
+		start, _, err := ResolveExportRange("2026-09-24 00:00:00", "2026-09-24 01:00:00")
+		require.NoError(t, err)
+		assert.Equal(t, int64(1790179200), start.Unix(),
+			"与文档第 1 节 date -d \"2026-09-24 00:00:00 +08:00\" +%s 一致")
+	})
+}
+
+// TestExportQueryEndIsInclusive 右端点是 end+1s：created_at 是整数秒，
+// `< end+1s` 等价于 `<= end`，闭区间语义靠这一步实现。
+func TestExportQueryEndIsInclusive(t *testing.T) {
+	end, _, err := ParseExportTime("2026-09-29 23:59:59")
+	require.NoError(t, err)
+
+	p := LogExportParams{EndTime: end}
+	assert.Equal(t, end.Unix()+1, p.ExportQueryEnd().Unix())
+	assert.False(t, p.ExportQueryEnd().After(end.Add(2*time.Second)))
+}
+
+// TestExportFilenameUsesGivenDays 文件名取起止时刻的日期本身。
+// 闭区间下 EndTime 已是最后一个算在内的时刻，若再减一秒，
+// 「结束于 09-29 00:00:00」会被标成 09-28，与实际导出内容不符。
+func TestExportFilenameUsesGivenDays(t *testing.T) {
+	cases := []struct {
+		name      string
+		start     string
+		end       string
+		wantSuffix string
+	}{
+		{"整段", "2026-09-01 00:00:00", "2026-09-30 23:59:59", "日志查询_2026-09-01_2026-09-30.tsv"},
+		{"结束在当天零点", "2026-09-01 00:00:00", "2026-09-29 00:00:00", "日志查询_2026-09-01_2026-09-29.tsv"},
+		{"只填日期", "2026-09-24", "2026-09-29", "日志查询_2026-09-24_2026-09-29.tsv"},
+		{"秒级窗口", "2026-09-24 10:30:05", "2026-09-24 10:30:08", "日志查询_2026-09-24_2026-09-24.tsv"},
 	}
-	assert.True(t, inRange(start.Unix()), "起始时刻（09-24 00:00:00）必须在区间内")
-	assert.True(t, inRange(end.Unix()-1), "09-29 23:59:59 必须在区间内")
-	assert.False(t, inRange(end.Unix()), "09-30 00:00:00 必须不在区间内")
-	assert.False(t, inRange(start.Unix()-1), "09-23 23:59:59 必须不在区间内")
-
-	// 与 BETWEEN ... AND 当日 23:59:59 的覆盖范围一致。
-	betweenEnd := end.Unix() - 1
-	assert.Equal(t, betweenEnd, end.Unix()-1, "23:59:59 到次日 00:00:00 之间只有整数秒，不存在漏掉的时刻")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, err := ResolveExportRange(tc.start, tc.end)
+			require.NoError(t, err)
+			got := ExportLogFileName(start, end)
+			assert.Equal(t, tc.wantSuffix, got)
+			// 含「日志查询」，以便出账时被 defaultOutputName 改名为「账单」。
+			assert.Contains(t, got, "日志查询")
+		})
+	}
 }
 
 func indexOfHeader(headers []string, name string) int {

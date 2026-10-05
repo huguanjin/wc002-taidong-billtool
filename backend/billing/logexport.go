@@ -28,12 +28,90 @@ var (
 )
 
 // LogExportParams 一次日志导出的参数。
+//
+// 时间语义是**双闭区间**，与人工导出的 `BETWEEN a AND b` 一致：
+// StartTime 与 EndTime 两个时刻本身都算在内，边界那一秒的日志不会被漏掉。
+// 内部查询仍写成半开区间 `created_at >= start AND created_at < end+1s`——
+// created_at 是整数秒，这个写法与闭区间完全等价（见 buildLogExportQuery）。
 type LogExportParams struct {
 	Usernames     []string  // 账号列表，与 UserIDs 取并集；两者不能同时为空
 	UserIDs       []int     // 可选
 	IncludeUserID bool      // 是否在输出里追加 user_id 列
-	StartTime     time.Time // 起始时刻（含），由调用方按 +08:00 构造
-	EndTime       time.Time // 结束时刻（不含），即结束日期次日 00:00
+	StartTime     time.Time // 起始时刻（含），由 ParseExportTime 按 +08:00 解析
+	EndTime       time.Time // 结束时刻（含）
+}
+
+// ExportQueryEnd 返回查询用的半开区间右端点：EndTime + 1 秒。
+//
+// created_at 是整数秒，`< EndTime+1s` 等价于 `<= EndTime`，也就是闭区间。
+// 这样既保持了「结束时刻本身包含在内」符合直觉的语义，又不必在 SQL 里
+// 为秒粒度写 `<=`（下游一律走半开区间，判断逻辑只有一处）。
+func (p LogExportParams) ExportQueryEnd() time.Time {
+	return p.EndTime.Add(time.Second)
+}
+
+// ParseExportTime 按北京时间（+08:00）解析前端传来的时间字符串。
+//
+// 容器时区通常是 UTC，用 time.Local 解析会整体偏 8 小时、把客户账期错切一天，
+// 所以这里一律用固定的 +08:00，与 aggregate.go 的 cstLocation 同一口径。
+//
+// 接受的输入形态（前端是 datetime-local，浏览器在秒为 0 时会省略秒段）：
+//   - 2026-09-24T00:00:05  完整时刻
+//   - 2026-09-24T00:00     缺秒，按 :00 处理
+//   - 2026-09-24 00:00:05  空格分隔（部分浏览器/手填）
+//   - 2026-09-24           只有日期，见 isDateOnly
+func ParseExportTime(s string) (time.Time, bool, error) {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return time.Time{}, false, fmt.Errorf("时间不能为空")
+	}
+	dateOnly := isDateOnly(v)
+	normalized := strings.Replace(v, " ", "T", 1)
+
+	for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02T15:04"} {
+		if t, err := time.ParseInLocation(layout, normalized, cstLocation); err == nil {
+			return t, dateOnly, nil
+		}
+	}
+	if dateOnly {
+		if t, err := time.ParseInLocation("2006-01-02", normalized, cstLocation); err == nil {
+			return t, true, nil
+		}
+	}
+	return time.Time{}, false, fmt.Errorf("时间格式无法识别：%q（应为 YYYY-MM-DD HH:MM:SS）", s)
+}
+
+// isDateOnly 判断是否只给了日期没给时刻。
+func isDateOnly(v string) bool {
+	return !strings.ContainsAny(v, "T: ")
+}
+
+// ResolveExportRange 把用户填写的起止时间解析成导出区间。
+//
+// 只填日期的写法按整段处理，保持与旧版「按天导出」完全一致的行为：
+// 起始 = 当天 00:00:00，结束 = 当天 23:59:59（含）。
+// 给了时刻就按秒精确，结束时刻本身也算在内。
+func ResolveExportRange(startRaw, endRaw string) (start, end time.Time, err error) {
+	start, _, err = ParseExportTime(startRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("开始时间：%w", err)
+	}
+	var endDateOnly bool
+	end, endDateOnly, err = ParseExportTime(endRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("结束时间：%w", err)
+	}
+
+	// 只给日期时起点就是当天 00:00:00，ParseExportTime 已经这么解析；
+	// 终点要补到当天 23:59:59（含），才与旧的「按整段导出」行为一致。
+	if endDateOnly {
+		end = end.Add(24*time.Hour - time.Second)
+	}
+
+	if end.Before(start) {
+		return time.Time{}, time.Time{}, fmt.Errorf("结束时间不能早于开始时间")
+	}
+	return start, end, nil
 }
 
 // LogExportResult 导出结果摘要。
@@ -134,8 +212,11 @@ func mysqlBatchEscape(v string) string {
 // 占位符严格对应，不能有任何字符串拼接（账号名里带引号/分号也不能破坏结构）。
 func buildLogExportQuery(table string, params LogExportParams) (string, []interface{}) {
 	// 账号与用户 ID 取并集。
+	//
+	// 区间写成半开 `< end+1s`：created_at 是整数秒，这与「结束时刻也包含在内」
+	// 的闭区间语义完全等价（`< T+1s` 即 `<= T`）。
 	conds := []string{"type = 2", "created_at >= ?", "created_at < ?"}
-	args := []interface{}{params.StartTime.Unix(), params.EndTime.Unix()}
+	args := []interface{}{params.StartTime.Unix(), params.ExportQueryEnd().Unix()}
 	if len(params.Usernames) > 0 {
 		conds = append(conds, fmt.Sprintf("username IN (%s)", placeholders(len(params.Usernames))))
 		for _, u := range params.Usernames {
@@ -156,6 +237,16 @@ func buildLogExportQuery(table string, params LogExportParams) (string, []interf
 	return query, args
 }
 
+// ExportLogFileName 导出文件名：日志查询_<起始日>_<结束日>.tsv。
+//
+// 取起止时刻本身的日期，不做任何偏移：区间是双闭的，EndTime 已经是最后一个
+// 算在内的时刻，减一秒会把「结束于某天 00:00:00」错标成前一天。
+// 含「日志查询」字样，出账时 defaultOutputName 会据此把名字换成「账单」。
+func ExportLogFileName(start, end time.Time) string {
+	return fmt.Sprintf("日志查询_%s_%s.tsv",
+		start.Format("2006-01-02"), end.Format("2006-01-02"))
+}
+
 // ExportLogsFromDB 连业务库把消费日志导出为 mysql 批处理模式的 tsv，
 // 列与列顺序对齐人工导出（末尾追加 other），流式写入 outDir 下的文件。
 //
@@ -164,8 +255,8 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	if len(params.Usernames) == 0 && len(params.UserIDs) == 0 {
 		return nil, fmt.Errorf("必须至少指定一个用户名或用户 ID")
 	}
-	if !params.EndTime.After(params.StartTime) {
-		return nil, fmt.Errorf("结束时间必须晚于开始时间")
+	if params.EndTime.Before(params.StartTime) {
+		return nil, fmt.Errorf("结束时间不能早于开始时间")
 	}
 	table, err := sanitizeTableName(cfg.LogTableName())
 	if err != nil {
@@ -188,8 +279,8 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
 	}
-	name := fmt.Sprintf("日志查询_%s_%s.tsv",
-		params.StartTime.Format("2006-01-02"), params.EndTime.Add(-time.Second).Format("2006-01-02"))
+	// 文件名里的日期直接取起止时刻本身（见 ExportLogFileName）。
+	name := ExportLogFileName(params.StartTime, params.EndTime)
 	finalPath := filepath.Join(outDir, name)
 	tmp, err := os.CreateTemp(outDir, ".logexport-*.tmp")
 	if err != nil {

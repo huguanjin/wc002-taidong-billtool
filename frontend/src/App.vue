@@ -381,18 +381,22 @@ function appendSourceFields(fd, errRef) {
   return true
 }
 
-// 导出日志明细：默认取上个月整月，这是出账最常用的区间。
+// 导出日志明细：默认取上个月整月（00:00:00 至 23:59:59），这是出账最常用的区间。
+// 用本地时间拼接，因为 datetime-local 的取值本身就是「无时区的墙钟时间」，
+// 时区解释统一交给后端按 +08:00 处理。
 function defaultExportRange() {
   const now = new Date()
   const firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1)
   const lastMonthEnd = new Date(firstOfThisMonth.getTime() - 24 * 3600 * 1000)
   const firstOfLastMonth = new Date(lastMonthEnd.getFullYear(), lastMonthEnd.getMonth(), 1)
-  const fmt = (d) => {
-    const m = String(d.getMonth() + 1).padStart(2, '0')
-    const day = String(d.getDate()).padStart(2, '0')
-    return `${d.getFullYear()}-${m}-${day}`
+  const fmt = (d, h, m, s) => {
+    const p = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(h)}:${p(m)}:${p(s)}`
   }
-  return { startDate: fmt(firstOfLastMonth), endDate: fmt(lastMonthEnd) }
+  return {
+    startAt: fmt(firstOfLastMonth, 0, 0, 0),
+    endAt: fmt(lastMonthEnd, 23, 59, 59),
+  }
 }
 
 const maxExportDays = 92
@@ -414,16 +418,16 @@ async function exportLogs() {
     exportError.value = '请至少填写一个客户账号或用户 ID'
     return
   }
-  if (!exportForm.value.startDate || !exportForm.value.endDate) {
-    exportError.value = '请填写开始日期与结束日期'
+  if (!exportForm.value.startAt || !exportForm.value.endAt) {
+    exportError.value = '请填写开始时间与结束时间'
     return
   }
 
   const fd = new FormData()
   fd.append('usernames', exportForm.value.usernames)
   fd.append('userIds', exportForm.value.userIds)
-  fd.append('startDate', exportForm.value.startDate)
-  fd.append('endDate', exportForm.value.endDate)
+  fd.append('startAt', exportForm.value.startAt)
+  fd.append('endAt', exportForm.value.endAt)
   fd.append('includeUserId', String(exportForm.value.includeUserId))
 
   exporting.value = true
@@ -766,19 +770,22 @@ async function handleSubmit() {
 
       <div class="grid">
         <div class="field">
-          <label>开始日期</label>
-          <input v-model="exportForm.startDate" type="date" />
+          <label>开始时间</label>
+          <input v-model="exportForm.startAt" type="datetime-local" step="1" />
         </div>
         <div class="field">
-          <label>结束日期</label>
-          <input v-model="exportForm.endDate" type="date" />
+          <label>结束时间</label>
+          <input v-model="exportForm.endAt" type="datetime-local" step="1" />
         </div>
       </div>
+      <span class="hint">
+        精确到秒，时间按北京时间（+08:00）解释；起止两个时刻都算在内（与人工导出的 BETWEEN 一致）。
+        单次最多导出 {{ maxExportDays }} 天。
+      </span>
 
       <div class="checkboxes">
         <label><input v-model="exportForm.includeUserId" type="checkbox" /> 追加 user_id 列（跨账号排查用；username 为空的老日志靠它定位）</label>
       </div>
-      <span class="hint">日期按北京时间（+08:00）解释。单次最多导出 {{ maxExportDays }} 天。</span>
 
       <button type="submit" :disabled="exporting">
         {{ exporting ? '导出中…' : '从数据库导出日志' }}

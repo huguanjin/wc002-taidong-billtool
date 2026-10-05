@@ -321,33 +321,22 @@ func handleExportLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	startRaw := strings.TrimSpace(form["startDate"])
-	endRaw := strings.TrimSpace(form["endDate"])
+	startRaw := exportTimeField(form, "startAt", "startDate")
+	endRaw := exportTimeField(form, "endAt", "endDate")
 	if startRaw == "" || endRaw == "" {
-		httpError(w, http.StatusBadRequest, "请填写开始日期与结束日期")
+		httpError(w, http.StatusBadRequest, "请填写开始时间与结束时间")
 		return
 	}
-	// 日期按北京时间解释。容器时区多为 UTC，用 time.Local 会整体偏 8 小时、
-	// 把客户账期错切一天，所以必须显式指定 +08:00。
-	start, err := time.ParseInLocation("2006-01-02", startRaw, cstLocationForHTTP())
+	// 时间按北京时间（+08:00）解释，与容器时区无关——容器通常是 UTC，
+	// 用 time.Local 会整体偏 8 小时、把客户账期错切一天。
+	start, end, err := billing.ResolveExportRange(startRaw, endRaw)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "开始日期格式应为 YYYY-MM-DD")
+		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	endDay, err := time.ParseInLocation("2006-01-02", endRaw, cstLocationForHTTP())
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "结束日期格式应为 YYYY-MM-DD")
-		return
-	}
-	if endDay.Before(start) {
-		httpError(w, http.StatusBadRequest, "结束日期不能早于开始日期")
-		return
-	}
-	// 半开区间：结束日期次日 00:00（不含），与 BETWEEN 当日 23:59:59 等价。
-	end := endDay.AddDate(0, 0, 1)
-	if days := end.Sub(start).Hours() / 24; days > maxExportDays {
+	if span := end.Sub(start); span > time.Duration(maxExportDays)*24*time.Hour {
 		httpError(w, http.StatusBadRequest,
-			fmt.Sprintf("时间跨度 %.0f 天超过上限 %d 天，请分次导出", days, maxExportDays))
+			fmt.Sprintf("时间跨度 %.1f 天超过上限 %d 天，请分次导出", span.Hours()/24, maxExportDays))
 		return
 	}
 
@@ -378,12 +367,18 @@ func handleExportLogs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cstLocationForHTTP 北京时间固定时区，与 aggregate.go 的 cstLocation 同一口径。
-func cstLocationForHTTP() *time.Location {
-	return time.FixedZone("CST", 8*3600)
+// exportTimeField 取时间字段：优先用新字段名，同时兼容旧字段名
+// （浏览器里缓存着旧版前端时仍会提交 startDate/endDate）。
+func exportTimeField(form map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(form[k]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
-// formValues 把 multipart 或普通表单统一成 一个 map[string]string。
+// formValues 把 multipart 或普通表单统一成一个 map[string]string。
 func formValues(r *http.Request) map[string]string {
 	out := map[string]string{}
 	if r.MultipartForm != nil {
