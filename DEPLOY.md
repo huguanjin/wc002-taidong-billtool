@@ -134,7 +134,47 @@ server {
 配好反向代理后，可以把 `docker-compose.yml` 里的端口映射改成只监听本机：`"127.0.0.1:8080:8080"`，
 避免容器端口直接暴露在公网。
 
-## 8. 备份
+## 8. 从数据库直连导出日志（可选功能）
+
+「导出日志明细」功能可以按时间段 + 客户账号，直接从业务数据库的 `logs` 表把消费日志导出成
+tsv，替代人工在服务器上执行：
+
+```bash
+mysql -h127.0.0.1 -P3316 -uroot -p'...' -D "new-api" -e "
+SELECT id, username, type, created_at, token_id, token_name, model_name,
+       \`group\`, prompt_tokens, completion_tokens, quota, use_time,
+       is_stream, request_id, other
+FROM logs
+WHERE type = 2 AND username IN ('a37836323','test02')
+AND created_at >= 1790179200 AND created_at < 1790697600
+ORDER BY created_at, id;" > yunwu9.24-9.29.tsv
+```
+
+**与人工导出的差异（刻意为之，逐条列出）**
+
+| 项 | 人工导出 | 本功能 |
+|---|---|---|
+| `other` 列 | 没有 | **追加在末尾** |
+| `ORDER BY` | 无（返回顺序不保证稳定） | `ORDER BY created_at, id`，保证同样输入得到同样文件 |
+| 时间区间 | `BETWEEN a AND b`（闭区间） | `created_at >= a AND created_at < b`（左闭右开，等价） |
+| 文件名 | 手动指定 | `日志查询_<起始>_<结束>.tsv`，落在 `data/` 目录 |
+| 时区 | 手动算时间戳 | 日期按北京时间 +08:00 解释，与容器时区无关 |
+
+**为什么必须带 `other`**：缓存读/写、阶梯计费表达式、web_search、工具调用全部存在这一列里。
+人工导出没有它，`ParseCacheTokens` 会全部返回 0，**整份账单的缓存计费静默变成 0**。
+导出文件含原始请求信息，属敏感数据，**只留在服务器 data 目录，不要直接交给客户**——
+生成脱敏日志时 `other` 会被整列丢弃，那份才是可以给客户的。
+
+**配置**：复用 `BILL_DB_*`（建议只读账号），日志表名单独用 `BILL_DB_LOG_TABLE`（默认 `logs`）。
+未配置 `BILL_DB_HOST` 时该功能不可用。
+
+**限制**：仅当日志落在 MySQL 时可用。若 new-api 设置了 `LOG_SQL_DSN` 指向 ClickHouse 或独立
+日志库，MySQL 驱动连不上日志表，请退回手动导出
+（`clickhouse-client --query "..." --format TabSeparatedWithNames`）。
+单次导出跨度上限 92 天——`logs` 表在 `(username, created_at)` 上没有组合索引，跨度过大
+会扫掉大量行。
+
+## 9. 备份
 
 需要定期备份的内容：
 
@@ -155,3 +195,7 @@ server {
 | 页面能打开但生成账单报错「账单模板不存在」 | 确认 `data/bill_template.xlsx`、`data/price_table.xlsx` 已放在部署目录并正确挂载 |
 | 登录一直提示用户名密码错误 | 确认 `.env` 已生效：`docker compose config` 查看解析后的环境变量 |
 | 想用服务器路径读取源文件但报「路径超出允许范围」 | 检查 `BILL_BROWSE_ROOT` 与实际 `volumes` 挂载路径是否一致 |
+| 导出日志报「未配置业务数据库连接信息」 | 未设置 `BILL_DB_HOST`；参照第 8 节补齐 `BILL_DB_*` |
+| 导出日志报连接/查询失败 | 确认日志落在 MySQL（未配置 `LOG_SQL_DSN` 指向 ClickHouse）；核对 `BILL_DB_LOG_TABLE` 表名 |
+| 导出 0 行 | 不算错误，但通常说明账号拼写或时间段有误；账号需填 `logs.username` 的值 |
+| 账单里缓存读/写全是 0 | 输入日志用的可能是人工导出（缺 `other` 列）。用「导出日志明细」重新导出，或手动给 SQL 加上 `other` |

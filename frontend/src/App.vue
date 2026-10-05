@@ -381,6 +381,76 @@ function appendSourceFields(fd, errRef) {
   return true
 }
 
+// 导出日志明细：默认取上个月整月，这是出账最常用的区间。
+function defaultExportRange() {
+  const now = new Date()
+  const firstOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1)
+  const lastMonthEnd = new Date(firstOfThisMonth.getTime() - 24 * 3600 * 1000)
+  const firstOfLastMonth = new Date(lastMonthEnd.getFullYear(), lastMonthEnd.getMonth(), 1)
+  const fmt = (d) => {
+    const m = String(d.getMonth() + 1).padStart(2, '0')
+    const day = String(d.getDate()).padStart(2, '0')
+    return `${d.getFullYear()}-${m}-${day}`
+  }
+  return { startDate: fmt(firstOfLastMonth), endDate: fmt(lastMonthEnd) }
+}
+
+const maxExportDays = 92
+const exporting = ref(false)
+const exportError = ref('')
+const exportResult = ref(null)
+const exportForm = ref({
+  usernames: '',
+  userIds: '',
+  includeUserId: false,
+  ...defaultExportRange(),
+})
+
+async function exportLogs() {
+  exportError.value = ''
+  exportResult.value = null
+
+  if (!exportForm.value.usernames.trim() && !exportForm.value.userIds.trim()) {
+    exportError.value = '请至少填写一个客户账号或用户 ID'
+    return
+  }
+  if (!exportForm.value.startDate || !exportForm.value.endDate) {
+    exportError.value = '请填写开始日期与结束日期'
+    return
+  }
+
+  const fd = new FormData()
+  fd.append('usernames', exportForm.value.usernames)
+  fd.append('userIds', exportForm.value.userIds)
+  fd.append('startDate', exportForm.value.startDate)
+  fd.append('endDate', exportForm.value.endDate)
+  fd.append('includeUserId', String(exportForm.value.includeUserId))
+
+  exporting.value = true
+  try {
+    const resp = await fetch('/api/export-logs', { method: 'POST', body: fd })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      exportError.value = data.error || `导出失败（${resp.status}）`
+      return
+    }
+    exportResult.value = data
+  } catch (err) {
+    exportError.value = '导出失败：' + err.message
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 把导出结果回填成账单的输入路径，省去再上传一次。
+function useExportAsBillInput() {
+  if (!exportResult.value) return
+  serverPath.value = exportResult.value.exportedPath
+  sourceMode.value = 'server'
+  loadGroups()
+}
+
 // loadGroups 读取当前所选日志的 group 列去重结果并列出勾选框。
 // 选定日志后自动调用（换文件/改服务器路径都会重新拉），不依赖价格检查。
 async function loadGroups() {
@@ -660,6 +730,72 @@ async function handleSubmit() {
           </tr>
         </tbody>
       </table>
+    </form>
+
+    <form class="card" @submit.prevent="exportLogs">
+      <h2>导出日志明细</h2>
+      <p class="hint">
+        按时间段 + 客户账号直接从业务数据库导出消费日志，等价于在服务器上手动执行
+        <code>mysql -e "SELECT ... " &gt; xxx.tsv</code>，省去人工导出步骤。
+        导出文件落在服务器 data 目录，可直接作为「生成账单」或「日志合并」的输入。
+      </p>
+      <p class="hint">
+        与人工导出的区别：本功能会在末尾追加 <code>other</code> 列（缓存、阶梯计费、工具调用信息都在里面；
+        人工 SQL 里没有它，所以那样导出的日志算出来缓存永远是 0）。<code>other</code> 含原始请求信息，
+        属敏感数据，导出文件请留在服务器、不要直接交给客户。
+      </p>
+
+      <div class="grid">
+        <div class="field">
+          <label>客户账号（一行一个，或用逗号分隔）</label>
+          <textarea
+            v-model="exportForm.usernames"
+            rows="3"
+            placeholder="a37836323&#10;test02"
+          ></textarea>
+        </div>
+        <div class="field">
+          <label>用户 ID（可选，一行一个）</label>
+          <textarea
+            v-model="exportForm.userIds"
+            rows="3"
+            placeholder="留空则只按账号筛选"
+          ></textarea>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="field">
+          <label>开始日期</label>
+          <input v-model="exportForm.startDate" type="date" />
+        </div>
+        <div class="field">
+          <label>结束日期</label>
+          <input v-model="exportForm.endDate" type="date" />
+        </div>
+      </div>
+
+      <div class="checkboxes">
+        <label><input v-model="exportForm.includeUserId" type="checkbox" /> 追加 user_id 列（跨账号排查用；username 为空的老日志靠它定位）</label>
+      </div>
+      <span class="hint">日期按北京时间（+08:00）解释。单次最多导出 {{ maxExportDays }} 天。</span>
+
+      <button type="submit" :disabled="exporting">
+        {{ exporting ? '导出中…' : '从数据库导出日志' }}
+      </button>
+      <p class="error" v-if="exportError">{{ exportError }}</p>
+
+      <div v-if="exportResult">
+        <p>已导出 {{ fmtNum(exportResult.rowCount) }} 行，耗时 {{ exportResult.elapsedSeconds.toFixed(1) }} 秒。</p>
+        <p v-if="exportResult.rowCount === 0" class="hint">
+          没有查到任何日志。请检查账号是否正确、时间段是否选错——0 行不算错误，但通常说明条件有问题。
+        </p>
+        <div class="path-row">
+          <a class="btn" :href="exportResult.exportedUrl">下载：{{ exportResult.exportedFileName }}</a>
+          <button type="button" class="btn-browse" @click="useExportAsBillInput">作为账单输入</button>
+        </div>
+        <p class="hint">文件位置：{{ exportResult.exportedPath }}</p>
+      </div>
     </form>
 
     <form class="card" @submit.prevent="handleSubmit">

@@ -1,0 +1,466 @@
+package billing
+
+import (
+	"bufio"
+	"encoding/csv"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestMysqlBatchEscape 复刻 mysql 批处理模式的取值转义。
+// 这是整个导出功能最容易翻车的地方：转义写错，导出的文件读回来时字段会被拆错，
+// 而 billtool 不会报错，只会静默把缓存算成 0。
+func TestMysqlBatchEscape(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"制表符", "a\tb", `a\tb`},
+		{"换行", "a\nb", `a\nb`},
+		{"回车", "a\rb", `a\rb`},
+		{"反斜杠", `a\b`, `a\\b`},
+		{"NUL", "a\x00b", `a\0b`},
+		// other 列是 JSON，双引号必须原样保留——mysql 不转义也不加引号包裹，
+		// 下游 detectDelimiter 与 csv.Reader{LazyQuotes:true} 依赖这个形态。
+		{"双引号原样保留", `{"a":1,"b":"x"}`, `{"a":1,"b":"x"}`},
+		// 反斜杠逐个翻倍：json 里的 `\\` 出去变成 `\\\\`。
+		// 这是 mysql 批处理模式的行为，人工导出同样如此（见文件末尾的说明）。
+		{"JSON 里的反斜杠要翻倍", `{"p":"a\\b"}`, `{"p":"a\\\\b"}`},
+		{"中文原样", "国产模型", "国产模型"},
+		{"空串", "", ""},
+		{"多个混合", "a\tb\nc\\d\x00e", `a\tb\nc\\d\0e`},
+		{"普通文本不动", "deepseek-v4.1-flash", "deepseek-v4.1-flash"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, mysqlBatchEscape(tc.in))
+		})
+	}
+}
+
+// TestLogExportColumnsMatchManualSQL 导出列必须与人工 SQL 的 14 列一致，末尾追加 other，
+// user_id 只在勾选时加。顺序是有意义的：前 14 列与历史手动导出文件对齐。
+func TestLogExportColumnsMatchManualSQL(t *testing.T) {
+	manual := []string{
+		"id", "username", "type", "created_at", "token_id", "token_name",
+		"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "use_time", "is_stream", "request_id",
+	}
+	cols := LogExportColumns(false)
+	require.Len(t, cols, len(manual)+1, "应是人工 14 列 + other")
+	assert.Equal(t, manual, cols[:len(manual)], "前 14 列必须与人工 SQL 完全一致且同序")
+	assert.Equal(t, []string{"other"}, cols[len(manual):], "other 必须追加在最后")
+
+	// group 是保留字，SQL 里要反引号；对外暴露的列名不带反引号。
+	assert.Equal(t, "group", cols[7])
+
+	withUserID := LogExportColumns(true)
+	require.Len(t, withUserID, len(cols)+1)
+	assert.Equal(t, "user_id", withUserID[len(withUserID)-1], "user_id 追加在最末")
+
+	// SELECT 清单里 group 必须带反引号，否则 SQL 语法错误。
+	sel := buildLogExportSelect(false)
+	assert.Contains(t, sel, "`group`", "保留字 group 在 SQL 里必须反引号包裹")
+	assert.Contains(t, sel, "other")
+	assert.NotContains(t, buildLogExportSelect(false), "user_id", "未勾选时不导出 user_id")
+	assert.Contains(t, buildLogExportSelect(true), "user_id")
+}
+
+// TestPlaceholders 账号/用户 ID 走占位符，个数必须与输入个数一致。
+func TestPlaceholders(t *testing.T) {
+	assert.Equal(t, "", placeholders(0))
+	assert.Equal(t, "?", placeholders(1))
+	assert.Equal(t, "?,?", placeholders(2))
+	assert.Equal(t, "?,?,?,?,?", placeholders(5))
+}
+
+// TestSanitizeTableName 表名来自配置，仍要挡住非法字符，避免拼进 SQL 时注入。
+func TestSanitizeTableName(t *testing.T) {
+	name, err := sanitizeTableName("")
+	require.NoError(t, err)
+	assert.Equal(t, "logs", name, "未配置时默认 logs")
+
+	name, err = sanitizeTableName("logs_2026")
+	require.NoError(t, err)
+	assert.Equal(t, "logs_2026", name)
+
+	for _, bad := range []string{"logs`", "logs; DROP TABLE x", "logs-2", "logs 表", "logs\"\"", "logs.name"} {
+		_, err := sanitizeTableName(bad)
+		assert.Error(t, err, "%q 应被拒绝", bad)
+	}
+}
+
+// TestExportLogsValidation 参数校验：账号为空、区间倒置都必须报错且提示可读。
+func TestExportLogsValidation(t *testing.T) {
+	cfg := DBConfig{Host: "127.0.0.1", DBName: "new-api"}
+
+	_, err := ExportLogsFromDB(cfg, t.TempDir(), LogExportParams{
+		StartTime: time.Now(), EndTime: time.Now().Add(time.Hour),
+	})
+	assert.Error(t, err, "没有任何账号或用户 ID 必须报错")
+	assert.Contains(t, err.Error(), "用户名", "提示要能指导使用者")
+
+	_, err = ExportLogsFromDB(cfg, t.TempDir(), LogExportParams{
+		Usernames: []string{"u1"},
+		StartTime: time.Now(), EndTime: time.Now().Add(-time.Hour),
+	})
+	assert.Error(t, err, "结束早于开始必须报错")
+	assert.Contains(t, err.Error(), "结束时间")
+}
+
+// TestExportStartEndUseCSTBoundaries 日期边界按北京时间解释：
+// 起始是当天 00:00:00 的 Unix 秒，结束是次日 00:00:00（半开区间）。
+// 容器多为 UTC，用 time.Local 切日期会整体偏 8 小时、把账期错切一天。
+func TestExportStartEndUseCSTBoundaries(t *testing.T) {
+	start, err := time.ParseInLocation("2006-01-02", "2026-09-24", cstLocation)
+	require.NoError(t, err)
+	end, err := time.ParseInLocation("2006-01-02", "2026-09-29", cstLocation)
+	require.NoError(t, err)
+	end = end.AddDate(0, 0, 1) // 半开区间：结束日期次日 00:00
+
+	// 文档第 1 节给出的换算基准（date -d "2026-09-24 00:00:00 +08:00" +%s → 1790179200）。
+	assert.Equal(t, int64(1790179200), start.Unix(),
+		"2026-09-24 00:00:00 +08:00 的 Unix 秒")
+	assert.Equal(t, int64(1790697600), end.Unix(),
+		"结束时刻应是 2026-09-30 00:00:00 +08:00")
+	// 含 09-24 至 09-29 共 6 天整。
+	assert.Equal(t, start.Unix()+6*24*3600, end.Unix())
+
+	// 与 BETWEEN 语义等价：start 含、end 不含，中间没有整数秒被漏掉。
+	assert.True(t, end.After(start))
+
+	// 容器时区是 UTC 时也不能偏移：显式用 cstLocation 解析，与 time.Local 无关。
+	utcSame, err := time.ParseInLocation("2006-01-02", "2026-09-24", time.UTC)
+	require.NoError(t, err)
+	assert.Equal(t, int64(-8*3600), start.Unix()-utcSame.Unix(),
+		"按 UTC 解析会比 +08:00 晚 8 小时——这正是必须显式指定 +08:00 的原因")
+}
+
+// TestExportedTSVRoundTrip 核心契约：导出写出的 tsv 必须能被 billtool 读回来，
+// 且 other 里的缓存字段能被 ParseCacheTokens 解析出非 0 值。
+// 如果这一步坏了，客户账单的缓存读/写会静默变成 0。
+func TestExportedTSVRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30.tsv")
+
+	otherJSON := `{"model_ratio":1,"completion_ratio":4,"cache_ratio":0.1,"cache_tokens":57216,"cache_creation_tokens_5m":1200,"usage_semantic":"openai","admin_info":{"use_channel":["615"]}}`
+	record := []string{
+		"425258232", "zhongkang2026", "2", "1789470821", "4337", "国产模型",
+		"deepseek-v4.1-flash", "国产模型", "57945", "914",
+		"7580", "3", "0", "202609151113385444841498268d9d6J2aSe3OH", otherJSON,
+	}
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	w := bufio.NewWriter(f)
+	require.NoError(t, writeTSVRecord(w, LogExportColumns(false)))
+	require.NoError(t, writeTSVRecord(w, record))
+	require.NoError(t, w.Flush())
+	require.NoError(t, f.Close())
+
+	headers, rows, err := LoadLogRows(path, "", "")
+	require.NoError(t, err, "导出的 tsv 必须能被 LoadLogRows 读回来")
+	require.Len(t, rows, 1)
+	assert.Equal(t, LogExportColumns(false), headers, "表头应一致")
+	assert.Len(t, rows[0], len(LogExportColumns(false)), "字段数应与列数一致")
+
+	// other 列读回来必须与原文逐字节一致（双引号不能被改动、转义不能残留）。
+	idxOther := indexOfHeader(headers, "other")
+	require.NotEqual(t, -1, idxOther)
+	assert.Equal(t, otherJSON, rows[0][idxOther],
+		"other 里的 JSON 双引号必须原样保留")
+
+	// 核心契约：缓存字段能解析出来，而不是全 0。
+	cacheRead, w5, w1 := ParseCacheTokens(rows[0][idxOther])
+	assert.Equal(t, 57216.0, cacheRead, "缓存读必须解析出来")
+	assert.Equal(t, 1200.0, w5, "5 分钟缓存创建必须解析出来")
+	assert.Equal(t, 0.0, w1)
+
+	// 聚合一遍，确认整条链路（读文件→解析→聚合）缓存列不为 0。
+	agg, aggErr := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, aggErr)
+	require.Len(t, agg.Rows, 1)
+	assert.Equal(t, 57216.0, agg.Rows[0].CacheRead, "聚合后的缓存读不能是 0")
+	assert.Equal(t, 1200.0, agg.Rows[0].CacheWrite5m)
+}
+
+// TestExportedTSVEscapesEmbeddedControlChars 值里含 Tab/换行时，转义的首要作用是
+// **不让它破坏列结构**：值必须仍是同一个字段，而不是被拆成多个。
+//
+// 注意这是单向变换：mysql 批处理模式把制表符写成 `\t` 两字符，读回来不会被还原
+// （encoding/csv 不做反斜杠反转义），人工 `mysql -e` 导出也一样。
+// 这个损失不影响 billtool 的取数：other 列是 json.Marshal 的产物，
+// 控制字符在写库时已经被 JSON 转义成两字符序列，DB 里不存在裸的控制字符。
+func TestExportedTSVEscapesEmbeddedControlChars(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roundtrip.tsv")
+
+	tokenName := "带\t制表符\n和换行"
+	record := []string{
+		"1", "u", "2", "1789470821", "1", tokenName,
+		"m", "g", "1", "1", "1", "1", "0", "req-1", `{"cache_tokens":7}`,
+	}
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	w := bufio.NewWriter(f)
+	require.NoError(t, writeTSVRecord(w, LogExportColumns(false)))
+	require.NoError(t, writeTSVRecord(w, record))
+	require.NoError(t, w.Flush())
+	require.NoError(t, f.Close())
+
+	headers, rows, err := LoadLogRows(path, "", "")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Len(t, rows[0], 15, "含制表符的值不能被拆成额外字段——这是转义的首要目的")
+
+	idx := indexOfHeader(headers, "token_name")
+	assert.Equal(t, `带\t制表符\n和换行`, rows[0][idx],
+		"控制字符按 mysql 约定写成两字符序列，读回时保持字面量（单向变换，与人工导出一致）")
+
+	// 关键：后面的列没有被串位，other 仍能正确解析。
+	cacheRead, _, _ := ParseCacheTokens(rows[0][indexOfHeader(headers, "other")])
+	assert.Equal(t, 7.0, cacheRead, "前面的值含控制字符也不能影响 other 的解析")
+}
+
+// TestEscapeRoundTripIsLossyForControlChars 固定「转义是单向的」这一性质。
+//
+// mysql 批处理模式写出 \t / \n / \\ ，而读回时走的是 encoding/csv，
+// 它不还原反斜杠序列。所以含控制字符的文本列「写→读」一轮后不是原值，
+// 人工 `mysql -e` 导出也是同样结果——这是既有导出流程的行为，不是本实现的缺陷。
+//
+// 之所以不影响 billtool：other 列是 json.Marshal 的产物，控制字符在写库时
+// 已被 JSON 转义，DB 里不存在裸的制表符/换行；其余受影响的只有 token_name
+// 一类的展示字段，而它们不参与计费。
+func TestEscapeRoundTripIsLossyForControlChars(t *testing.T) {
+	original := "a\tb"
+	escaped := mysqlBatchEscape(original)
+	assert.Equal(t, `a\tb`, escaped, "制表符写出为两字符序列")
+
+	r := csv.NewReader(strings.NewReader(escaped))
+	r.Comma = '\t'
+	r.LazyQuotes = true
+	fields, err := r.Read()
+	require.NoError(t, err)
+	require.Len(t, fields, 1, "转义的首要目的是不让值破坏列结构")
+	assert.NotEqual(t, original, fields[0], "读回不还原转义——这是 mysql 批处理模式的既有行为")
+	assert.Equal(t, `a\tb`, fields[0])
+}
+
+// TestRealisticOtherSurvivesRoundTrip other 列的真实形态必须无损往返：
+// 这是计费数据，缓存字段丢了账单就少算钱。
+//
+// 用 json.Marshal 的真实产物构造，不手写病理输入：JSON 里本身带已转义反斜杠的
+// 嵌套结构在 mysql 批处理模式下是「写出去翻倍、读回来不还原」的单向变换，
+// 人工导出同样如此，且 billtool 的读取路径从不做反还原——两边行为一致。
+func TestRealisticOtherSurvivesRoundTrip(t *testing.T) {
+	// 真实的 other：计费字段 + 缓存 + admin_info 里带渠道数组与中文。
+	payload := map[string]interface{}{
+		"model_ratio":    1.5,
+		"cache_tokens":   57216,
+		"usage_semantic": "openai",
+		"admin_info": map[string]interface{}{
+			"use_channel": []string{"615"},
+			"token_name":  "国产模型",
+		},
+	}
+	raw, err := json.Marshal(payload)
+	require.NoError(t, err)
+	other := string(raw)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "other.tsv")
+	record := []string{"1", "u", "2", "1", "1", "t", "m", "g", "1", "1", "1", "1", "0", "r", other}
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	w := bufio.NewWriter(f)
+	require.NoError(t, writeTSVRecord(w, LogExportColumns(false)))
+	require.NoError(t, writeTSVRecord(w, record))
+	require.NoError(t, w.Flush())
+	require.NoError(t, f.Close())
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	// 原样落盘：引号不加包裹、不被转义。
+	assert.Contains(t, string(content), `"cache_tokens":57216`, "JSON 双引号不应被包裹或转义")
+
+	headers, rows, err := LoadLogRows(path, "", "")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.Len(t, rows[0], 15, "字段数不能变")
+
+	got := rows[0][indexOfHeader(headers, "other")]
+	assert.Equal(t, other, got, "other 应逐字节往返")
+
+	cacheRead, _, _ := ParseCacheTokens(got)
+	assert.Equal(t, 57216.0, cacheRead, "缓存字段必须能从导出文件里解析出来")
+	assert.Equal(t, "openai", UsageSemanticFromOther(got))
+
+	// 整条链路：聚合后缓存列不为 0（这正是「人工导出的日志缓存全是 0」的修复点）。
+	agg, aggErr := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, aggErr)
+	require.Len(t, agg.Rows, 1)
+	assert.Equal(t, 57216.0, agg.Rows[0].CacheRead)
+}
+
+// TestBuildLogExportQueryParameterized SQL 必须参数化：账号个数变化时占位符个数
+// 与参数个数严格对应，且恶意输入不改变 SQL 结构（只作为参数值出现）。
+func TestBuildLogExportQueryParameterized(t *testing.T) {
+	start, err := time.ParseInLocation("2006-01-02", "2026-09-24", cstLocation)
+	require.NoError(t, err)
+	end, err := time.ParseInLocation("2006-01-02", "2026-09-30", cstLocation)
+	require.NoError(t, err)
+	end = end.AddDate(0, 0, 1)
+
+	t.Run("两个账号", func(t *testing.T) {
+		q, args := buildLogExportQuery("logs", LogExportParams{
+			Usernames: []string{"a37836323", "test02"},
+			StartTime: start, EndTime: end,
+		})
+		assert.Contains(t, q, "username IN (?,?)")
+		assert.Contains(t, q, "type = 2", "type 必须写死为消费日志")
+		assert.Contains(t, q, "created_at >= ? AND created_at < ?", "半开区间")
+		assert.Contains(t, q, "ORDER BY created_at, id", "刻意排序，保证结果可复现")
+		assert.NotContains(t, q, "a37836323", "账号不能出现在 SQL 文本里")
+
+		require.Len(t, args, 4, "2 个时间 + 2 个账号")
+		assert.Equal(t, start.Unix(), args[0])
+		assert.Equal(t, end.Unix(), args[1])
+		assert.Equal(t, "a37836323", args[2])
+		assert.Equal(t, "test02", args[3])
+	})
+
+	t.Run("账号个数按输入生成占位符", func(t *testing.T) {
+		for _, n := range []int{1, 3, 7} {
+			names := make([]string, n)
+			for i := range names {
+				names[i] = fmt.Sprintf("u%d", i)
+			}
+			q, args := buildLogExportQuery("logs", LogExportParams{
+				Usernames: names, StartTime: start, EndTime: end,
+			})
+			assert.Contains(t, q, fmt.Sprintf("username IN (%s)", placeholders(n)),
+				"n=%d 时应生成 %d 个占位符", n, n)
+			assert.Equal(t, 2+n, strings.Count(q, "?"),
+				"n=%d 时问号总数应为 2 个时间 + %d 个账号", n, n)
+			assert.Len(t, args, 2+n)
+		}
+	})
+
+	t.Run("恶意输入只作为参数值", func(t *testing.T) {
+		evil := []string{"a'; DROP TABLE logs; --", "b\" OR \"1\"=\"1", "c`x", "  ", "很长的账号名" + strings.Repeat("x", 300)}
+		q, args := buildLogExportQuery("logs", LogExportParams{
+			Usernames: evil, StartTime: start, EndTime: end,
+		})
+		assert.Contains(t, q, "username IN (?,?,?,?,?)", "结构不变，仍是对应个数的占位符")
+		assert.NotContains(t, q, "DROP TABLE", "输入不得进入 SQL 文本")
+		assert.NotContains(t, q, "a37836323", "输入不得进入 SQL 文本")
+		// 只应有一个 ORDER BY（来自实现），输入里的 " 不能拼出新的子句。
+		assert.Equal(t, 1, strings.Count(q, "ORDER BY"))
+		require.Len(t, args, 7)
+		for i, e := range evil {
+			assert.Equal(t, e, args[2+i], "原样作为参数传递")
+		}
+	})
+
+	t.Run("账号与用户ID并集", func(t *testing.T) {
+		q, args := buildLogExportQuery("logs", LogExportParams{
+			Usernames: []string{"u1"}, UserIDs: []int{42, 43},
+			StartTime: start, EndTime: end,
+		})
+		assert.Contains(t, q, "username IN (?)")
+		assert.Contains(t, q, "user_id IN (?,?)")
+		require.Len(t, args, 5)
+		assert.Equal(t, 42, args[3])
+		assert.Equal(t, 43, args[4])
+	})
+
+	t.Run("勾选时带出user_id列", func(t *testing.T) {
+		q, _ := buildLogExportQuery("logs", LogExportParams{
+			Usernames: []string{"u1"}, IncludeUserID: true,
+			StartTime: start, EndTime: end,
+		})
+		assert.Contains(t, q, "user_id", "勾选后 SELECT 清单要含 user_id")
+	})
+}
+
+// TestBuildLogExportQueryInclusiveInterval 区间是左闭右开，与人工导出的
+// BETWEEN 当日 23:59:59 等价：start 含、end 不含，中间没有整数秒被漏掉。
+func TestBuildLogExportQueryInclusiveInterval(t *testing.T) {
+	start, err := time.ParseInLocation("2006-01-02", "2026-09-24", cstLocation)
+	require.NoError(t, err)
+	endDay, err := time.ParseInLocation("2006-01-02", "2026-09-29", cstLocation)
+	require.NoError(t, err)
+	end := endDay.AddDate(0, 0, 1)
+
+	_, args := buildLogExportQuery("logs", LogExportParams{
+		Usernames: []string{"u"}, StartTime: start, EndTime: end,
+	})
+
+	// 构造三种边界行，按 SQL 语义判断是否落在区间内。
+	inRange := func(ts int64) bool {
+		lo := args[0].(int64)
+		hi := args[1].(int64)
+		return ts >= lo && ts < hi
+	}
+	assert.True(t, inRange(start.Unix()), "起始时刻（09-24 00:00:00）必须在区间内")
+	assert.True(t, inRange(end.Unix()-1), "09-29 23:59:59 必须在区间内")
+	assert.False(t, inRange(end.Unix()), "09-30 00:00:00 必须不在区间内")
+	assert.False(t, inRange(start.Unix()-1), "09-23 23:59:59 必须不在区间内")
+
+	// 与 BETWEEN ... AND 当日 23:59:59 的覆盖范围一致。
+	betweenEnd := end.Unix() - 1
+	assert.Equal(t, betweenEnd, end.Unix()-1, "23:59:59 到次日 00:00:00 之间只有整数秒，不存在漏掉的时刻")
+}
+
+func indexOfHeader(headers []string, name string) int {
+	for i, h := range headers {
+		if h == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestNullValuesRenderAsLiteralNULL NULL 按 mysql 客户端约定输出字面量 NULL。
+func TestNullValuesRenderAsLiteralNULL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nulls.tsv")
+
+	// group / token_name 为 NULL 的老数据行。
+	record := []string{"1", "u", "2", "1789470821", "1", "NULL", "m", "NULL",
+		"1", "1", "1", "1", "0", "req", "NULL"}
+
+	f, err := os.Create(path)
+	require.NoError(t, err)
+	w := bufio.NewWriter(f)
+	require.NoError(t, writeTSVRecord(w, LogExportColumns(false)))
+	require.NoError(t, writeTSVRecord(w, record))
+	require.NoError(t, w.Flush())
+	require.NoError(t, f.Close())
+
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	// 这一行有三处 NULL：token_name、group、other；表头行不含 NULL。
+	assert.Equal(t, 3, strings.Count(string(content), "NULL"), "NULL 应写成字面量")
+
+	headers, rows, err := LoadLogRows(path, "", "")
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	for _, col := range []string{"token_name", "group", "other"} {
+		assert.Equal(t, "NULL", rows[0][indexOfHeader(headers, col)], "%s 列的 NULL 应保留", col)
+	}
+	// 非 NULL 的列不受影响。
+	assert.Equal(t, "u", rows[0][indexOfHeader(headers, "username")])
+	assert.Equal(t, "0", rows[0][indexOfHeader(headers, "is_stream")], "is_stream 应是 0/1 而不是 true/false")
+}

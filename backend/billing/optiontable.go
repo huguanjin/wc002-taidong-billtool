@@ -11,14 +11,18 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-// DBConfig 业务库 options 表连接信息（key/value 结构，与 one-api/new-api 一致）。
+// DBConfig 业务库连接信息。同一实例上既放 options 表（key/value 计费配置），
+// 也放 logs 表（消费日志明细），两者表名独立配置。
 type DBConfig struct {
 	Host     string
 	Port     string
 	User     string
 	Password string
 	DBName   string
-	Table    string // 默认 "options"
+	Table    string // options 表名，默认 "options"
+	// LogTable 消费日志表名，默认 "logs"。与 Table 分开：Table 已语义化为
+	// options 表，日志导出复用它会在换库/换表名时互相牵连。
+	LogTable string
 }
 
 func (c DBConfig) dsn() string {
@@ -26,7 +30,9 @@ func (c DBConfig) dsn() string {
 	if port == "" {
 		port = "3306"
 	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&timeout=5s",
+	// readTimeout 给日志导出这种大范围查询留出余量：默认的 timeout=5s 只约束建连，
+	// 长查询在中途挂死时没有 readTimeout 会一直等下去。
+	return fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&timeout=5s&readTimeout=300s",
 		c.User, c.Password, c.Host, port, c.DBName)
 }
 
@@ -35,6 +41,14 @@ func (c DBConfig) tableName() string {
 		return "options"
 	}
 	return c.Table
+}
+
+// LogTableName 消费日志表名，未配置时为 "logs"。
+func (c DBConfig) LogTableName() string {
+	if c.LogTable == "" {
+		return "logs"
+	}
+	return c.LogTable
 }
 
 // dbCachedPrice 单模型价格（USD/MTok），落盘用的精简结构。

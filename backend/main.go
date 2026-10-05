@@ -30,6 +30,7 @@ type jobRecord struct {
 	billPath      string
 	sanitizedPath string
 	mergedPath    string
+	exportedPath  string
 	createdAt     time.Time
 }
 
@@ -82,6 +83,7 @@ func main() {
 	mux.HandleFunc("/api/pull-user-discount", withCORS(requireAuth(handlePullUserDiscount)))
 	mux.HandleFunc("/api/check-prices", withCORS(requireAuth(handleCheckMissingPrices)))
 	mux.HandleFunc("/api/log-groups", withCORS(requireAuth(handleLogGroups)))
+	mux.HandleFunc("/api/export-logs", withCORS(requireAuth(handleExportLogs)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -113,6 +115,8 @@ func initDBConfig() {
 		Password: os.Getenv("BILL_DB_PASSWORD"),
 		DBName:   os.Getenv("BILL_DB_NAME"),
 		Table:    os.Getenv("BILL_DB_TABLE"),
+		// 消费日志表（通常是 logs），与 options 表同实例、表名独立配置。
+		LogTable: os.Getenv("BILL_DB_LOG_TABLE"),
 	}
 }
 
@@ -279,6 +283,153 @@ func handleLogGroups(w http.ResponseWriter, r *http.Request) {
 		"groups": groups,
 		"rowCount": len(rows),
 	})
+}
+
+// maxExportDays 单次导出的时间跨度上限。日志表在 (username, created_at) 上没有
+// 组合索引，跨度过大时查询会扫掉大量行；这里挡一下，避免误操作把库拖垮。
+const maxExportDays = 92
+
+// handleExportLogs 按时间段 + 账号从业务库 logs 表导出消费日志为 tsv，
+// 等价于在服务器上手动跑 mysql -e "SELECT ... > xxx.tsv"，省去人工导出步骤。
+// 导出文件落在 data 目录，可直接作为「生成账单」或「日志合并」的输入。
+func handleExportLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if dbConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置业务数据库连接信息（BILL_DB_HOST 等环境变量）")
+		return
+	}
+	if err := r.ParseMultipartForm(200 << 20); err != nil {
+		// 导出表单只有文本字段，不带文件；非 multipart 时退回解析普通表单。
+		if perr := r.ParseForm(); perr != nil {
+			httpError(w, http.StatusBadRequest, "解析表单失败: "+perr.Error())
+			return
+		}
+	}
+
+	form := formValues(r)
+	usernames := splitList(form["usernames"])
+	if len(usernames) == 0 && len(splitList(form["userIds"])) == 0 {
+		httpError(w, http.StatusBadRequest, "请至少填写一个客户账号或用户 ID")
+		return
+	}
+	userIDs, err := parseIntList(splitList(form["userIds"]))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "用户 ID 必须是整数: "+err.Error())
+		return
+	}
+
+	startRaw := strings.TrimSpace(form["startDate"])
+	endRaw := strings.TrimSpace(form["endDate"])
+	if startRaw == "" || endRaw == "" {
+		httpError(w, http.StatusBadRequest, "请填写开始日期与结束日期")
+		return
+	}
+	// 日期按北京时间解释。容器时区多为 UTC，用 time.Local 会整体偏 8 小时、
+	// 把客户账期错切一天，所以必须显式指定 +08:00。
+	start, err := time.ParseInLocation("2006-01-02", startRaw, cstLocationForHTTP())
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "开始日期格式应为 YYYY-MM-DD")
+		return
+	}
+	endDay, err := time.ParseInLocation("2006-01-02", endRaw, cstLocationForHTTP())
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "结束日期格式应为 YYYY-MM-DD")
+		return
+	}
+	if endDay.Before(start) {
+		httpError(w, http.StatusBadRequest, "结束日期不能早于开始日期")
+		return
+	}
+	// 半开区间：结束日期次日 00:00（不含），与 BETWEEN 当日 23:59:59 等价。
+	end := endDay.AddDate(0, 0, 1)
+	if days := end.Sub(start).Hours() / 24; days > maxExportDays {
+		httpError(w, http.StatusBadRequest,
+			fmt.Sprintf("时间跨度 %.0f 天超过上限 %d 天，请分次导出", days, maxExportDays))
+		return
+	}
+
+	result, err := billing.ExportLogsFromDB(*dbConfig, dataDir, billing.LogExportParams{
+		Usernames:     usernames,
+		UserIDs:       userIDs,
+		IncludeUserID: form["includeUserId"] == "true",
+		StartTime:     start,
+		EndTime:       end,
+	})
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	jobID := newJobID()
+	jobsMu.Lock()
+	jobs[jobID] = jobRecord{exportedPath: result.Path, createdAt: time.Now()}
+	jobsMu.Unlock()
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"jobId":          jobID,
+		"exportedFileName": filepath.Base(result.Path),
+		"exportedUrl":    "/api/download/" + jobID + "/exported",
+		"exportedPath":   result.Path,
+		"rowCount":       result.RowCount,
+		"elapsedSeconds": result.FinishedAt.Sub(result.StartedAt).Seconds(),
+	})
+}
+
+// cstLocationForHTTP 北京时间固定时区，与 aggregate.go 的 cstLocation 同一口径。
+func cstLocationForHTTP() *time.Location {
+	return time.FixedZone("CST", 8*3600)
+}
+
+// formValues 把 multipart 或普通表单统一成 一个 map[string]string。
+func formValues(r *http.Request) map[string]string {
+	out := map[string]string{}
+	if r.MultipartForm != nil {
+		for k, v := range r.MultipartForm.Value {
+			if len(v) > 0 {
+				out[k] = v[0]
+			}
+		}
+	}
+	for k, v := range r.Form {
+		if _, exists := out[k]; !exists && len(v) > 0 {
+			out[k] = v[0]
+		}
+	}
+	return out
+}
+
+// splitList 把多行/逗号分隔的输入拆成去重后的列表。
+func splitList(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == '\r' || r == ',' || r == '，' || r == ' ' || r == '\t'
+	})
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range fields {
+		v := strings.TrimSpace(f)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// parseIntList 把字符串列表解析成整数列表。
+func parseIntList(items []string) ([]int, error) {
+	out := make([]int, 0, len(items))
+	for _, s := range items {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("%q 不是整数", s)
+		}
+		out = append(out, n)
+	}
+	return out, nil
 }
 
 // handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。
@@ -576,6 +727,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		path = rec.sanitizedPath
 	case "merged":
 		path = rec.mergedPath
+	case "exported":
+		path = rec.exportedPath
 	}
 	if path == "" {
 		http.NotFound(w, r)
