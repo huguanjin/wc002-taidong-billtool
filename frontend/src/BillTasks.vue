@@ -26,12 +26,16 @@ const error = ref('')
 const message = ref('')
 
 // 计划表单。id 为 0 表示新建。
+//
+// startAt/endAt 是**北京时间墙上时间**字符串（"YYYY-MM-DDTHH:mm:ss"），
+// 直接绑定 <input type="datetime-local">，中间不经过任何 Date 转换——
+// 后端按 +08:00 解释并回存，前端按原样展示，两边看到的是同一个时刻。
 const planForm = ref({
   id: 0,
   customerId: 0,
   name: '',
-  startDate: '',
-  endDate: '',
+  startAt: '',
+  endAt: '',
   generateSanitized: true,
   generateCost: true,
 })
@@ -174,29 +178,39 @@ async function saveSettings() {
 
 // ---- 计划表单 ----
 
-// 快捷预设：只帮用户少敲几个日期，与账期解析无关（那在服务端按 +08:00 做）。
+// 快捷预设：只帮用户少敲几个数字，与账期解析无关（那在服务端按 +08:00 做）。
+//
+// 用本地日期算「上月/上周」是**可以**的：用户所在时区就是他理解「今天」的时区，
+// 预设只是把这几个数字填进输入框，真正的时间语义由后端按 +08:00 解释。
+// 起止分别补 00:00:00 / 23:59:59，与「整天」的直觉一致（闭区间，末日最后一秒也含）。
 function applyPreset(kind) {
   const today = new Date()
   const fmt = (d) => {
     const p = (n) => String(n).padStart(2, '0')
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
   }
+  const dayStart = (d) => `${fmt(d)}T00:00:00`
+  const dayEnd = (d) => `${fmt(d)}T23:59:59`
+
   if (kind === 'lastMonth') {
     const first = new Date(today.getFullYear(), today.getMonth() - 1, 1)
     const last = new Date(today.getFullYear(), today.getMonth(), 0)
-    planForm.value.startDate = fmt(first)
-    planForm.value.endDate = fmt(last)
+    planForm.value.startAt = dayStart(first)
+    planForm.value.endAt = dayEnd(last)
   } else if (kind === 'lastWeek') {
     // 上一整周（周一~周日）。getDay() 的 0 是周日，换算成 ISO 的周一为起点。
     const dow = (today.getDay() + 6) % 7
     const thisMonday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - dow)
     const lastMonday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 7)
     const lastSunday = new Date(thisMonday.getFullYear(), thisMonday.getMonth(), thisMonday.getDate() - 1)
-    planForm.value.startDate = fmt(lastMonday)
-    planForm.value.endDate = fmt(lastSunday)
+    planForm.value.startAt = dayStart(lastMonday)
+    planForm.value.endAt = dayEnd(lastSunday)
   } else if (kind === 'monthToDate') {
-    planForm.value.startDate = fmt(new Date(today.getFullYear(), today.getMonth(), 1))
-    planForm.value.endDate = fmt(today)
+    planForm.value.startAt = dayStart(new Date(today.getFullYear(), today.getMonth(), 1))
+    planForm.value.endAt = dayEnd(today)
+  } else if (kind === 'today') {
+    planForm.value.startAt = dayStart(today)
+    planForm.value.endAt = dayEnd(today)
   }
 }
 
@@ -205,8 +219,8 @@ function resetPlanForm() {
     id: 0,
     customerId: planForm.value.customerId || 0,
     name: '',
-    startDate: '',
-    endDate: '',
+    startAt: '',
+    endAt: '',
     generateSanitized: planForm.value.generateSanitized,
     generateCost: planForm.value.generateCost,
   }
@@ -216,12 +230,14 @@ function startEditPlan(t) {
   error.value = ''
   message.value = ''
   showPlanForm.value = true
+  // startAt/endAt 由后端给出北京时间墙上时间，原样回填，不做时区换算——
+  // 换算一次就可能偏 8 小时，而且用户看不出哪里错了。
   planForm.value = {
     id: t.id,
     customerId: t.customerId,
     name: t.name || '',
-    startDate: t.startTime ? t.startTime.slice(0, 10) : '',
-    endDate: t.endTime ? t.endTime.slice(0, 10) : '',
+    startAt: t.startAt || '',
+    endAt: t.endAt || '',
     generateSanitized: !!t.generateSanitized,
     generateCost: !!t.generateCost,
   }
@@ -235,10 +251,10 @@ async function savePlan() {
     error.value = '请选择客户'
     return
   }
-  const hasStart = String(planForm.value.startDate || '').trim() !== ''
-  const hasEnd = String(planForm.value.endDate || '').trim() !== ''
+  const hasStart = String(planForm.value.startAt || '').trim() !== ''
+  const hasEnd = String(planForm.value.endAt || '').trim() !== ''
   if (hasStart !== hasEnd) {
-    error.value = '开始日期与结束日期必须同时填写'
+    error.value = '开始时间与结束时间必须同时填写'
     return
   }
 
@@ -251,8 +267,8 @@ async function savePlan() {
         id: planForm.value.id || 0,
         customerId: planForm.value.customerId,
         name: planForm.value.name,
-        startDate: planForm.value.startDate,
-        endDate: planForm.value.endDate,
+        startAt: planForm.value.startAt,
+        endAt: planForm.value.endAt,
         generateSanitized: planForm.value.generateSanitized,
         generateCost: planForm.value.generateCost,
       }),
@@ -453,9 +469,22 @@ function periodLabel(t) {
   return `${t.periodYear}-${String(t.periodMonth).padStart(2, '0')}`
 }
 
+// rangeLabel 显示计划时段。用后端给的北京时间墙上时间，只做字符串裁剪，
+// 不 new Date()——那会按浏览器本地时区解释，服务端在 UTC 时显示会偏 8 小时。
+//
+// 起止都是 00:00:00 / 23:59:59 时只显示日期：整天区间写成「09-01 00:00:00 ~ 09-07
+// 23:59:59」噪音太大，而这类区间恰恰是最常见的。
 function rangeLabel(t) {
-  if (!t.startTime || !t.endTime) return '未设置时段'
-  return `${t.startTime.slice(0, 10)} ~ ${t.endTime.slice(0, 10)}`
+  const s = t.startAt || ''
+  const e = t.endAt || ''
+  if (!s || !e) return '未设置时段'
+  const short = (v) => {
+    const date = v.slice(0, 10)
+    const time = v.slice(11, 19)
+    if (time === '00:00:00' || time === '23:59:59') return date
+    return `${date} ${time}`
+  }
+  return `${short(s)} ~ ${short(e)}`
 }
 
 // 三态：未执行 / 已执行未核算成本 / 已执行有成本。
@@ -580,12 +609,12 @@ defineExpose({ loadAll })
           <input v-model="planForm.name" type="text" placeholder="例如：9月第1周" />
         </label>
         <label>
-          <span>开始日期</span>
-          <input v-model="planForm.startDate" type="date" />
+          <span>开始时间</span>
+          <input v-model="planForm.startAt" type="datetime-local" step="1" />
         </label>
         <label>
-          <span>结束日期</span>
-          <input v-model="planForm.endDate" type="date" />
+          <span>结束时间</span>
+          <input v-model="planForm.endAt" type="datetime-local" step="1" />
         </label>
       </div>
 
@@ -594,6 +623,7 @@ defineExpose({ loadAll })
         <button type="button" class="btn-browse" @click="applyPreset('lastMonth')">上月整月</button>
         <button type="button" class="btn-browse" @click="applyPreset('lastWeek')">上周（周一~周日）</button>
         <button type="button" class="btn-browse" @click="applyPreset('monthToDate')">本月至今</button>
+        <button type="button" class="btn-browse" @click="applyPreset('today')">今天</button>
       </div>
 
       <div class="checkboxes">
@@ -608,7 +638,8 @@ defineExpose({ loadAll })
         <span class="hint inline">时段可留空先建计划，之后再补。单次跨度上限 92 天。</span>
       </div>
       <p class="hint">
-        归属账期按<strong>开始日期</strong>所在月计算，跨月计划（如 8/28~9/3）整个计入开始月。
+        时间按<strong>北京时间</strong>解释，起止两端都包含在内（结束那一刻的日志不会被漏掉）。
+        归属账期按<strong>开始时间</strong>所在月计算，跨月计划（如 8/28~9/3）整个计入开始月。
       </p>
     </div>
 

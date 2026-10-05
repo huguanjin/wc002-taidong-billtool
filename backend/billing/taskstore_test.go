@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 	"time"
@@ -225,4 +226,80 @@ func TestBillTaskDisplayName(t *testing.T) {
 
 	noBoth := BillTask{CustomerName: "示例科技"}
 	assert.Equal(t, "示例科技", noBoth.DisplayName(), "连时段都没有时至少给出客户名")
+}
+
+// TestBillTaskWallClockJSON 时段以**北京时间墙上时间**字符串暴露给前端。
+//
+// 这是前后端时区往返的关键一环：前端的 <input type="datetime-local"> 没有时区概念，
+// 若把带偏移的 RFC3339 喂给它，浏览器会按本地时区换算——服务端在 UTC 时，
+// 用户来回编辑一次计划就整体偏 8 小时，而且界面上看不出任何异常。
+func TestBillTaskWallClockJSON(t *testing.T) {
+	// 库里存的是带时区的时刻；序列化出来必须是北京时间的墙上表示。
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, cstLocation)
+	end := time.Date(2026, 9, 30, 23, 59, 59, 0, cstLocation)
+	task := BillTask{ID: 1, Name: "9月", StartTime: &start, EndTime: &end}
+
+	raw, err := json.Marshal(task)
+	require.NoError(t, err)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &got))
+
+	assert.Equal(t, "2026-09-01T00:00:00", got["startAt"], "必须是北京时间墙上时间")
+	assert.Equal(t, "2026-09-30T23:59:59", got["endAt"])
+
+	// 反证：同一时刻若按 UTC 表示会是 8 月 31 日 16:00——证明转换真的发生了。
+	utcWall := start.UTC().Format(WallClockLayout)
+	assert.Equal(t, "2026-08-31T16:00:00", utcWall, "构造反证的前提")
+	assert.NotEqual(t, utcWall, got["startAt"], "不能把 UTC 墙上时间给前端")
+}
+
+// TestBillTaskWallClockJSONUnset 未设置时段时给空串，不给零值日期。
+//
+// 零值会序列化成 "0001-01-01T00:00:00"，前端的日期输入框会显示一个荒唐的年份，
+// 用户以为计划被改坏了。
+func TestBillTaskWallClockJSONUnset(t *testing.T) {
+	task := BillTask{ID: 1, Name: "还没定时段"}
+
+	raw, err := json.Marshal(task)
+	require.NoError(t, err)
+
+	var got map[string]interface{}
+	require.NoError(t, json.Unmarshal(raw, &got))
+
+	assert.Equal(t, "", got["startAt"])
+	assert.Equal(t, "", got["endAt"])
+}
+
+// TestWallClockRoundTrip 往返一致性：后端给出去的墙上时间，被前端原样回传后
+// 解析回来必须是**同一个时刻**。
+//
+// 这一条覆盖的正是「编辑计划」的完整链路：读取 → 回填输入框 → 用户不改 → 保存。
+// 中间任何一次时区换算都会让时刻漂移，而漂移后的账单会多算或少算那几小时的消费。
+func TestWallClockRoundTrip(t *testing.T) {
+	original := time.Date(2026, 9, 1, 0, 0, 0, 0, cstLocation)
+	task := BillTask{StartTime: &original, EndTime: &original}
+
+	// 1. 后端 → 前端：拿到墙上时间字符串。
+	wall := task.StartAt()
+	assert.Equal(t, "2026-09-01T00:00:00", wall)
+
+	// 2. 前端原样回传 → 后端解析（与 handleSaveBillTask 走同一个函数）。
+	parsed, _, err := ParseExportTime(wall)
+	require.NoError(t, err)
+
+	// 3. 必须还是同一个时刻。
+	assert.True(t, original.Equal(parsed),
+		"往返后时刻漂移了：原 %s，解析回 %s", original, parsed)
+	assert.Equal(t, 0, parsed.Hour(), "小时数必须保持 0，不能被时区差值改掉")
+
+	// 精确到秒的场景：峰谷计费依赖请求时刻，秒级漂移也会影响金额。
+	withSeconds := time.Date(2026, 9, 1, 13, 45, 30, 0, cstLocation)
+	task2 := BillTask{StartTime: &withSeconds}
+	wall2 := task2.StartAt()
+	assert.Equal(t, "2026-09-01T13:45:30", wall2)
+
+	parsed2, _, err := ParseExportTime(wall2)
+	require.NoError(t, err)
+	assert.True(t, withSeconds.Equal(parsed2), "秒级时刻往返后也必须完全一致")
 }

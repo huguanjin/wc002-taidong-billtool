@@ -2,6 +2,7 @@ package billing
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -77,6 +78,63 @@ type BillTask struct {
 // 用它区分「还没跑」与「跑了但没成本」——这两种在金额列上都是空，
 // 但含义完全不同：前者不该计入月度汇总，后者要计入并标注成本不全。
 func (t BillTask) HasRun() bool { return t.LastRunAt != nil }
+
+// WallClockLayout 北京时间墙上时间的展示格式，精确到秒。
+//
+// 用它而不是 RFC3339：前端的 <input type="datetime-local"> 是没有时区概念
+// 的墙上时间，若把带偏移的 RFC3339 直接喂给它，浏览器会按**本地时区**换算——
+// 服务端在 UTC 时，来回编辑一次计划就整体偏 8 小时，而用户看不到任何提示。
+// 所以接口统一给出「北京时间看上去是什么样」的字符串，前端原样绑定。
+const WallClockLayout = "2006-01-02T15:04:05"
+
+// StartAt 开始时刻的北京时间墙上时间，形如 "2026-09-01T00:00:00"。
+// 未设置时段时是空串——不能给零值的 "0001-01-01T00:00:00"，
+// 那会让前端的日期输入框显示一个荒唐的日期。
+func (t BillTask) StartAt() string {
+	if t.StartTime == nil {
+		return ""
+	}
+	return t.StartTime.In(cstLocation).Format(WallClockLayout)
+}
+
+// EndAt 结束时刻的北京时间墙上时间。同 StartAt。
+func (t BillTask) EndAt() string {
+	if t.EndTime == nil {
+		return ""
+	}
+	return t.EndTime.In(cstLocation).Format(WallClockLayout)
+}
+
+// billTaskWire 是 BillTask 的镜像类型：同样的字段与 JSON tag，但**没有方法**。
+//
+// 必须有它，否则会栈溢出：若直接嵌入 BillTask，后者的 MarshalJSON 会被提升到
+// taskJSON 上，json.Marshal(taskJSON) 又调回 BillTask.MarshalJSON，无限递归。
+// Go 的定义类型不继承方法，所以这里断得干净。
+type billTaskWire BillTask
+
+// taskJSON 是 BillTask 对外序列化的形态：原始字段 + 两个墙上时间字符串。
+//
+// 为什么不给 BillTask 直接加 StartAt/EndAt 字段：StartTime/EndTime 是 *time.Time，
+// 参与全部业务逻辑；墙上时间是**同一份数据的另一种表示**，只给前端用。
+// 两套字段并存就会有两个真相来源，迟早有人改了一个忘了另一个。
+type taskJSON struct {
+	billTaskWire
+	StartAt string `json:"startAt"`
+	EndAt   string `json:"endAt"`
+}
+
+// MarshalJSON 让 BillTask 直接序列化成带墙上时间的形态。
+//
+// 这样所有 writeJSON(task) 的地方都自动带上 startAt/endAt，
+// 不必在每个 handler 里各拼一次——漏一处前端就会拿到空值，
+// 而空值在编辑框里表现为「时段被清空了」，很难查。
+func (t BillTask) MarshalJSON() ([]byte, error) {
+	return json.Marshal(taskJSON{
+		billTaskWire: billTaskWire(t),
+		StartAt:      t.StartAt(),
+		EndAt:        t.EndAt(),
+	})
+}
 
 // EnsureBillTaskSchema 建表（幂等）+ 迁移（幂等），启动时调用一次。
 //

@@ -635,14 +635,15 @@ func handleBillTasks(w http.ResponseWriter, r *http.Request) {
 
 // taskInput 新建/编辑计划的请求体。
 //
-// 时段用两个日期字符串而不是时间戳：前端是 <input type="date">，
-// 按北京时间解析（ParseExportTime 内部走 +08:00），与导出日志同一套口径。
+// 时段用两个时间字符串：前端是 <input type="datetime-local" step="1">，
+// 精确到秒。ParseExportTime 也能接受只有日期的形态（如 "2026-09-30"），
+// 那时结束时间会补到当天 23:59:59——与手动导出的区间语义一致。
 type taskInput struct {
 	ID                int64  `json:"id"` // 0 = 新建
 	CustomerID        int64  `json:"customerId"`
 	Name              string `json:"name"`
-	StartDate         string `json:"startDate"`
-	EndDate           string `json:"endDate"`
+	StartAt           string `json:"startAt"`
+	EndAt             string `json:"endAt"`
 	GenerateSanitized bool   `json:"generateSanitized"`
 	GenerateCost      bool   `json:"generateCost"`
 }
@@ -671,10 +672,10 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 
 	// 解析时段。两个都空是允许的（先建计划、后补时段），
 	// 但只填一个没意义——查库区间缺一端。
-	hasStart := strings.TrimSpace(in.StartDate) != ""
-	hasEnd := strings.TrimSpace(in.EndDate) != ""
+	hasStart := strings.TrimSpace(in.StartAt) != ""
+	hasEnd := strings.TrimSpace(in.EndAt) != ""
 	if hasStart != hasEnd {
-		httpError(w, http.StatusBadRequest, "开始日期与结束日期必须同时填写")
+		httpError(w, http.StatusBadRequest, "开始时间与结束时间必须同时填写")
 		return
 	}
 
@@ -688,9 +689,9 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 
 	if hasStart && hasEnd {
 		// ResolveExportRange 复用导出日志的同一套解析：一律按 +08:00，
-		// 只给日期时结束日补到当天 23:59:59（含），与手动导出的区间语义一致。
+		// 给完整时刻就按秒精确；只给日期则结束日补到当天 23:59:59（含）。
 		// 它只校验起止顺序，跨度上限由 billing 侧的 validatePlanRange 兜。
-		start, end, err := billing.ResolveExportRange(in.StartDate, in.EndDate)
+		start, end, err := billing.ResolveExportRange(in.StartAt, in.EndAt)
 		if err != nil {
 			httpError(w, http.StatusBadRequest, err.Error())
 			return
