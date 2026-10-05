@@ -93,6 +93,7 @@ func main() {
 	mux.HandleFunc("/api/pull-channels", withCORS(requireAuth(handlePullChannels)))
 	mux.HandleFunc("/api/channels", withCORS(requireAuth(handleChannels)))
 	mux.HandleFunc("/api/channel-ratios", withCORS(requireAuth(handleSaveChannelRatios)))
+	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -289,7 +290,7 @@ func handleLogGroups(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"groups": groups,
+		"groups":   groups,
 		"rowCount": len(rows),
 	})
 }
@@ -367,12 +368,12 @@ func handleExportLogs(w http.ResponseWriter, r *http.Request) {
 	jobsMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"jobId":          jobID,
+		"jobId":            jobID,
 		"exportedFileName": filepath.Base(result.Path),
-		"exportedUrl":    "/api/download/" + jobID + "/exported",
-		"exportedPath":   result.Path,
-		"rowCount":       result.RowCount,
-		"elapsedSeconds": result.FinishedAt.Sub(result.StartedAt).Seconds(),
+		"exportedUrl":      "/api/download/" + jobID + "/exported",
+		"exportedPath":     result.Path,
+		"rowCount":         result.RowCount,
+		"elapsedSeconds":   result.FinishedAt.Sub(result.StartedAt).Seconds(),
 	})
 }
 
@@ -448,7 +449,7 @@ func handleDataLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"files":  files,
+		"files":   files,
 		"dataDir": dataDir,
 	})
 }
@@ -582,6 +583,107 @@ func handleSaveChannelRatios(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"saved": len(body.Items)})
+}
+
+// handleCheckChannels 出账前预检：读一遍日志，列出用到的渠道及其倍率维护情况。
+//
+// 与 /api/check-prices 同属「出账前预检」：不写任何账单文件，处理完立即清理临时上传的日志。
+// 存在的意义是把「渠道没维护倍率」这个结论提前到出账之前——
+// 否则要等账单生成完才在响应里看到 costBlocked，白跑一遍出账。
+func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），无法检查渠道倍率")
+		return
+	}
+	if err := r.ParseMultipartForm(200 << 20); err != nil {
+		httpError(w, http.StatusBadRequest, "解析上传表单失败: "+err.Error())
+		return
+	}
+
+	jobID := newJobID()
+	jobPath := filepath.Join(jobDir, jobID)
+	if err := os.MkdirAll(jobPath, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer os.RemoveAll(jobPath)
+
+	inputPath, err := resolveInputFile(r, jobPath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	form := r.MultipartForm.Value
+	headers, rows, err := billing.LoadLogRows(inputPath, formValue(form, "sheet"), formValue(form, "encoding"))
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, "读取日志失败: "+err.Error())
+		return
+	}
+
+	channelIDs, err := billing.ExtractChannelIDs(headers, rows)
+	if err != nil {
+		// 日志没有 channel_id 列：这不是「检查失败」，而是这份日志做不了成本估算。
+		// 明确说清原因与下一步动作，页面才好引导用户重新导出。
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"hasChannelColumn": false,
+			"message":          err.Error(),
+		})
+		return
+	}
+
+	ratios, err := billing.ChannelRatioMap(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	channelList, err := billing.ListChannels(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	nameMap := make(map[int]string, len(channelList))
+	infoMap := make(map[int]billing.ChannelInfo, len(channelList))
+	for _, c := range channelList {
+		nameMap[c.ChannelID] = c.Name
+		infoMap[c.ChannelID] = c.ChannelInfo
+	}
+	// 日志里出现、但本地渠道清单里没有的渠道号，也要能就地补录，
+	// 否则用户只能先去拉一次清单；这里把它们按「未知渠道」补进清单供填写。
+	for _, id := range channelIDs {
+		if _, ok := infoMap[id]; !ok {
+			infoMap[id] = billing.ChannelInfo{ChannelID: id, Name: fmt.Sprintf("渠道 %d（渠道清单里没有）", id)}
+		}
+	}
+
+	status := billing.CheckUpstreamRatios(channelIDs, ratios, infoMap)
+
+	// 把「日志里用到的渠道」整份返回（含已维护的），页面可直接就地编辑补录。
+	used := make([]billing.ChannelWithRatio, 0, len(channelIDs))
+	for _, id := range channelIDs {
+		info := infoMap[id]
+		cw := billing.ChannelWithRatio{ChannelInfo: info}
+		if v, ok := ratios[id]; ok {
+			ratio := v
+			cw.UpstreamRatio = &ratio
+		}
+		used = append(used, cw)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"hasChannelColumn":  true,
+		"usedChannels":      used,
+		"maintainedCount":   len(status.Maintained),
+		"missingCount":      len(status.Missing),
+		"unknownCount":      len(status.UnknownChannelIDs),
+		"missingChannels":   status.Missing,
+		"unknownChannelIds": status.UnknownChannelIDs,
+		"channelTableEmpty": len(channelList) == 0,
+	})
 }
 
 // handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。
