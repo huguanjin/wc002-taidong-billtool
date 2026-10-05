@@ -129,8 +129,29 @@ func (w *ExcelSanitizedWriter) Close() error {
 
 func strPtr(s string) *string { return &s }
 
+// extraColumn 模板表在 AC 之后追加的一列，供成本表使用（账单不追加任何列）。
+//
+// 抽成数据而不是复制一份写出逻辑：成本表与账单要求前 29 列逐列同构，
+// 一旦各写一份，两边必然随时间走偏（列宽、样式、公式引用的差异会悄悄累积）。
+type extraColumn struct {
+	Title string
+	// write 写入第 rowIdx 行的该列。formula 非空时写公式，否则写 value。
+	write func(rowIdx, r int, exchangeRate float64) (value interface{}, formula string)
+	// sumInTotal 合计行是否对该列求 SUM。
+	sumInTotal bool
+	// money 该列是否套人民币金额格式。
+	money bool
+}
+
 // WriteBillFromTemplate 按账单模板列写出账单，返回缺少定价的 (model/group) 列表。
 func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
+	return writeTemplateSheet(templatePath, outputPath, rows, nil, year, month, book,
+		discount, exchangeRate, preferPriceTable, manualMarkers)
+}
+
+// writeTemplateSheet 是账单与成本表共用的写出核心：前 29 列语义完全一致，
+// extras 为空即账单，非空则在 AC 之后追加各列（成本表用）。
+func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras []extraColumn, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
 	if _, err := os.Stat(templatePath); err != nil {
 		return nil, fmt.Errorf("账单模板不存在: %s", templatePath)
 	}
@@ -181,6 +202,15 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 	styleBold, err := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}})
 	if err != nil {
 		return nil, err
+	}
+
+	// 追加列的表头由代码写：模板文件里 AC 之后是空的，成本表要自己补表头。
+	// 起始列固定为 AC 之后，与 buildLogExportColumns 的既有列布局对齐。
+	const extraStartCol = 29 + 1 // AD
+	for i, ex := range extras {
+		if err := f.SetCellValue(sheet, mustAxis(extraStartCol+i, 1), ex.Title); err != nil {
+			return nil, err
+		}
 	}
 
 	firstDataRow := 3
@@ -407,6 +437,33 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		if len(notes) > 0 {
 			setStr(28, r, strings.Join(notes, "；"))
 		}
+
+		// 追加列（成本表的渠道/上游折扣/上游成本）。写在这里是为了让它的值
+		// 能引用同行的 AC，公式在 Excel 里可追溯而不是写死的数。
+		for i, ex := range extras {
+			col := extraStartCol + i
+			value, formula := ex.write(offset, r, exchangeRate)
+			axis := axisOf(col, r)
+			switch {
+			case formula != "":
+				f.SetCellFormula(sheet, axis, formula)
+				if ex.money {
+					f.SetCellStyle(sheet, axis, axis, styleMoney)
+				}
+			case value == nil:
+				// 形如「上游倍率没维护」：必须留空而不是写 0。
+				// 写 0 会被读成「上游免费」，把毛利虚高。
+				f.SetCellValue(sheet, axis, "")
+			default:
+				f.SetCellValue(sheet, axis, value)
+				switch {
+				case ex.money:
+					f.SetCellStyle(sheet, axis, axis, styleMoney)
+				case isDiscountColumn(ex):
+					f.SetCellStyle(sheet, axis, axis, styleDiscount)
+				}
+			}
+		}
 	}
 
 	lastDataRow := firstDataRow + len(rows) - 1
@@ -426,6 +483,11 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 	setTotalFormula(22, styleMoneyBold)
 	setTotalFormula(23, styleMoneyBold)
 	setTotalFormula(29, styleMoneyBold)
+	for i, ex := range extras {
+		if ex.sumInTotal {
+			setTotalFormula(extraStartCol+i, styleMoneyBold)
+		}
+	}
 
 	axisT := axisOf(20, totalRow)
 	f.SetCellFormula(sheet, axisT, fmt.Sprintf("IF(S%d=0,0,V%d/S%d)", totalRow, totalRow, totalRow))
@@ -435,6 +497,23 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		return nil, err
 	}
 	return missingPrices, nil
+}
+
+// mustAxis 把 (列,行) 转成单元格坐标。列/行都是代码里算出来的常量或循环变量，
+// 不会越界，出错时返回空串让 Excel 侧报错而不是掩盖。
+func mustAxis(col, row int) string {
+	axis, err := excelize.CoordinatesToCellName(col, row)
+	if err != nil {
+		return ""
+	}
+	return axis
+}
+
+// isDiscountColumn 判断追加列是否该套「折扣」格式（3 位小数）。
+// 折扣与金额用不同格式：折扣是比值（0.057），金额是人民币（43.6205），
+// 共用金额格式会把折扣显示成 0.0570，与 T 列的既有观感不一致。
+func isDiscountColumn(ex extraColumn) bool {
+	return !ex.money && !ex.sumInTotal
 }
 
 // appendNote 追加一条备注，空串忽略，避免在账单 AB 列留下孤立的「；」。

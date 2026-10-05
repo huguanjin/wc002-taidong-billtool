@@ -234,6 +234,7 @@ const form = ref({
   sanitizedFormat: 'tsv',
   includeBillingParams: false,
   keepLog: false,
+  generateCost: false,
 })
 
 const loading = ref(false)
@@ -409,6 +410,143 @@ const exportForm = ref({
   includeUserId: false,
   ...defaultExportRange(),
 })
+
+// 渠道成本倍率维护：拉取业务库渠道清单，人工填上游倍率。
+// 成本表被拦下时点「去维护」要能滚到渠道卡片。
+const channelCard = ref(null)
+
+const channels = ref([])
+const channelsLoaded = ref(false)
+const loadingChannels = ref(false)
+const pullingChannels = ref(false)
+const savingChannels = ref(false)
+const channelsError = ref('')
+const channelsMessage = ref('')
+// ratioDraft 渠道ID → 输入框里的倍率文本（空串表示未维护）。
+const ratioDraft = ref({})
+const ratioNotes = ref({})
+
+const missingChannelCount = computed(
+  () => channels.value.filter((c) => !ratioDraft.value[c.channelId]).length
+)
+
+function syncChannelDraft(list) {
+  const rd = {}
+  const rn = {}
+  for (const c of list) {
+    rd[c.channelId] = c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
+    rn[c.channelId] = c.note || ''
+  }
+  ratioDraft.value = rd
+  ratioNotes.value = rn
+}
+
+async function loadChannels() {
+  channelsError.value = ''
+  loadingChannels.value = true
+  try {
+    const resp = await fetch('/api/channels')
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      channelsError.value = data.error || `读取失败（${resp.status}）`
+      return
+    }
+    channels.value = data.channels || []
+    channelsLoaded.value = true
+    syncChannelDraft(channels.value)
+  } catch (err) {
+    channelsError.value = '读取失败：' + err.message
+  } finally {
+    loadingChannels.value = false
+  }
+}
+
+async function pullChannels() {
+  channelsError.value = ''
+  channelsMessage.value = ''
+  pullingChannels.value = true
+  try {
+    const resp = await fetch('/api/pull-channels', { method: 'POST' })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      channelsError.value = data.error || `拉取失败（${resp.status}）`
+      return
+    }
+    channels.value = data.channels || []
+    channelsLoaded.value = true
+    syncChannelDraft(channels.value)
+    channelsMessage.value = `已拉取 ${data.pulled} 个渠道。`
+  } catch (err) {
+    channelsError.value = '拉取失败：' + err.message
+  } finally {
+    pullingChannels.value = false
+  }
+}
+
+// 只提交「有改动」的项：把整个清单发回去会把没碰过的渠道也写成当前值，
+// 万一别处改过就被这里覆盖了。
+async function saveChannelRatios() {
+  channelsError.value = ''
+  channelsMessage.value = ''
+  const items = []
+  for (const c of channels.value) {
+    const raw = (ratioDraft.value[c.channelId] ?? '').trim()
+    const before = c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
+    const noteBefore = c.note || ''
+    const noteNow = ratioNotes.value[c.channelId] || ''
+    if (raw === before && noteNow === noteBefore) continue
+
+    if (raw === '') {
+      // 清空表示「取消维护」，发 null。
+      items.push({ channelId: c.channelId, upstreamRatio: null, note: noteNow })
+      continue
+    }
+    const num = Number(raw)
+    if (!Number.isFinite(num) || num < 0) {
+      channelsError.value = `渠道 ${c.channelId} 的倍率必须是非负数字`
+      return
+    }
+    items.push({ channelId: c.channelId, upstreamRatio: num, note: noteNow })
+  }
+
+  if (items.length === 0) {
+    channelsMessage.value = '没有改动需要保存。'
+    return
+  }
+
+  savingChannels.value = true
+  try {
+    const resp = await fetch('/api/channel-ratios', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) authenticated.value = false
+      channelsError.value = data.error || `保存失败（${resp.status}）`
+      return
+    }
+    channelsMessage.value = `已保存 ${data.saved} 个渠道的倍率。`
+    await loadChannels()
+  } catch (err) {
+    channelsError.value = '保存失败：' + err.message
+  } finally {
+    savingChannels.value = false
+  }
+}
+
+function focusChannelCard() {
+  const el = channelCard.value
+  if (!el) return
+  // Vue 3 里 ref 在普通元素上就是 DOM 节点；兜底一下 $el 以防写法变化。
+  const node = el.$el || el
+  if (node && typeof node.scrollIntoView === "function") {
+    node.scrollIntoView({ behavior: "smooth", block: "start" })
+  }
+}
 
 async function exportLogs() {
   exportError.value = ''
@@ -642,6 +780,7 @@ async function handleSubmit() {
   fd.append('sanitizedFormat', form.value.sanitizedFormat)
   fd.append('includeBillingParams', String(form.value.includeBillingParams))
   fd.append('keepLog', String(form.value.keepLog))
+  fd.append('generateCost', String(form.value.generateCost))
 
   const manualEntries = {}
   for (const [model, p] of Object.entries(manualPrices.value)) {
@@ -782,6 +921,79 @@ async function handleSubmit() {
         </div>
       </div>
     </form>
+
+    <div class="card" ref="channelCard">
+      <h2>渠道成本倍率维护</h2>
+      <p class="hint">
+        拉取业务库 channels 表的渠道清单，为每个渠道填一个上游分组倍率。
+        成本表按「官方刊例 × (上游倍率 ÷ 7)」估算上游成本，与站内折扣同一套换算基准。
+        只读业务库，倍率只存在本地，不会回写。
+      </p>
+      <p class="hint">
+        未维护倍率的渠道不会被估算——成本列留空并排除在合计之外，
+        而不是按 0 算（那会让成本虚低）。
+      </p>
+
+      <div class="path-row">
+        <button type="button" class="btn-browse" @click="pullChannels" :disabled="pullingChannels">
+          {{ pullingChannels ? '拉取中…' : '拉取渠道清单' }}
+        </button>
+        <button type="button" class="btn-browse" @click="loadChannels" :disabled="loadingChannels">
+          {{ loadingChannels ? '读取中…' : '刷新' }}
+        </button>
+        <button
+          type="button"
+          class="btn-browse"
+          @click="saveChannelRatios"
+          :disabled="savingChannels || channels.length === 0"
+        >
+          {{ savingChannels ? '保存中…' : '保存倍率' }}
+        </button>
+      </div>
+      <p class="error" v-if="channelsError">{{ channelsError }}</p>
+      <span class="hint" v-if="channelsMessage">{{ channelsMessage }}</span>
+      <span class="hint" v-if="channelsLoaded && missingChannelCount > 0">
+        还有 {{ missingChannelCount }} 个渠道未维护倍率。
+      </span>
+
+      <table v-if="channels.length > 0">
+        <thead>
+          <tr>
+            <th>渠道 ID</th>
+            <th>渠道名称</th>
+            <th>类型</th>
+            <th>状态</th>
+            <th>上游倍率</th>
+            <th>备注</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="c in channels" :key="c.channelId" :class="{ 'row-missing': !ratioDraft[c.channelId] }">
+            <td>{{ c.channelId }}</td>
+            <td>{{ c.name }}</td>
+            <td>{{ c.channelType }}</td>
+            <td>{{ c.status === 1 ? '启用' : c.status }}</td>
+            <td>
+              <input
+                v-model="ratioDraft[c.channelId]"
+                type="number"
+                step="0.01"
+                min="0"
+                placeholder="未维护"
+                class="ratio-input"
+              />
+            </td>
+            <td><input v-model="ratioNotes[c.channelId]" type="text" placeholder="可选" /></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="hint" v-else-if="!loadingChannels && channelsLoaded">
+        本地还没有渠道清单，先点「拉取渠道清单」。
+      </span>
+      <span class="hint" v-else-if="!channelsLoaded">
+        点「刷新」查看已拉取的渠道清单。
+      </span>
+    </div>
 
     <form class="card" @submit.prevent="pullUserDiscount">
       <h2>客户折扣核对</h2>
@@ -1119,6 +1331,7 @@ async function handleSubmit() {
           <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
         </select>
         <label><input v-model="form.includeBillingParams" type="checkbox" /> 附带计费参数列（模型/分组倍率等内部参数，默认不导出）</label>
+        <label><input v-model="form.generateCost" type="checkbox" /> 生成成本表（账单全部列 + 渠道/上游折扣/上游成本，需先维护渠道倍率）</label>
       </div>
 
       <button type="submit" :disabled="loading">{{ loading ? '生成中…' : '生成账单' }}</button>
@@ -1146,6 +1359,25 @@ async function handleSubmit() {
       <div class="downloads">
         <a class="btn" :href="result.billUrl">下载账单：{{ result.billFileName }}</a>
         <a class="btn" v-if="result.sanitizedUrl" :href="result.sanitizedUrl">下载脱敏日志：{{ result.sanitizedFileName }}</a>
+        <a class="btn" v-if="result.costUrl" :href="result.costUrl">下载成本表：{{ result.costFileName }}</a>
+      </div>
+
+      <!-- 成本表被拦下：账单已生成，只是有渠道没维护倍率。不是错误，给出补录入口。 -->
+      <div v-if="result.costBlocked" class="cost-blocked">
+        <p class="error">
+          成本表未生成：有渠道还没维护上游倍率。账单已正常生成，补录后重新生成即可。
+        </p>
+        <p v-if="result.missingChannels && result.missingChannels.length > 0">
+          <strong>待补录渠道</strong>：
+          <span v-for="c in result.missingChannels" :key="c.channelId">
+            {{ c.name }}（{{ c.channelId }}）
+          </span>
+        </p>
+        <p v-if="result.unknownChannelIds && result.unknownChannelIds.length > 0" class="hint">
+          另有 {{ result.unknownChannelIds.length }} 个渠道号在渠道表里查不到（{{ result.unknownChannelIds.join('，') }}）——
+          这些渠道多半已在业务库被删除，无法维护倍率，成本表里会如实留空。
+        </p>
+        <button type="button" class="btn-browse" @click="focusChannelCard">去维护渠道倍率</button>
       </div>
 
       <table>
@@ -1281,6 +1513,19 @@ async function handleSubmit() {
   background: #2c6ef2;
   color: #fff;
   border-color: #2c6ef2;
+}
+.ratio-input {
+  width: 100px;
+}
+.row-missing {
+  background: #fff8e1;
+}
+.cost-blocked {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border: 1px solid #f0c36d;
+  border-radius: 4px;
+  background: #fffdf5;
 }
 .group-picker {
   display: flex;

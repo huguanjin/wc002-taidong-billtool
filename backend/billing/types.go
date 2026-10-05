@@ -197,6 +197,17 @@ type Params struct {
 	// IncludeBillingParams 控制脱敏日志是否附带站点内部计费参数列（见 SanitizedBillingColumns）。
 	// 默认 false：这些字段暴露内部定价倍率，是否对客户可见属于商务决定。
 	IncludeBillingParams bool
+	// GenerateCost 是否额外生成一张成本表（账单全部列 + 渠道/上游折扣/上游成本）。
+	// 需要日志含 channel_id 列，且日志用到的渠道都已维护上游倍率。
+	GenerateCost bool
+	// ChannelUpstreamRatios 渠道 ID → 上游倍率。由 handler 从本地 PG 读好传入，
+	// billing 包不直接连 PG——保持「读配置」与「算账」分离，也便于测试注入。
+	ChannelUpstreamRatios map[int]float64
+	// ChannelNames 渠道 ID → 渠道名称（来自本地渠道清单快照）。
+	ChannelNames map[int]string
+	// ChannelInfos 渠道 ID → 渠道信息，用于成本估算前的倍率检查。
+	ChannelInfos map[int]ChannelInfo
+
 	// DomesticMarkers 人工标记的国产/站内定价标识：一条一个，可以是分组标识
 	// （精确匹配，如「国产模型」），也可以是模型名前缀（前缀匹配，如「doubao」）。
 	// 命中的 (模型,分组) 不参与折扣反推——模型名推厂商家族覆盖不全，识别不到时

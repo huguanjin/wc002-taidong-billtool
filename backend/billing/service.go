@@ -13,7 +13,17 @@ import (
 type GenerateResult struct {
 	BillPath      string
 	SanitizedPath string // 为空表示未生成
-	Summary       Summary
+	// CostPath 成本表路径；为空表示未生成（未勾选、或倍率未维护被拦下）。
+	CostPath string
+	// CostBlocked 为真表示用户勾了生成成本表，但有渠道尚未维护上游倍率，
+	// 于是没有生成成本表。**这不是错误**——硬报错会让用户丢掉已填好的出账参数。
+	// 调用方应把 MissingChannelInfos / UnknownChannelIDs 交给页面就地补录。
+	CostBlocked bool
+	// MissingChannelInfos 未维护倍率的渠道（渠道表里查得到，可以补录）。
+	MissingChannelInfos []ChannelInfo
+	// UnknownChannelIDs 日志里有、但渠道表里查不到的渠道号（多半已被硬删除，无法补录）。
+	UnknownChannelIDs []int
+	Summary           Summary
 }
 
 // GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
@@ -122,7 +132,56 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 
 	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices, params.DomesticMarkers)
 
-	return &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}, nil
+	result := &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}
+
+	// 成本表是增量产物：不生成时账单与改动前逐格一致，不影响既有客户。
+	if params.GenerateCost {
+		costPath, blocked, missing, unknown, cerr := generateCostTable(
+			inputPath, templatePath, billPath, rows, headers, book, params, exchangeRate, preferPriceTable, year, month)
+		if cerr != nil {
+			return nil, cerr
+		}
+		result.CostBlocked = blocked
+		result.MissingChannelInfos = missing
+		result.UnknownChannelIDs = unknown
+		if !blocked {
+			result.CostPath = costPath
+		}
+	}
+
+	return result, nil
+}
+
+// generateCostTable 生成成本表。若有渠道还没维护倍率，**不报错中断**，而是返回
+// blocked=true 与待补录清单——用户此时已经填好了出账参数，硬报错会让他白填一遍。
+//
+// 返回 (成本表路径, 是否被拦下, 未维护渠道, 未知渠道号, 错误)。
+func generateCostTable(inputPath, templatePath, billPath string, rows [][]string, headers []string,
+	book *PriceBook, params Params, exchangeRate float64, preferPriceTable bool, year, month int) (string, bool, []ChannelInfo, []int, error) {
+
+	channelIDs, err := ExtractChannelIDs(headers, rows)
+	if err != nil {
+		return "", false, nil, nil, err
+	}
+	status := CheckUpstreamRatios(channelIDs, params.ChannelUpstreamRatios, params.ChannelInfos)
+	if len(status.Missing) > 0 || len(status.UnknownChannelIDs) > 0 {
+		// 未维护倍率的渠道无法估算成本；未知渠道连补录都做不到。
+		// 两种情况都拦下生成，把清单交给页面处理。
+		return "", true, status.Missing, status.UnknownChannelIDs, nil
+	}
+
+	costRows, err := AggregateCostByChannel(rows, headers, book, exchangeRate, preferPriceTable,
+		nil, params.ChannelUpstreamRatios, params.ChannelNames)
+	if err != nil {
+		return "", false, nil, nil, fmt.Errorf("成本聚合失败: %w", err)
+	}
+
+	outPath := costOutputPath(billPath)
+	if err := WriteCostFromTemplate(templatePath, outPath, costRows, year, month, book,
+		params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers); err != nil {
+		return "", false, nil, nil, fmt.Errorf("写出成本表失败: %w", err)
+	}
+	return outPath, false, nil, nil, nil
 }
 
 // mergeManualPrices 把用户手动补全的价格写入 book.ByModel，作为「哪里都找不到定价」时的

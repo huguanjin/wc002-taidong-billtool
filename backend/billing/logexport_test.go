@@ -47,8 +47,8 @@ func TestMysqlBatchEscape(t *testing.T) {
 	}
 }
 
-// TestLogExportColumnsMatchManualSQL 导出列必须与人工 SQL 的 14 列一致，末尾追加 other，
-// user_id 只在勾选时加。顺序是有意义的：前 14 列与历史手动导出文件对齐。
+// TestLogExportColumnsMatchManualSQL 导出列必须与人工 SQL 的 14 列一致，末尾追加 other
+// 与 channel_id，user_id 只在勾选时加。顺序是有意义的：前 14 列与历史手动导出文件对齐。
 func TestLogExportColumnsMatchManualSQL(t *testing.T) {
 	manual := []string{
 		"id", "username", "type", "created_at", "token_id", "token_name",
@@ -56,9 +56,12 @@ func TestLogExportColumnsMatchManualSQL(t *testing.T) {
 		"quota", "use_time", "is_stream", "request_id",
 	}
 	cols := LogExportColumns(false)
-	require.Len(t, cols, len(manual)+1, "应是人工 14 列 + other")
+	require.Len(t, cols, len(manual)+2, "应是人工 14 列 + other + channel_id")
 	assert.Equal(t, manual, cols[:len(manual)], "前 14 列必须与人工 SQL 完全一致且同序")
-	assert.Equal(t, []string{"other"}, cols[len(manual):], "other 必须追加在最后")
+	// other 与 channel_id 都追加在人工列之后：other 带计费信息，
+	// channel_id 是成本估算按渠道展开的依据（脱敏日志会丢掉 other，
+	// 渠道号必须是独立列才能活下来）。
+	assert.Equal(t, []string{"other", "channel_id"}, cols[len(manual):])
 
 	// group 是保留字，SQL 里要反引号；对外暴露的列名不带反引号。
 	assert.Equal(t, "group", cols[7])
@@ -71,8 +74,35 @@ func TestLogExportColumnsMatchManualSQL(t *testing.T) {
 	sel := buildLogExportSelect(false)
 	assert.Contains(t, sel, "`group`", "保留字 group 在 SQL 里必须反引号包裹")
 	assert.Contains(t, sel, "other")
+	assert.Contains(t, sel, "channel_id")
 	assert.NotContains(t, buildLogExportSelect(false), "user_id", "未勾选时不导出 user_id")
 	assert.Contains(t, buildLogExportSelect(true), "user_id")
+}
+
+// TestLogExportColumnsWithoutChannelID 老库没有 channel_id 列时要能降级导出，
+// 且列清单与 SELECT 清单必须同步少这一列——两边不一致会让写出的行错位。
+func TestLogExportColumnsWithoutChannelID(t *testing.T) {
+	cols := LogExportColumnsFor(false, false)
+	assert.NotContains(t, cols, "channel_id")
+	assert.Contains(t, cols, "other", "other 与 channel_id 是两件事，缺一列不该影响另一列")
+
+	sel := buildLogExportSelectWith(false, false)
+	assert.NotContains(t, sel, "channel_id")
+	assert.Contains(t, sel, "other")
+
+	// 有该列时两份清单都要带上，且顺序一致。
+	withCol := LogExportColumnsFor(false, true)
+	assert.Equal(t, []string{"other", "channel_id"}, withCol[len(withCol)-2:])
+	assert.Contains(t, buildLogExportSelectWith(false, true), "channel_id")
+
+	// 无论哪种情况，列名清单与 SELECT 清单的列数必须相同。
+	for _, hasCh := range []bool{false, true} {
+		for _, uid := range []bool{false, true} {
+			assert.Equal(t, len(LogExportColumnsFor(uid, hasCh)),
+				strings.Count(buildLogExportSelectWith(uid, hasCh), ",")+1,
+				"hasChannelID=%v includeUserID=%v 时两份清单列数必须一致", hasCh, uid)
+		}
+	}
 }
 
 // TestPlaceholders 账号/用户 ID 走占位符，个数必须与输入个数一致。
@@ -156,7 +186,7 @@ func TestExportedTSVRoundTrip(t *testing.T) {
 	record := []string{
 		"425258232", "zhongkang2026", "2", "1789470821", "4337", "国产模型",
 		"deepseek-v4.1-flash", "国产模型", "57945", "914",
-		"7580", "3", "0", "202609151113385444841498268d9d6J2aSe3OH", otherJSON,
+		"7580", "3", "0", "202609151113385444841498268d9d6J2aSe3OH", otherJSON, "1165",
 	}
 
 	f, err := os.Create(path)
@@ -207,7 +237,7 @@ func TestExportedTSVEscapesEmbeddedControlChars(t *testing.T) {
 	tokenName := "带\t制表符\n和换行"
 	record := []string{
 		"1", "u", "2", "1789470821", "1", tokenName,
-		"m", "g", "1", "1", "1", "1", "0", "req-1", `{"cache_tokens":7}`,
+		"m", "g", "1", "1", "1", "1", "0", "req-1", `{"cache_tokens":7}`, "1165",
 	}
 
 	f, err := os.Create(path)
@@ -221,7 +251,8 @@ func TestExportedTSVEscapesEmbeddedControlChars(t *testing.T) {
 	headers, rows, err := LoadLogRows(path, "", "")
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
-	require.Len(t, rows[0], 15, "含制表符的值不能被拆成额外字段——这是转义的首要目的")
+	require.Len(t, rows[0], len(LogExportColumns(false)),
+		"含制表符的值不能被拆成额外字段——这是转义的首要目的")
 
 	idx := indexOfHeader(headers, "token_name")
 	assert.Equal(t, `带\t制表符\n和换行`, rows[0][idx],
@@ -279,7 +310,7 @@ func TestRealisticOtherSurvivesRoundTrip(t *testing.T) {
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "other.tsv")
-	record := []string{"1", "u", "2", "1", "1", "t", "m", "g", "1", "1", "1", "1", "0", "r", other}
+	record := []string{"1", "u", "2", "1", "1", "t", "m", "g", "1", "1", "1", "1", "0", "r", other, "1165"}
 
 	f, err := os.Create(path)
 	require.NoError(t, err)
@@ -297,7 +328,7 @@ func TestRealisticOtherSurvivesRoundTrip(t *testing.T) {
 	headers, rows, err := LoadLogRows(path, "", "")
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
-	require.Len(t, rows[0], 15, "字段数不能变")
+	require.Len(t, rows[0], len(LogExportColumns(false)), "字段数不能变")
 
 	got := rows[0][indexOfHeader(headers, "other")]
 	assert.Equal(t, other, got, "other 应逐字节往返")
@@ -326,7 +357,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 		q, args := buildLogExportQuery("logs", LogExportParams{
 			Usernames: []string{"a37836323", "test02"},
 			StartTime: start, EndTime: end,
-		})
+		}, true)
 		assert.Contains(t, q, "username IN (?,?)")
 		assert.Contains(t, q, "type = 2", "type 必须写死为消费日志")
 		assert.Contains(t, q, "created_at >= ? AND created_at < ?", "半开区间")
@@ -348,7 +379,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 			}
 			q, args := buildLogExportQuery("logs", LogExportParams{
 				Usernames: names, StartTime: start, EndTime: end,
-			})
+			}, true)
 			assert.Contains(t, q, fmt.Sprintf("username IN (%s)", placeholders(n)),
 				"n=%d 时应生成 %d 个占位符", n, n)
 			assert.Equal(t, 2+n, strings.Count(q, "?"),
@@ -361,7 +392,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 		evil := []string{"a'; DROP TABLE logs; --", "b\" OR \"1\"=\"1", "c`x", "  ", "很长的账号名" + strings.Repeat("x", 300)}
 		q, args := buildLogExportQuery("logs", LogExportParams{
 			Usernames: evil, StartTime: start, EndTime: end,
-		})
+		}, true)
 		assert.Contains(t, q, "username IN (?,?,?,?,?)", "结构不变，仍是对应个数的占位符")
 		assert.NotContains(t, q, "DROP TABLE", "输入不得进入 SQL 文本")
 		assert.NotContains(t, q, "a37836323", "输入不得进入 SQL 文本")
@@ -377,7 +408,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 		q, args := buildLogExportQuery("logs", LogExportParams{
 			Usernames: []string{"u1"}, UserIDs: []int{42, 43},
 			StartTime: start, EndTime: end,
-		})
+		}, true)
 		assert.Contains(t, q, "username IN (?)")
 		assert.Contains(t, q, "user_id IN (?,?)")
 		require.Len(t, args, 5)
@@ -389,7 +420,7 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 		q, _ := buildLogExportQuery("logs", LogExportParams{
 			Usernames: []string{"u1"}, IncludeUserID: true,
 			StartTime: start, EndTime: end,
-		})
+		}, true)
 		assert.Contains(t, q, "user_id", "勾选后 SELECT 清单要含 user_id")
 	})
 }
@@ -407,7 +438,7 @@ func TestBuildLogExportQueryInclusiveInterval(t *testing.T) {
 
 	_, args := buildLogExportQuery("logs", LogExportParams{
 		Usernames: []string{"u"}, StartTime: start, EndTime: end,
-	})
+	}, true)
 	lo := args[0].(int64)
 	hi := args[1].(int64)
 	assert.Equal(t, int64(1790179200), lo, "起点是 09-24 00:00:00")
@@ -593,7 +624,7 @@ func TestNullValuesRenderAsLiteralNULL(t *testing.T) {
 
 	// group / token_name 为 NULL 的老数据行。
 	record := []string{"1", "u", "2", "1789470821", "1", "NULL", "m", "NULL",
-		"1", "1", "1", "1", "0", "req", "NULL"}
+		"1", "1", "1", "1", "0", "req", "NULL", "NULL"}
 
 	f, err := os.Create(path)
 	require.NoError(t, err)
@@ -606,7 +637,8 @@ func TestNullValuesRenderAsLiteralNULL(t *testing.T) {
 	content, err := os.ReadFile(path)
 	require.NoError(t, err)
 	// 这一行有三处 NULL：token_name、group、other；表头行不含 NULL。
-	assert.Equal(t, 3, strings.Count(string(content), "NULL"), "NULL 应写成字面量")
+	// 四个 NULL：token_name、group、other、channel_id（表头行不含 NULL）。
+	assert.Equal(t, 4, strings.Count(string(content), "NULL"), "NULL 应写成字面量")
 
 	headers, rows, err := LoadLogRows(path, "", "")
 	require.NoError(t, err)

@@ -122,26 +122,6 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
 		}
 
-		if cacheRead != 0 || cacheWrite5m != 0 || cacheWrite1h != 0 {
-			cacheHitRows++
-		}
-
-		imgMode := ImageBillingMode(model)
-		semantic := InferUsageSemantic(model, UsageSemanticFromOther(other))
-		uncached := UncachedInputTokens(prompt, cacheRead, cacheWrite5m, cacheWrite1h, semantic)
-		wsCalls, wsPrice := ParseWebSearch(other)
-		if wsCalls > 0 {
-			webSearchRows++
-		}
-
-		if sanitizedWriter != nil {
-			details := ParseRowDetails(other, includeBilling)
-			details.UncachedInputTokens = uncached
-			details.WebSearchCalls = wsCalls
-			if err := sanitizedWriter.WriteRow(row, cacheRead, cacheWrite5m, cacheWrite1h, details); err != nil {
-				return nil, err
-			}
-		}
 
 		// 该请求发生的时间：日志的 created_at 是 Unix 秒。出账面对历史日志，
 		// 带 hour() 一类的表达式必须按请求当时的时刻判断（见 RunBillingExpr）。
@@ -152,115 +132,26 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			}
 		}
 
-		var perCall, listUSD float64
-		var exprUsed, matchedTier string
-		// 本行刊例的来源，决定它能不能当折扣反推的分母（见 ListOrigin）。
-		listOrigin := ListOriginNone
-		// 表达式系数的计价币种：国产供应商家族在站上按人民币报价，系数落成
-		// 「美金/百万token」单价前要除汇率；海外模型系数本身即美金，不除。
-		exprUnitCurrency := "USD"
-		billingMode := imgMode
-		if billingMode == "" {
-			billingMode = "token"
-		}
+		// 计费口径统一走 priceRow（见 rowpricing.go）：主账单与成本表共用同一份实现，
+		// 分支语义只在一处维护。这里只负责把它算出的结果并进桶。
+		pr := priceRow(model, other, prompt, completion,
+			cacheRead, cacheWrite5m, cacheWrite1h, quota,
+			book, exchangeRate, preferPriceTable, exprSetting, at)
 
-		// 表达式优先取日志自带的（计费当时生效的规则），其次取 options 表当前配置——
-		// 但只有当日志自己既没有 expr_b64、也没有 model_ratio/completion_ratio 快照时，
-		// 才允许回落到 options 表现在的配置。模型在账期内可能从 ratio 计费切换成
-		// billing_expr 阶梯计费，若日志本身是切换前的 ratio 快照，绝不能套用「现在」的表达式，
-		// 否则会把整条历史请求按今天才生效的计费口径重算，刊例严重失真。
-		exprStr := ""
-		rowModelRatio, rowCompletionRatio, rowCacheRatio, hasRowRatio := ParseRowRatioPricing(other)
-		if imgMode != "per_call" {
-			exprStr = ParseBillingExpr(other)
-			if exprStr == "" && !hasRowRatio && exprSetting != nil {
-				exprStr = exprSetting.Expr(model)
-			}
-			if exprStr != "" {
-				billingMode = BillingModeTieredExpr
+		if pr.WebSearchCalls > 0 {
+			webSearchRows++
+		}
+		if pr.HasCache {
+			cacheHitRows++
+		}
+		if sanitizedWriter != nil {
+			details := ParseRowDetails(other, includeBilling)
+			details.UncachedInputTokens = pr.Uncached
+			details.WebSearchCalls = pr.WebSearchCalls
+			if err := sanitizedWriter.WriteRow(row, cacheRead, cacheWrite5m, cacheWrite1h, details); err != nil {
+				return nil, err
 			}
 		}
-
-		if imgMode == "per_call" {
-			if mp := ParseModelPrice(other); mp > 0 {
-				listUSD = mp
-				// 按次计费的固定美金价来自日志 model_price，是一份外部刊例。
-				listOrigin = ListOriginExternal
-			}
-			perCall = 1.0
-		} else if exprStr != "" {
-			img, imgO, ai, ao := ParseExtraTokens(other)
-			// 表达式入参必须传原始 prompt，不是扣过缓存的 uncached：
-			// BuildExprParams 内部会按表达式引用的子类变量扣一次，传 uncached 会扣两次，
-			// 把缓存命中的请求算少，并让阶梯档位判断用错长度（跨 272000 阈值会判错档，
-			// 单价差一倍）。与主库 BuildTieredTokenParams 同口径。
-			params := BuildExprParams(model, prompt, completion,
-				cacheRead, cacheWrite5m, cacheWrite1h, img, imgO, ai, ao, exprStr)
-			res, err := RunBillingExpr(exprStr, params, at)
-			if err != nil {
-				// 表达式跑不通时回落到按量价表，宁可价格略有偏差也不整行失败。
-				basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
-				if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
-					basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
-				}
-				listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
-				billingMode = "token"
-				listOrigin = ListOriginExternal
-			} else {
-				listUSD = res.USD / 1_000_000
-				if VendorFamily(model) != "" {
-					// 国产供应商家族的 billing_expr 系数是人民币、不是美元；这里先除回
-					// exchangeRate，下游 OfficialListCNY = officialUSD * exchangeRate 才能正确
-					// 换回原始人民币刊例，否则会被多乘一次汇率，把国产模型的"官方刊例"放大约 exchangeRate 倍。
-					//
-					// 注意这是载荷性写法，不是重复除法：OfficialUSD 必须是「美金」口径
-					// （AC 列按美金、S 列再 ×汇率还原人民币），除去的这一层由下游乘回来。
-					// 同一币种还要传给单价列（见 ExprUnitCurrency），否则单价列留着人民币数字
-					// 被当成美金，AC 的「单价×用量」公式会整体放大 exchangeRate 倍。
-					listUSD /= exchangeRate
-					exprUnitCurrency = "CNY"
-				}
-				exprUsed = exprStr
-				matchedTier = res.MatchedTier
-				// 刊例由站内表达式算出，不是外部对标价：这一行不能参与折扣反推。
-				listOrigin = ListOriginExpr
-			}
-		} else if hasRowRatio {
-			// 该请求当时是按 ModelRatio/CompletionRatio/CacheRatio 直接计费（未命中
-			// billing_expr），系数换算方式与 fetchModelPricesFromDB 保持一致：
-			// ratio=1 对应官方基准 $0.002/1K token（$2/MTok）。国产供应商家族的
-			// ModelRatio 在这套系统里是按人民币报价（1 元=1 美金充值），同样需要
-			// 先除回 exchangeRate，避免换回人民币时被多乘一次汇率。
-			inp := rowModelRatio * 2
-			outp := inp * rowCompletionRatio
-			crp := inp * rowCacheRatio
-			// 缓存创建同样要计价，倍率取日志自带的 cache_creation_ratio(_1h)。
-			// 曾经这里只算了未命中/缓存读/输出三项，导致带缓存创建的请求少算——
-			// 月账单里仅这一项就差了 311.97 元（占 7%），而且悄无声息。
-			w5p, w1p := ParseCacheWritePrices(inp, other)
-			if VendorFamily(model) != "" {
-				inp, outp, crp = inp/exchangeRate, outp/exchangeRate, crp/exchangeRate
-				w5p, w1p = w5p/exchangeRate, w1p/exchangeRate
-			}
-			listUSD = (uncached*inp + cacheRead*crp + completion*outp +
-				cacheWrite5m*w5p + cacheWrite1h*w1p) / 1_000_000
-			if wsCalls > 0 && wsPrice > 0 {
-				listUSD += wsCalls * wsPrice / 1000.0
-			}
-			billingMode = "token"
-			// ratio 快照的换算基准是官方锚点（ratio=1 → $2/MTok），算外部对标价。
-			listOrigin = ListOriginExternal
-		} else {
-			basePrice, _ := ResolvePrice(model, book, preferPriceTable, exchangeRate)
-			if tier, ok := TieredModelPrices[model]; ok && (basePrice == nil || basePrice.Source == "per_call") {
-				basePrice = &ModelPrice{InputPerM: tier.Low[0], OutputPerM: tier.Low[1], Currency: "USD", Source: "tiered_low"}
-			}
-			listUSD = RowListUSD(model, prompt, uncached, cacheRead, cacheWrite5m, cacheWrite1h, completion, basePrice, wsCalls, wsPrice)
-			if listUSD > 0 {
-				listOrigin = ListOriginExternal
-			}
-		}
-
 		// 倍率归桶：0 表示日志没给 group_ratio，单独成一桶，不与其他倍率混。
 		ratioBucket := ""
 		if groupRatio > 0 {
@@ -280,8 +171,9 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			}
 			agg = &AggRow{
 				Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
-				BillingMode: billingMode, ListOrigin: listOrigin,
-				ExprUnitCurrency: exprUnitCurrency,
+				BillingMode: pr.BillingMode,
+				// ListOrigin 先落下第一行的来源，同桶后续行由 mergesListOrigin 合并。
+				ListOrigin: pr.ListOrigin, ExprUnitCurrency: pr.ExprUnitCurrency,
 			}
 			buckets[key] = agg
 			if !groupSeen[group] {
@@ -292,28 +184,28 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			// 同一 (模型,分组) 内可能混着两种口径：账期中途从 ratio 计费切到表达式，
 			// 或表达式降级行按价表算。整桶来源只有在完全一致时才可信，
 			// 不一致就记成 mixed，让折扣反推跳过这一桶而不是用半截分母算出个错数。
-			agg.ListOrigin = mergesListOrigin(agg.ListOrigin, listOrigin)
+			agg.ListOrigin = mergesListOrigin(agg.ListOrigin, pr.ListOrigin)
 			// 币种同样要一致：只要有一行是人民币系数，这一桶的单价列就得按人民币归一，
 			// 否则单价列会混着两种量纲的数字，客户没法读。
-			if exprUnitCurrency == "CNY" {
+			if pr.ExprUnitCurrency == "CNY" {
 				agg.ExprUnitCurrency = "CNY"
 			}
 		}
-		if exprUsed != "" {
-			agg.BillingExpr = exprUsed
+		if pr.BillingExpr != "" {
+			agg.BillingExpr = pr.BillingExpr
 		}
-		if matchedTier != "" && !containsString(agg.ExprTiers, matchedTier) {
-			agg.ExprTiers = append(agg.ExprTiers, matchedTier)
+		if pr.MatchedTier != "" && !containsString(agg.ExprTiers, pr.MatchedTier) {
+			agg.ExprTiers = append(agg.ExprTiers, pr.MatchedTier)
 		}
-		agg.Uncached += uncached
-		agg.CacheRead += cacheRead
-		agg.Output += completion
-		agg.CacheWrite5m += cacheWrite5m
-		agg.CacheWrite1h += cacheWrite1h
-		agg.Quota += quota
-		agg.OfficialUSD += listUSD
-		agg.WebSearchCalls += wsCalls
-		agg.ImagePerCallCount += perCall
+		agg.Uncached += pr.Uncached
+		agg.CacheRead += pr.CacheRead
+		agg.Output += pr.Output
+		agg.CacheWrite5m += pr.CacheWrite5m
+		agg.CacheWrite1h += pr.CacheWrite1h
+		agg.Quota += pr.Quota
+		agg.OfficialUSD += pr.OfficialUSD
+		agg.WebSearchCalls += pr.WebSearchCalls
+		agg.ImagePerCallCount += pr.ImagePerCallCount
 		agg.Rows++
 		rowCount++
 

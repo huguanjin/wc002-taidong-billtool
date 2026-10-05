@@ -24,8 +24,12 @@ var (
 		"model_name", "`group`", "prompt_tokens", "completion_tokens",
 		"quota", "use_time", "is_stream", "request_id",
 	}
-	// logRequiredColumns 人工 SQL 之外必需的列，紧跟基础列之后。
-	logRequiredColumns = []string{"other"}
+	// logRequiredColumns 人工 SQL 之外必需的列，紧跟基础列之后：
+	//   other      —— 缓存计费、阶梯表达式、工具调用、web_search 全在它里面；
+	//   channel_id —— 成本估算要按渠道展开，且脱敏日志会把 other 整列丢掉，
+	//                 渠道号只藏在 other.admin_info 里的话，脱敏日志就永远做不了成本表。
+	// 两列都放在必选而非可选：缺了 any 一个，对应功能就直接失效而不是降级。
+	logRequiredColumns = []string{"other", "channel_id"}
 	// logOptionalColumns 勾选才加的可选列（跨账号排查用）。
 	logOptionalColumns = []string{"user_id"}
 )
@@ -127,7 +131,7 @@ type LogExportResult struct {
 
 // LogExportColumns 返回本次导出的列名（不带反引号），供测试与文档核对。
 func LogExportColumns(includeUserID bool) []string {
-	cols := make([]string, 0, len(logBaseColumns)+2)
+	cols := make([]string, 0, len(logBaseColumns)+len(logRequiredColumns)+len(logOptionalColumns))
 	for _, c := range logBaseColumns {
 		cols = append(cols, strings.Trim(c, "`"))
 	}
@@ -140,7 +144,7 @@ func LogExportColumns(includeUserID bool) []string {
 
 // buildLogExportSelect 拼出导出用的 SELECT 列清单。
 func buildLogExportSelect(includeUserID bool) string {
-	cols := make([]string, 0, len(logBaseColumns)+2)
+	cols := make([]string, 0, len(logBaseColumns)+len(logRequiredColumns)+len(logOptionalColumns))
 	cols = append(cols, logBaseColumns...)
 	cols = append(cols, logRequiredColumns...)
 	if includeUserID {
@@ -213,7 +217,7 @@ func mysqlBatchEscape(v string) string {
 //
 // 抽成纯函数便于测试：账号与用户 ID 一律走占位符，参数个数与顺序必须与
 // 占位符严格对应，不能有任何字符串拼接（账号名里带引号/分号也不能破坏结构）。
-func buildLogExportQuery(table string, params LogExportParams) (string, []interface{}) {
+func buildLogExportQuery(table string, params LogExportParams, hasChannelID bool) (string, []interface{}) {
 	// 账号与用户 ID 取并集。
 	//
 	// 区间写成半开 `< end+1s`：created_at 是整数秒，这与「结束时刻也包含在内」
@@ -236,7 +240,7 @@ func buildLogExportQuery(table string, params LogExportParams) (string, []interf
 	// 人工导出没有 ORDER BY，数据库返回顺序并不保证稳定；这里刻意按
 	// (created_at, id) 排序，让同样的输入总是得到同样的文件，便于比对与复查。
 	query := fmt.Sprintf("SELECT %s FROM `%s` WHERE %s ORDER BY created_at, id",
-		buildLogExportSelect(params.IncludeUserID), table, strings.Join(conds, " AND "))
+		buildLogExportSelectWith(params.IncludeUserID, hasChannelID), table, strings.Join(conds, " AND "))
 	return query, args
 }
 
@@ -283,6 +287,61 @@ func exportFingerprint(params LogExportParams) string {
 	return hex.EncodeToString(sum[:])[:8]
 }
 
+// buildLogExportSelectWith 按实际可用列拼 SELECT。
+//
+// channel_id 是成本估算的必需列，但并非所有部署都有（老库、自定义表结构、
+// 或 ClickHouse 迁移中途）。缺列时**不静默跳过**——导出一份没有渠道号的日志，
+// 用户会在生成成本表时才发现，那时已经白导一次了；这里直接少这一列，
+// 由 LogExportColumnsFor 同步反映，并在结果里回传实际列清单供页面提示。
+func buildLogExportSelectWith(includeUserID, hasChannelID bool) string {
+	cols := make([]string, 0, len(logBaseColumns)+len(logRequiredColumns)+len(logOptionalColumns))
+	cols = append(cols, logBaseColumns...)
+	for _, c := range logRequiredColumns {
+		if c == "channel_id" && !hasChannelID {
+			continue
+		}
+		cols = append(cols, c)
+	}
+	if includeUserID {
+		cols = append(cols, logOptionalColumns...)
+	}
+	return strings.Join(cols, ", ")
+}
+
+// LogExportColumnsFor 与 buildLogExportSelectWith 对应的列名清单。
+func LogExportColumnsFor(includeUserID, hasChannelID bool) []string {
+	cols := make([]string, 0, len(logBaseColumns)+len(logRequiredColumns)+len(logOptionalColumns))
+	for _, c := range logBaseColumns {
+		cols = append(cols, strings.Trim(c, "`"))
+	}
+	for _, c := range logRequiredColumns {
+		if c == "channel_id" && !hasChannelID {
+			continue
+		}
+		cols = append(cols, c)
+	}
+	if includeUserID {
+		cols = append(cols, logOptionalColumns...)
+	}
+	return cols
+}
+
+// hasChannelColumn 探测日志表是否有 channel_id 列。
+//
+// 用 information_schema 查一次而不是「查失败再重试」：后者会让第一次 SELECT
+// 白跑一遍（大表上代价很高），也分不清「缺列」与「真的查询出错」。
+func hasChannelColumn(db *sql.DB, table string) (bool, error) {
+	var n int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 'channel_id'
+	`, table).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("探测 %s 表结构失败: %w", table, err)
+	}
+	return n > 0, nil
+}
+
 // ExportLogsFromDB 连业务库把消费日志导出为 mysql 批处理模式的 tsv，
 // 列与列顺序对齐人工导出（末尾追加 other），流式写入 outDir 下的文件。
 //
@@ -298,13 +357,18 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	if err != nil {
 		return nil, err
 	}
-	query, args := buildLogExportQuery(table, params)
-
 	db, err := sql.Open("mysql", cfg.dsn())
 	if err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
 	defer db.Close()
+
+	// channel_id 用于成本估算，但不是所有部署都有这一列；先探测再决定 SELECT 清单。
+	hasChannelID, err := hasChannelColumn(db, table)
+	if err != nil {
+		return nil, err
+	}
+	query, args := buildLogExportQuery(table, params, hasChannelID)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
@@ -333,14 +397,14 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 
 	started := time.Now()
 	w := bufio.NewWriterSize(tmp, 1<<20)
-	headers := LogExportColumns(params.IncludeUserID)
+	headers := LogExportColumnsFor(params.IncludeUserID, hasChannelID)
 	if err := writeTSVRecord(w, headers); err != nil {
 		return nil, fmt.Errorf("写入表头失败: %w", err)
 	}
 
 	var count int64
 	for rows.Next() {
-		record, err := scanLogRecord(rows, params.IncludeUserID)
+		record, err := scanLogRecord(rows, params.IncludeUserID, hasChannelID)
 		if err != nil {
 			return nil, fmt.Errorf("读取第 %d 行失败: %w", count+1, err)
 		}
@@ -377,8 +441,9 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 // 整数列用 sql.NullInt64、字符串列用 sql.NullString：老数据里 group / token_name
 // 可能是 NULL，直接 Scan 进 string/int 会报错。NULL 统一输出字面量 NULL，
 // 与 mysql 客户端批处理模式一致。
-func scanLogRecord(rows *sql.Rows, includeUserID bool) ([]string, error) {
+func scanLogRecord(rows *sql.Rows, includeUserID, hasChannelID bool) ([]string, error) {
 	var (
+		channelID        sql.NullInt64
 		id               sql.NullInt64
 		username         sql.NullString
 		logType          sql.NullInt64
@@ -401,6 +466,9 @@ func scanLogRecord(rows *sql.Rows, includeUserID bool) ([]string, error) {
 		&id, &username, &logType, &createdAt, &tokenID, &tokenName,
 		&modelName, &group, &promptTokens, &completionTokens,
 		&quota, &useTime, &isStream, &requestID, &other,
+	}
+	if hasChannelID {
+		dest = append(dest, &channelID)
 	}
 	if includeUserID {
 		dest = append(dest, &userID)
@@ -427,6 +495,9 @@ func scanLogRecord(rows *sql.Rows, includeUserID bool) ([]string, error) {
 		nullInt64Text(isStream),
 		nullStringText(requestID),
 		nullStringText(other),
+	}
+	if hasChannelID {
+		record = append(record, nullInt64Text(channelID))
 	}
 	if includeUserID {
 		record = append(record, nullInt64Text(userID))

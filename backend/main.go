@@ -31,6 +31,7 @@ type jobRecord struct {
 	sanitizedPath string
 	mergedPath    string
 	exportedPath  string
+	costPath      string
 	createdAt     time.Time
 }
 
@@ -68,6 +69,9 @@ func main() {
 		if err := billing.EnsureUserDiscountSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化 PostgreSQL 折扣快照表失败，客户折扣拉取功能可能不可用: %v", err)
 		}
+		if err := billing.EnsureChannelSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化渠道倍率表失败，成本估算功能可能不可用: %v", err)
+		}
 	}
 
 	go cleanupOldJobs()
@@ -86,6 +90,9 @@ func main() {
 	mux.HandleFunc("/api/export-logs", withCORS(requireAuth(handleExportLogs)))
 	mux.HandleFunc("/api/data-logs", withCORS(requireAuth(handleDataLogs)))
 	mux.HandleFunc("/api/delete-log-file", withCORS(requireAuth(handleDeleteLogFile)))
+	mux.HandleFunc("/api/pull-channels", withCORS(requireAuth(handlePullChannels)))
+	mux.HandleFunc("/api/channels", withCORS(requireAuth(handleChannels)))
+	mux.HandleFunc("/api/channel-ratios", withCORS(requireAuth(handleSaveChannelRatios)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +487,103 @@ func handleDeleteLogFile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": filepath.Base(removed)})
 }
 
+// handlePullChannels 从业务库拉取渠道清单落本地 PostgreSQL。
+//
+// 业务库只读：这条路径只 SELECT channels，写入全部落在本地 PG。
+func handlePullChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if dbConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置业务数据库连接信息（BILL_DB_HOST 等环境变量）")
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），渠道清单无处保存")
+		return
+	}
+
+	pulled, err := billing.PullChannelsFromDB(*dbConfig, *pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	channels, err := billing.ListChannels(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"pulled":   pulled,
+		"channels": channels,
+	})
+}
+
+// handleChannels 返回本地渠道清单 + 各自的上游倍率维护状态。
+func handleChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），渠道清单不可用")
+		return
+	}
+	channels, err := billing.ListChannels(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// 未维护倍率的数量直接给出，页面不用自己数。
+	missing := 0
+	for _, c := range channels {
+		if c.UpstreamRatio == nil {
+			missing++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"channels":     channels,
+		"missingCount": missing,
+	})
+}
+
+// handleSaveChannelRatios 批量保存渠道上游倍率。
+func handleSaveChannelRatios(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	var body struct {
+		Items []billing.ChannelRatioInput `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if len(body.Items) == 0 {
+		httpError(w, http.StatusBadRequest, "没有要保存的渠道倍率")
+		return
+	}
+	for _, it := range body.Items {
+		if it.UpstreamRatio != nil && *it.UpstreamRatio < 0 {
+			httpError(w, http.StatusBadRequest,
+				fmt.Sprintf("渠道 %d 的倍率不能为负数", it.ChannelID))
+			return
+		}
+	}
+	if err := billing.UpsertChannelRatios(*pgConfig, body.Items); err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"saved": len(body.Items)})
+}
+
 // handlePullDBPrices 触发一次数据库价格拉取并落盘，供「数据库实时价格」出账模式使用。
 func handlePullDBPrices(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -634,6 +738,34 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	// 国产/站内定价标识：一行一个，前端用多行文本框填写；空行自动丢弃。
 	params.DomesticMarkers = parseMarkers(formValue(form, "domesticMarkers"))
 
+	// 成本表：勾选时从本地 PG 装载渠道倍率与渠道名。
+	// 不在这里做「有没有未维护渠道」的判断——那件事需要先读日志里的渠道集合，
+	// 由 billing.GenerateBill 在解析完日志后统一检查，避免把日志读两遍。
+	params.GenerateCost = formValue(form, "generateCost") == "true"
+	if params.GenerateCost {
+		if pgConfig == nil {
+			httpError(w, http.StatusBadRequest, "生成成本表需要先配置 PostgreSQL（BILL_PG_*）并拉取渠道清单")
+			return
+		}
+		ratios, err := billing.ChannelRatioMap(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		channels, err := billing.ListChannels(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		params.ChannelUpstreamRatios = ratios
+		params.ChannelNames = make(map[int]string, len(channels))
+		params.ChannelInfos = make(map[int]billing.ChannelInfo, len(channels))
+		for _, c := range channels {
+			params.ChannelNames[c.ChannelID] = c.Name
+			params.ChannelInfos[c.ChannelID] = c.ChannelInfo
+		}
+	}
+
 	templatePath := filepath.Join(dataDir, "bill_template.xlsx")
 	priceTablePath := filepath.Join(dataDir, "price_table.xlsx")
 
@@ -644,7 +776,10 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jobsMu.Lock()
-	jobs[jobID] = jobRecord{billPath: result.BillPath, sanitizedPath: result.SanitizedPath, createdAt: time.Now()}
+	jobs[jobID] = jobRecord{
+		billPath: result.BillPath, sanitizedPath: result.SanitizedPath,
+		costPath: result.CostPath, createdAt: time.Now(),
+	}
 	jobsMu.Unlock()
 
 	resp := map[string]interface{}{
@@ -656,6 +791,17 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	if result.SanitizedPath != "" {
 		resp["sanitizedFileName"] = filepath.Base(result.SanitizedPath)
 		resp["sanitizedUrl"] = "/api/download/" + jobID + "/sanitized"
+	}
+	if result.CostPath != "" {
+		resp["costFileName"] = filepath.Base(result.CostPath)
+		resp["costUrl"] = "/api/download/" + jobID + "/cost"
+	}
+	// 被拦下的情形**不是错误**：账单已经生成并登记好了，只是成本表没出，
+	// 把待补录的渠道清单交给页面，用户补完倍率再勾一次即可。
+	if result.CostBlocked {
+		resp["costBlocked"] = true
+		resp["missingChannels"] = result.MissingChannelInfos
+		resp["unknownChannelIds"] = result.UnknownChannelIDs
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -777,6 +923,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		path = rec.mergedPath
 	case "exported":
 		path = rec.exportedPath
+	case "cost":
+		path = rec.costPath
 	}
 	if path == "" {
 		http.NotFound(w, r)
