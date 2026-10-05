@@ -2,6 +2,7 @@ package billing
 
 import (
 	"encoding/base64"
+	"fmt"
 	"math"
 	"testing"
 
@@ -260,4 +261,107 @@ func TestSettleFactorNotRounded(t *testing.T) {
 	roundedSettle := OfficialListCNY(a, 7.0) * shown
 	assert.Greater(t, math.Abs(exactSettle-roundedSettle), 1e-9,
 		"用取整后的展示折扣结算会偏离实收——所以结算必须用精确系数")
+}
+
+// TestRowRatioBranchCountsCacheCreation ratio 计费路径必须把缓存创建计入刊例。
+//
+// 曾经的 bug：该分支只算了「未命中 + 缓存读 + 输出」三项，把 cache_creation
+// 整个漏掉。带缓存创建的请求（Claude Code 的 1h 缓存尤其常见）被系统性少算，
+// 实测一份月账单因此少了 311.97 元（占 7%），而且没有任何报警。
+//
+// 真实数据（claude-sonnet-5 / AWS-专供分组 的一行）：
+//
+//	model_ratio=1   → 输入 $2/MTok；completion_ratio=5 → 输出 $10
+//	cache_ratio=0.1 → 缓存读 $0.2
+//	cache_creation_ratio=1.25 → 5m 写 $2.5
+//	cache_creation_ratio_1h=2  → 1h 写 $4
+//	prompt=2, completion=7133, cache_creation_tokens_1h=112750
+//
+// 缺 1h 那一项时刊例是 0.073302，补上后是 0.524302（差 0.451）。
+func TestRowRatioBranchCountsCacheCreation(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other", "created_at"}
+
+	const (
+		modelRatio      = 1.0  // → 输入 $2/MTok
+		completionRatio = 5.0  // → 输出 $10/MTok
+		cacheRatio      = 0.1  // → 缓存读 $0.2/MTok
+		ccRatio         = 1.25 // → 5m 写 $2.5/MTok
+		ccRatio1h       = 2.0  // → 1h 写 $4/MTok
+		groupRatio      = 4.62
+		prompt          = 2.0
+		completion      = 7133.0
+		cacheCreation1h = 112750.0
+	)
+
+	// 刊例按 ratio 口径自算，quota 也由它推导——测试不该手填一个可能与口径
+	// 无关的数字，那样两边都错也能"通过"。
+	inp := modelRatio * 2
+	listUSD := (prompt*inp + completion*inp*completionRatio + cacheCreation1h*inp*ccRatio1h) / 1_000_000
+	quota := ExprQuota(listUSD, groupRatio)
+
+	other := fmt.Sprintf(
+		`{"model_ratio":%v,"completion_ratio":%v,"cache_ratio":%v,`+
+			`"cache_creation_ratio":%v,"cache_creation_ratio_1h":%v,`+
+			`"cache_tokens":0,"cache_creation_tokens":%v,"cache_creation_tokens_1h":%v,"group_ratio":%v}`,
+		modelRatio, completionRatio, cacheRatio, ccRatio, ccRatio1h,
+		cacheCreation1h, cacheCreation1h, groupRatio)
+	rows := [][]string{{
+		"claude-sonnet-5", "AWS-专供分组",
+		trimRatio(prompt), trimRatio(completion), trimRatio(quota), other, "1789470821",
+	}}
+
+	agg, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
+	require.NoError(t, err)
+	require.Len(t, agg.Rows, 1)
+	a := agg.Rows[0]
+
+	// 用量确实被解析出来（否则这个测试测不到该测的东西）。
+	assert.Equal(t, cacheCreation1h, a.CacheWrite1h, "1h 缓存创建量应被解析")
+	assert.Equal(t, 0.0, a.CacheWrite5m)
+
+	// 刊例必须含 1h 缓存创建那一项。
+	w1Price := inp * ccRatio1h // $4/MTok
+	wantUSD := (prompt*inp + completion*inp*completionRatio + cacheCreation1h*w1Price) / 1_000_000
+	assert.InDelta(t, wantUSD, a.OfficialUSD, 1e-9, "缓存创建必须计入刊例")
+
+	// 反证：确认这个测试真能抓住该 bug——漏掉 1h 写会少 0.451。
+	withoutCacheWrite := (prompt*inp + completion*inp*completionRatio) / 1_000_000
+	assert.InDelta(t, 0.451, wantUSD-withoutCacheWrite, 1e-9)
+	assert.Greater(t, a.OfficialUSD, withoutCacheWrite)
+
+	// 结算额与站内实收相符（该行 group_ratio=4.62，由按倍率结算保证）。
+	//
+	// 容差 1e-5 而非 1e-9：日志里的 quota 是整数，写进日志时已经量化过一次
+	// （真实数据同样如此）。剩下的差额只来自这一次整数化，量级 ~1e-6 元，
+	// 再收紧就是在要求测试数据比生产数据更精确。
+	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, nil, false, nil)
+	settle := OfficialListCNY(a, 7.0) * disc.SettleFactor(a.Group)
+	assert.InDelta(t, a.Quota/QuotaPerCNY, settle, 1e-5,
+		"补齐缓存创建后，结算额应与站内实收一致")
+	// 刊例本身不受整数化影响，这一条仍是精确的。
+	assert.InDelta(t, listUSD, a.OfficialUSD, 1e-9)
+}
+
+// TestParseCacheWritePrices ratio 缺失时回落到内置倍数。
+func TestParseCacheWritePrices(t *testing.T) {
+	const inp = 5.0
+	const rate = 7.0
+
+	// 日志给了倍率：按其换算。
+	w5, w1 := ParseCacheWritePrices(inp, `{"cache_creation_ratio":1.25,"cache_creation_ratio_1h":2}`)
+	assert.InDelta(t, 6.25, w5, 1e-9)
+	assert.InDelta(t, 10.0, w1, 1e-9)
+
+	// 只有 5m 倍率时，1h 用内置倍数。
+	w5, w1 = ParseCacheWritePrices(inp, `{"cache_creation_ratio":1.25}`)
+	assert.InDelta(t, 6.25, w5, 1e-9)
+	assert.InDelta(t, inp*CacheWrite1hMult, w1, 1e-9)
+
+	// 完全没有倍率字段（含解析失败）时全部回落，取官方倍数。
+	for _, other := range []string{"", "{}", "not json", `{"admin_info":{"key_hint":"{\"de...28\"}"}}`} {
+		w5, w1 := ParseCacheWritePrices(inp, other)
+		assert.InDelta(t, inp*CacheWrite5mMult, w5, 1e-9, "other=%q", other)
+		assert.InDelta(t, inp*CacheWrite1hMult, w1, 1e-9, "other=%q", other)
+	}
+	_ = rate
 }

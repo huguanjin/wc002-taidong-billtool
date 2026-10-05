@@ -234,10 +234,16 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			inp := rowModelRatio * 2
 			outp := inp * rowCompletionRatio
 			crp := inp * rowCacheRatio
+			// 缓存创建同样要计价，倍率取日志自带的 cache_creation_ratio(_1h)。
+			// 曾经这里只算了未命中/缓存读/输出三项，导致带缓存创建的请求少算——
+			// 月账单里仅这一项就差了 311.97 元（占 7%），而且悄无声息。
+			w5p, w1p := ParseCacheWritePrices(inp, other)
 			if VendorFamily(model) != "" {
 				inp, outp, crp = inp/exchangeRate, outp/exchangeRate, crp/exchangeRate
+				w5p, w1p = w5p/exchangeRate, w1p/exchangeRate
 			}
-			listUSD = (uncached*inp + cacheRead*crp + completion*outp) / 1_000_000
+			listUSD = (uncached*inp + cacheRead*crp + completion*outp +
+				cacheWrite5m*w5p + cacheWrite1h*w1p) / 1_000_000
 			if wsCalls > 0 && wsPrice > 0 {
 				listUSD += wsCalls * wsPrice / 1000.0
 			}

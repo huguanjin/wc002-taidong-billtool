@@ -917,6 +917,45 @@ func parseFloatValue(value interface{}) (float64, bool) {
 // groupRatioRe 兜底的 group_ratio 提取：匹配 "group_ratio": 0.4 这类片段。
 var groupRatioRe = regexp.MustCompile(`"group_ratio"\s*:\s*"?([0-9]*\.?[0-9]+)"?`)
 
+// ParseCacheWritePrices 解析缓存创建的单价（$/MTok）。
+//
+// ratio 计费路径要用日志自带的 cache_creation_ratio / cache_creation_ratio_1h：
+// 它们与 model_ratio 同一套基准（相对输入倍数的倍数），
+// 例如 model_ratio=2.5（=$5/MTok）、cache_creation_ratio=1.25 → 6.25、_1h=2 → 10。
+// 字段缺失时回落到内置的 CacheWrite5mMult / CacheWrite1hMult。
+//
+// 日志里确实存在整段不是合法 JSON 的 other（key_hint 里嵌了转义引号），
+// 这类行取不到倍率，用兜底倍数即可——它正是官方倍数，不会算错。
+func ParseCacheWritePrices(inputPerM float64, other string) (w5m, w1h float64) {
+	r5m, r1h := CacheWrite5mMult, CacheWrite1hMult
+
+	text := strings.TrimSpace(other)
+	if text != "" {
+		if data := parseOtherJSON(text); data != nil {
+			if r := optFloat(data, "cache_creation_ratio_5m"); r != nil && *r > 0 {
+				r5m = *r
+			} else if r := optFloat(data, "cache_creation_ratio"); r != nil && *r > 0 {
+				r5m = *r
+			}
+			if r := optFloat(data, "cache_creation_ratio_1h"); r != nil && *r > 0 {
+				r1h = *r
+			}
+		}
+	}
+	return inputPerM * r5m, inputPerM * r1h
+}
+
+// parseOtherJSON 解析 other；失败返回 nil。容错：先原文，再逐级去转义。
+func parseOtherJSON(text string) map[string]interface{} {
+	for _, candidate := range iterTextCandidates(text) {
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(candidate), &data); err == nil && data != nil {
+			return data
+		}
+	}
+	return nil
+}
+
 // ParseDiscountText 对应 parse_discount_text：兼容百分数、"6折"、纯小数写法。
 func ParseDiscountText(value string) (float64, bool) {
 	text := strings.TrimSpace(value)
