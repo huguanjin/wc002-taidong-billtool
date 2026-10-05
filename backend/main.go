@@ -454,11 +454,14 @@ func handleDeleteLogFile(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		httpError(w, http.StatusBadRequest, "解析表单失败: "+err.Error())
-		return
-	}
-	name := r.FormValue("name")
+	// 必须走 ParseMultipartForm：前端用 FormData 提交，content-type 是
+	// multipart/form-data，而 ParseForm 不会解析 multipart body，
+	// 那样读出来的 name 永远是空串。ParseMultipartForm 内部会先调 ParseForm，
+	// 所以 urlencoded 的提交也一并支持。
+	_ = r.ParseMultipartForm(1 << 20)
+	_ = r.ParseForm()
+
+	name := strings.TrimSpace(r.FormValue("name"))
 	removed, err := billing.DeleteDataLog(dataDir, name)
 	if err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
