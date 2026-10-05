@@ -34,13 +34,23 @@ const maintainedCount = computed(
 const pendingCount = computed(() => channels.value.filter((c) => isDirty(c)).length)
 
 // isDirty 必须与 saveChannelRatios 的判据保持一致，否则按钮上的数字会和实际提交数对不上。
+//
+// 注意 v-model 绑在 type="number" 的输入框上时，Vue 会自动套 .number 修饰符，
+// 值随用户输入在 string / number 之间变（空串仍是 ''）。所以统一 String() 归一化，
+// 不能直接 .trim()——那会在用户输入数字的那一瞬间抛 TypeError。
+// 本函数在模板渲染期被调用（:class），抛异常会让 Vue 卸载整个组件，表现为页面空白。
 function isDirty(c) {
-  const raw = (ratioDraft.value[c.channelId] ?? '').trim()
+  const raw = String(ratioDraft.value[c.channelId] ?? '').trim()
   const before =
     c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
-  const noteBefore = c.note || ''
-  const noteNow = ratioNotes.value[c.channelId] || ''
-  return raw !== before || noteNow !== noteBefore
+  // 数字归一化后再比，避免 "0.60" 与 0.6 被当成改动。
+  const normalize = (v) => {
+    const t = String(v ?? '').trim()
+    if (t === '') return ''
+    const n = Number(t)
+    return Number.isFinite(n) ? String(n) : t
+  }
+  return normalize(raw) !== normalize(before) || (ratioNotes.value[c.channelId] || '') !== (c.note || '')
 }
 
 function syncChannelDraft(list) {
@@ -106,12 +116,12 @@ async function saveChannelRatios() {
   channelsMessage.value = ''
   const items = []
   for (const c of channels.value) {
-    const raw = (ratioDraft.value[c.channelId] ?? '').trim()
-    const before =
-      c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
+    // 同 isDirty：type=number 的 v-model 会给到 number，必须 String() 归一化后再 trim。
+    const raw = String(ratioDraft.value[c.channelId] ?? '').trim()
     const noteBefore = c.note || ''
     const noteNow = ratioNotes.value[c.channelId] || ''
-    if (raw === before && noteNow === noteBefore) continue
+    // 用 isDirty 统一判据，免得这里的比较与按钮上的计数漂移。
+    if (!isDirty(c)) continue
 
     if (raw === '') {
       // 清空表示「取消维护」，发 null。

@@ -441,11 +441,20 @@ const usedUnsavedCount = computed(
   () => usedChannels.value.filter((c) => usedDirty(c)).length
 )
 
+// usedDirty 判断「这个渠道填了但还没提交」。
+//
+// 注意 v-model 绑在 type="number" 的输入框上时，Vue 会自动套 .number 修饰符，
+// 值随用户输入在 string / number 之间变（空串仍是 ''）。所以统一 String() 归一化，
+// 不能直接 .trim()——那会在用户输入数字的那一瞬间抛 TypeError。
+// 这个函数在模板渲染期被调用（:class / v-if），抛异常会让 Vue 卸载整棵组件树，
+// 表现是整页白屏，而不是某个输入框报错。
 function usedDirty(c) {
-  const raw = (usedRatioDraft.value[c.channelId] ?? '').trim()
-  if (!Number.isFinite(Number(raw)) || raw === '') return false
+  const raw = String(usedRatioDraft.value[c.channelId] ?? '').trim()
+  if (raw === '') return false
+  const num = Number(raw)
+  if (!Number.isFinite(num) || num < 0) return false
   const before = c.upstreamRatio === null || c.upstreamRatio === undefined ? null : c.upstreamRatio
-  return before === null || Number(raw) !== before
+  return before === null || num !== before
 }
 
 async function checkChannels() {
@@ -503,13 +512,15 @@ async function saveUsedRatios() {
   checkChannelsMsg.value = ''
   const items = []
   for (const c of usedChannels.value) {
-    const raw = (usedRatioDraft.value[c.channelId] ?? '').trim()
+    // 同 usedDirty：type=number 的 v-model 会给到 number，必须 String() 归一化后再 trim。
+    const raw = String(usedRatioDraft.value[c.channelId] ?? '').trim()
     if (raw === '') continue
     const num = Number(raw)
     if (!Number.isFinite(num) || num < 0) {
       checkChannelsError.value = `渠道 ${c.channelId} 的倍率必须是非负数字`
       return
     }
+    // 用数值比较，避免 "0.60" 与已存的 0.6 被当成改动而重复提交。
     const before = c.upstreamRatio === null || c.upstreamRatio === undefined ? null : c.upstreamRatio
     if (before !== null && before === num) continue
     items.push({ channelId: c.channelId, upstreamRatio: num, note: '' })
