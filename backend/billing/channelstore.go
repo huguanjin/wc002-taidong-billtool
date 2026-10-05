@@ -12,7 +12,7 @@ import (
 // ChannelInfo 从业务库 channels 表拉取的渠道标识。
 //
 // 只取成本估算需要的字段：key / base_url 等敏感信息一概不落本地，
-// 渠道名也只为让成本表读得懂。
+// 渠道名也只为让成本利润表读得懂。
 type ChannelInfo struct {
 	ChannelID    int    `json:"channelId"`
 	Name         string `json:"name"`
@@ -80,7 +80,7 @@ func EnsureChannelSchema(cfg PGConfig) error {
 //
 // 用 UPSERT：已存在的渠道更新名称/类型/状态，新增的插入。
 // 业务库里已删除的渠道**不从本地删除**——历史账期可能仍引用它，
-// 删了会让那份账期的成本表凭空少行；改由 ListChannels 标记 stale 提示复核。
+// 删了会让那份账期的成本利润表凭空少行；改由 ListChannels 标记 stale 提示复核。
 func PullChannelsFromDB(biz DBConfig, pg PGConfig) (int, error) {
 	channels, err := fetchChannelsFromDB(biz)
 	if err != nil {
@@ -116,7 +116,7 @@ func fetchChannelsFromDB(biz DBConfig) ([]ChannelInfo, error) {
 		}
 		c.Name = strings.TrimSpace(name.String)
 		if c.Name == "" {
-			// 渠道名可能为空串，落库时给个占位，避免成本表出现空白渠道名列。
+			// 渠道名可能为空串，落库时给个占位，避免成本利润表出现空白渠道名列。
 			c.Name = fmt.Sprintf("渠道 %d", c.ChannelID)
 		}
 		c.ChannelGroup = strings.TrimSpace(group.String)

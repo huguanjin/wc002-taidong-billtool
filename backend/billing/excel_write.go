@@ -129,9 +129,9 @@ func (w *ExcelSanitizedWriter) Close() error {
 
 func strPtr(s string) *string { return &s }
 
-// extraColumn 模板表在 AC 之后追加的一列，供成本表使用（账单不追加任何列）。
+// extraColumn 模板表在 AC 之后追加的一列，供成本利润表使用（账单不追加任何列）。
 //
-// 抽成数据而不是复制一份写出逻辑：成本表与账单要求前 29 列逐列同构，
+// 抽成数据而不是复制一份写出逻辑：成本利润表与账单要求前 29 列逐列同构，
 // 一旦各写一份，两边必然随时间走偏（列宽、样式、公式引用的差异会悄悄累积）。
 type extraColumn struct {
 	Title string
@@ -149,8 +149,8 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		discount, exchangeRate, preferPriceTable, manualMarkers)
 }
 
-// writeTemplateSheet 是账单与成本表共用的写出核心：前 29 列语义完全一致，
-// extras 为空即账单，非空则在 AC 之后追加各列（成本表用）。
+// writeTemplateSheet 是账单与成本利润表共用的写出核心：前 29 列语义完全一致，
+// extras 为空即账单，非空则在 AC 之后追加各列（成本利润表用）。
 func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras []extraColumn, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
 	if _, err := os.Stat(templatePath); err != nil {
 		return nil, fmt.Errorf("账单模板不存在: %s", templatePath)
@@ -204,7 +204,7 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		return nil, err
 	}
 
-	// 追加列的表头由代码写：模板文件里 AC 之后是空的，成本表要自己补表头。
+	// 追加列的表头由代码写：模板文件里 AC 之后是空的，成本利润表要自己补表头。
 	// 起始列固定为 AC 之后，与 buildLogExportColumns 的既有列布局对齐。
 	const extraStartCol = 29 + 1 // AD
 	for i, ex := range extras {
@@ -438,7 +438,7 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 			setStr(28, r, strings.Join(notes, "；"))
 		}
 
-		// 追加列（成本表的渠道/上游折扣/上游成本）。写在这里是为了让它的值
+		// 追加列（成本利润表的渠道/上游折扣/上游成本）。写在这里是为了让它的值
 		// 能引用同行的 AC，公式在 Excel 里可追溯而不是写死的数。
 		for i, ex := range extras {
 			col := extraStartCol + i

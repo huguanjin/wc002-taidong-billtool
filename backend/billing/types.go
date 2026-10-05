@@ -197,7 +197,7 @@ type Params struct {
 	// IncludeBillingParams 控制脱敏日志是否附带站点内部计费参数列（见 SanitizedBillingColumns）。
 	// 默认 false：这些字段暴露内部定价倍率，是否对客户可见属于商务决定。
 	IncludeBillingParams bool
-	// GenerateCost 是否额外生成一张成本表（账单全部列 + 渠道/上游折扣/上游成本）。
+	// GenerateCost 是否额外生成一张成本利润表（账单全部列 + 渠道/上游折扣/上游成本）。
 	// 需要日志含 channel_id 列，且日志用到的渠道都已维护上游倍率。
 	GenerateCost bool
 	// ChannelUpstreamRatios 渠道 ID → 上游倍率。由 handler 从本地 PG 读好传入，
@@ -265,6 +265,29 @@ type Summary struct {
 	RowCount           int              `json:"rowCount"`
 	CacheHitRows       int              `json:"cacheHitRows"`
 	WebSearchRows      int              `json:"webSearchRows"`
+	// CostTotals 成本利润表的合计，仅当成本利润表**成功生成**时非 nil。
+	// 由后端算好而不是让前端去解析 xlsx：金额口径必须与表内公式（成本=AC×AF×汇率）
+	// 完全一致，两边各算一份必然随时间漂移。
+	CostTotals *CostTotals `json:"costTotals,omitempty"`
+}
+
+// CostTotals 成本利润表的三个合计数，供结果区展示与复制。
+//
+// 注意 CostCNY 只累加**已维护倍率**的行：未维护的渠道按 nil 跳过，
+// 所以 PricedRows 可能小于总行数，此时利润是「已覆盖部分」的利润而非全量。
+// 前端必须把这个区别说出来，否则会被读成整体毛利。
+type CostTotals struct {
+	// SettleCNY 结算额合计（对应成本利润表 V 列合计）。
+	SettleCNY float64 `json:"settleCny"`
+	// CostCNY 上游成本合计（对应 AG 列合计，未维护倍率的行不计入）。
+	CostCNY float64 `json:"costCny"`
+	// ProfitCNY 利润合计 = SettleCNY − CostCNY。
+	ProfitCNY float64 `json:"profitCny"`
+	// PricedRows 参与了成本合计的行数；TotalRows 是成本利润表的全部行数。
+	PricedRows int `json:"pricedRows"`
+	TotalRows  int `json:"totalRows"`
+	// ChannelCount 成本利润表里覆盖到的渠道数（去重）。
+	ChannelCount int `json:"channelCount"`
 }
 
 // RowSummary 单个 (模型, 分组) 汇总行，供前端表格展示。

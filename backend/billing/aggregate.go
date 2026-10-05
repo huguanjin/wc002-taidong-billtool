@@ -132,7 +132,7 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			}
 		}
 
-		// 计费口径统一走 priceRow（见 rowpricing.go）：主账单与成本表共用同一份实现，
+		// 计费口径统一走 priceRow（见 rowpricing.go）：主账单与成本利润表共用同一份实现，
 		// 分支语义只在一处维护。这里只负责把它算出的结果并进桶。
 		pr := priceRow(model, other, prompt, completion,
 			cacheRead, cacheWrite5m, cacheWrite1h, quota,

@@ -118,7 +118,7 @@ func TestCheckUpstreamRatiosThreeWay(t *testing.T) {
 //
 // 页面会把日志里出现、渠道表里没有的渠道号也列出来供就地补录（main.go 的
 // handleCheckChannels）。如果这里先判渠道表成员资格，那个输入框就是个摆设：
-// 用户填了、保存了，出账时仍被判成 Unknown 而拦下，永远出不来成本表。
+// 用户填了、保存了，出账时仍被判成 Unknown 而拦下，永远出不来成本利润表。
 func TestCheckUpstreamRatiosMaintainedWinsOverUnknown(t *testing.T) {
 	channels := map[int]ChannelInfo{101: {ChannelID: 101, Name: "AZ"}}
 	// 101 在渠道表里也已维护；765 不在渠道表里（业务库已硬删除），但同样维护了倍率。
@@ -140,10 +140,10 @@ func TestCheckUpstreamRatiosMaintainedWinsOverUnknown(t *testing.T) {
 	assert.Contains(t, find765.Name, "765", "渠道表里查不到名字时要有占位名，不能留空")
 }
 
-// TestGenerateCostTableUnknownChannelDoesNotBlock 回归：未知渠道不该拦住成本表。
+// TestGenerateCostTableUnknownChannelDoesNotBlock 回归：未知渠道不该拦住成本利润表。
 //
-// 这类渠道业务库已查不到、无法补录，拦下来等于成本表永远出不来。
-// 处置与页面提示、DEPLOY.md 一致：成本列留空、不计入合计，但**成本表照常生成**。
+// 这类渠道业务库已查不到、无法补录，拦下来等于成本利润表永远出不来。
+// 处置与页面提示、DEPLOY.md 一致：成本列留空、不计入合计，但**成本利润表照常生成**。
 func TestGenerateCostTableUnknownChannelDoesNotBlock(t *testing.T) {
 	dir := t.TempDir()
 	templatePath := filepath.Join(dir, "template.xlsx")
@@ -168,16 +168,133 @@ func TestGenerateCostTableUnknownChannelDoesNotBlock(t *testing.T) {
 		ChannelInfos:          map[int]ChannelInfo{102: {ChannelID: 102, Name: "AZ"}},
 	}
 
-	costPath, blocked, missing, unknown, err := generateCostTable(
+	costPath, totals, summaryText, blocked, missing, unknown, err := generateCostTable(
 		"", templatePath, billPath, rows, headers,
 		&PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}},
 		params, 7.0, false, 2026, 9)
 	require.NoError(t, err)
 
-	assert.False(t, blocked, "只有未知渠道时不该拦下成本表")
+	assert.False(t, blocked, "只有未知渠道时不该拦下成本利润表")
 	assert.Empty(t, missing)
 	assert.Equal(t, []int{999}, unknown, "未知渠道仍要如实报出，供页面提示")
-	assert.NotEmpty(t, costPath, "成本表应正常生成")
+	assert.NotEmpty(t, costPath, "成本利润表应正常生成")
+	require.NotNil(t, totals, "成功生成时应一并给出合计")
+	assert.NotEmpty(t, summaryText, "成功生成时应一并给出可复制的说明文字")
+}
+
+// TestWriteCostProfitColumn 成本利润表的 AH 列（利润 = V − AG）：
+//   - 已维护倍率的行写 IF 判空公式，不是写死的数值，可在 Excel 里追溯；
+//   - 未维护倍率的行必须留空——Excel 把空当 0，直接写 V-AG 会按「上游免费」算出虚高毛利；
+//   - 合计行对 AH 求 SUM，空行被自动跳过。
+func TestWriteCostProfitColumn(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.xlsx")
+	outPath := filepath.Join(dir, "cost.xlsx")
+	buildBillFixtureTemplate(t, templatePath)
+
+	const rate = 7.0
+	f := func(v float64) *float64 { return &v }
+	rows := []*CostRow{
+		{AggRow: &AggRow{
+			Model: "gpt-5.5", Group: "Codex|0.4", KeyGroup: "Codex", GroupRatio: 0.4,
+			Uncached: 1000, Output: 100, Quota: 5000, Rows: 1, OfficialUSD: 12.119489,
+			BillingMode: BillingModeTieredExpr, BillingExpr: `tier("base", p*1)`,
+		}, ChannelID: 101, ChannelName: "AZ", UpstreamRatio: f(0.4)},
+		{AggRow: &AggRow{
+			Model: "gpt-5.5", Group: "Codex|0.4", KeyGroup: "Codex", GroupRatio: 0.4,
+			Uncached: 2000, Output: 200, Quota: 9000, Rows: 1, OfficialUSD: 6.0,
+			BillingMode: BillingModeTieredExpr, BillingExpr: `tier("base", p*1)`,
+		}, ChannelID: 102, ChannelName: "AWS"}, // 未维护倍率
+	}
+
+	require.NoError(t, WriteCostFromTemplate(templatePath, outPath, rows, 2026, 9,
+		nil, nil, rate, false, nil))
+
+	file, err := excelize.OpenFile(outPath)
+	require.NoError(t, err)
+	defer file.Close()
+	sheet := file.GetSheetName(0)
+	cellRows, err := file.GetRows(sheet)
+	require.NoError(t, err)
+
+	assert.Equal(t, "利润（人民币）", cellAt(cellRows[0], 33), "AH 列表头")
+
+	// 第一行：利润写成引用同行 V 与 AG 的公式，而不是固定金额。
+	assert.Equal(t, `IF(AG3="","",V3-AG3)`, formula(t, file, sheet, 34, 3),
+		"AH 应为可追溯的公式，且对空白 AG 做保护")
+
+	// 第二行（未维护倍率）：AF/AG/AH 三列都必须留空。
+	assert.Equal(t, "", cell(t, file, sheet, 32, 4), "未维护倍率的 AF 留空")
+	assert.Equal(t, "", cell(t, file, sheet, 33, 4), "未维护倍率的 AG 留空")
+	assert.Equal(t, "", cell(t, file, sheet, 34, 4),
+		"未维护倍率的 AH 必须留空：Excel 把空当 0，V-AG 会算出虚高毛利")
+
+	// 合计行对 AH 求 SUM（AG 已是同样处理）。
+	totalAxis := mustAxis(34, 5)
+	totalFormula, err := file.GetCellFormula(sheet, totalAxis)
+	require.NoError(t, err)
+	assert.Contains(t, totalFormula, "SUM(", "AH 合计应是 SUM 公式")
+	assert.Contains(t, totalFormula, "AH3:AH4", "求和范围应覆盖两行数据")
+}
+
+// TestSummarizeCostSkipsUnpricedRows 合计口径：未维护倍率的行**两边都不计**。
+//
+// 只扣成本不扣结算额会得出「全量结算 − 部分成本」——利润虚高，是最危险的错法。
+// 同时必须报出有多少行没覆盖，否则这段文字会被读成整体毛利。
+func TestSummarizeCostSkipsUnpricedRows(t *testing.T) {
+	const rate = 7.0
+	f := func(v float64) *float64 { return &v }
+	// 两行刊例相同、分组相同，只有渠道倍率不同：一行已维护 0.4，一行未维护。
+	mk := func(channel int, ratio *float64) *CostRow {
+		return &CostRow{
+			AggRow: &AggRow{
+				Model: "gpt-5.5", Group: "Codex|0.4", KeyGroup: "Codex", GroupRatio: 0.4,
+				Quota: 5000, Rows: 1, OfficialUSD: 12.119489,
+				BillingMode: BillingModeTieredExpr, BillingExpr: `tier("base", p*1)`,
+			},
+			ChannelID: channel, UpstreamRatio: ratio,
+		}
+	}
+	priced := mk(101, f(0.4))
+	unpriced := mk(102, nil)
+
+	totals, text := SummarizeCost([]*CostRow{priced, unpriced}, NewPriceBook(), nil, rate, false, nil, 2026, 9)
+
+	assert.Equal(t, 2, totals.TotalRows)
+	assert.Equal(t, 1, totals.PricedRows, "只有一行参与合计")
+
+	// 只有已维护那一行的金额进了合计。
+	wantSettle := round(OfficialListCNY(priced.AggRow, rate)*priced.RatioDiscount(), MoneyDecimals)
+	assert.InDelta(t, wantSettle, totals.SettleCNY, 1e-6, "结算额只算已覆盖的行")
+	assert.InDelta(t, wantSettle, totals.CostCNY, 1e-6, "上游倍率等于分组倍率，成本应等于结算额")
+	assert.InDelta(t, 0.0, totals.ProfitCNY, 1e-6)
+	// ChannelCount 是「表里出现的渠道数」，与是否维护倍率无关——
+	// 102 未维护但它确实在表中占一行，所以是 2。
+	assert.Equal(t, 2, totals.ChannelCount)
+
+	// 文案必须写明有行没覆盖，并给出账期。
+	assert.Contains(t, text, "2026-09", "账期要写出来")
+	assert.Contains(t, text, "结算金额")
+	assert.Contains(t, text, "上游成本")
+	assert.Contains(t, text, "利润")
+	assert.Contains(t, text, "1 行因渠道未维护上游倍率未计入", "漏掉的行数必须说明")
+}
+
+// TestFormatCostSummaryFullCoverage 全覆盖时不应出现「未计入」的注解，且金额不带多余尾零。
+func TestFormatCostSummaryFullCoverage(t *testing.T) {
+	totals := CostTotals{
+		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
+	}
+	text := FormatCostSummary(totals, 2026, 9)
+
+	assert.NotContains(t, text, "未计入", "全覆盖时不该有保留说明")
+	assert.Contains(t, text, "账期：2026-09")
+	assert.Contains(t, text, "结算金额：¥15146.6056")
+	assert.Contains(t, text, "上游成本：¥9000")
+	assert.Contains(t, text, "利润：¥6146.6056")
+	assert.Contains(t, text, "毛利率 40.58%", "毛利率 = 利润/结算额，保留两位")
+	assert.Contains(t, text, "覆盖渠道：3 个")
 }
 
 // ---- 按渠道展开 ----
@@ -301,9 +418,9 @@ func TestUnmaintainedChannelCostIsEmpty(t *testing.T) {
 	assert.Equal(t, 0.0, cost, "返回 0 只是零值，调用方必须靠 ok=false 判断并留空")
 }
 
-// ---- 成本表写出 ----
+// ---- 成本利润表写出 ----
 
-// TestWriteCostFromTemplateLayout 成本表的列布局：
+// TestWriteCostFromTemplateLayout 成本利润表的列布局：
 //   - A~AC 与账单逐列同构（渠道信息不塞进 C 列，否则与账单的行对不上）；
 //   - AD=渠道ID、AE=渠道名称、AF=上游折扣、AG=上游成本（人民币，公式）；
 //   - 未维护倍率的行 AF/AG 必须留空，且不参与合计。

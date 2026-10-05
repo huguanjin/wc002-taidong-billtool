@@ -13,17 +13,21 @@ import (
 type GenerateResult struct {
 	BillPath      string
 	SanitizedPath string // 为空表示未生成
-	// CostPath 成本表路径；为空表示未生成（未勾选、或倍率未维护被拦下）。
+	// CostPath 成本利润表路径；为空表示未生成（未勾选、或倍率未维护被拦下）。
 	CostPath string
-	// CostBlocked 为真表示用户勾了生成成本表，但有渠道尚未维护上游倍率，
-	// 于是没有生成成本表。**这不是错误**——硬报错会让用户丢掉已填好的出账参数。
+	// CostBlocked 为真表示用户勾了生成成本利润表，但有渠道尚未维护上游倍率，
+	// 于是没有生成成本利润表。**这不是错误**——硬报错会让用户丢掉已填好的出账参数。
 	// 调用方应把 MissingChannelInfos / UnknownChannelIDs 交给页面就地补录。
 	CostBlocked bool
 	// MissingChannelInfos 未维护倍率的渠道（渠道表里查得到，可以补录）。
 	MissingChannelInfos []ChannelInfo
 	// UnknownChannelIDs 日志里有、但渠道表里查不到的渠道号（多半已被硬删除，无法补录）。
 	UnknownChannelIDs []int
-	Summary           Summary
+	// CostTotals 成本利润表合计；为空表示成本利润表没生成。前端据此拼可复制的说明文字。
+	CostTotals *CostTotals
+	// CostSummary 结果区那段可复制的文字，由后端按与表内公式同源的口径生成。
+	CostSummary string
+	Summary     Summary
 }
 
 // GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
@@ -134,9 +138,9 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 
 	result := &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}
 
-	// 成本表是增量产物：不生成时账单与改动前逐格一致，不影响既有客户。
+	// 成本利润表是增量产物：不生成时账单与改动前逐格一致，不影响既有客户。
 	if params.GenerateCost {
-		costPath, blocked, missing, unknown, cerr := generateCostTable(
+		costPath, totals, summaryText, blocked, missing, unknown, cerr := generateCostTable(
 			inputPath, templatePath, billPath, rows, headers, book, params, exchangeRate, preferPriceTable, year, month)
 		if cerr != nil {
 			return nil, cerr
@@ -146,44 +150,54 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		result.UnknownChannelIDs = unknown
 		if !blocked {
 			result.CostPath = costPath
-		}	}
+			result.CostTotals = totals
+			result.CostSummary = summaryText
+			// 合计同时挂进 Summary：前端结果区的「结算/成本/利润」与可复制文字
+			// 都读这一份，避免两处各取一套数。
+			result.Summary.CostTotals = totals
+		}
+	}
 
 	return result, nil
 }
 
-// generateCostTable 生成成本表。若有渠道还没维护倍率，**不报错中断**，而是返回
+// generateCostTable 生成成本利润表。若有渠道还没维护倍率，**不报错中断**，而是返回
 // blocked=true 与待补录清单——用户此时已经填好了出账参数，硬报错会让他白填一遍。
 //
-// 返回 (成本表路径, 是否被拦下, 未维护渠道, 未知渠道号, 错误)。
+// 返回 (成本利润表路径, 合计, 可复制文字, 是否被拦下, 未维护渠道, 未知渠道号, 错误)。
 func generateCostTable(inputPath, templatePath, billPath string, rows [][]string, headers []string,
-	book *PriceBook, params Params, exchangeRate float64, preferPriceTable bool, year, month int) (string, bool, []ChannelInfo, []int, error) {
+	book *PriceBook, params Params, exchangeRate float64, preferPriceTable bool, year, month int) (
+	string, *CostTotals, string, bool, []ChannelInfo, []int, error) {
 
 	channelIDs, err := ExtractChannelIDs(headers, rows)
 	if err != nil {
-		return "", false, nil, nil, err
+		return "", nil, "", false, nil, nil, err
 	}
 	status := CheckUpstreamRatios(channelIDs, params.ChannelUpstreamRatios, params.ChannelInfos)
 	if len(status.Missing) > 0 {
 		// 未维护倍率的渠道还**能**补录，先拦下把清单交给页面。
-		return "", true, status.Missing, status.UnknownChannelIDs, nil
+		return "", nil, "", true, status.Missing, status.UnknownChannelIDs, nil
 	}
-	// 未知渠道不拦：这类渠道业务库已查不到、填不了倍率，拦下来等于成本表永远出不来。
+	// 未知渠道不拦：这类渠道业务库已查不到、填不了倍率，拦下来等于成本利润表永远出不来。
 	// 它们的成本列留空且不计入合计，与页面提示、DEPLOY.md 的说法一致。
 
 	costRows, err := AggregateCostByChannel(rows, headers, book, exchangeRate, preferPriceTable,
 		nil, params.ChannelUpstreamRatios, params.ChannelNames)
 	if err != nil {
-		return "", false, nil, nil, fmt.Errorf("成本聚合失败: %w", err)
+		return "", nil, "", false, nil, nil, fmt.Errorf("成本聚合失败: %w", err)
 	}
 
 	outPath := costOutputPath(billPath)
 	if err := WriteCostFromTemplate(templatePath, outPath, costRows, year, month, book,
 		params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers); err != nil {
-		return "", false, nil, nil, fmt.Errorf("写出成本表失败: %w", err)
+		return "", nil, "", false, nil, nil, fmt.Errorf("写出成本利润表失败: %w", err)
 	}
-	// 未知渠道不拦生成，但必须如实报出：成本表里它们的成本列是空的，
-	// 用户得知道是哪几个渠道号——否则会以为成本表已经算全了。
-	return outPath, false, nil, status.UnknownChannelIDs, nil
+	// 合计与文字用与表内公式同源的口径算，避免结果区报的数与 xlsx 里的 SUM 对不上。
+	totals, text := SummarizeCost(costRows, book, params.Discount, exchangeRate,
+		preferPriceTable, params.DomesticMarkers, year, month)
+	// 未知渠道不拦生成，但必须如实报出：成本利润表里它们的成本列是空的，
+	// 用户得知道是哪几个渠道号——否则会以为成本利润表已经算全了。
+	return outPath, &totals, text, false, nil, status.UnknownChannelIDs, nil
 }
 
 // mergeManualPrices 把用户手动补全的价格写入 book.ByModel，作为「哪里都找不到定价」时的

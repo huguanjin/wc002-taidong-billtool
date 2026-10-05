@@ -27,7 +27,7 @@ var (
 	// logRequiredColumns 人工 SQL 之外必需的列，紧跟基础列之后：
 	//   other      —— 缓存计费、阶梯表达式、工具调用、web_search 全在它里面；
 	//   channel_id —— 成本估算要按渠道展开，且脱敏日志会把 other 整列丢掉，
-	//                 渠道号只藏在 other.admin_info 里的话，脱敏日志就永远做不了成本表。
+	//                 渠道号只藏在 other.admin_info 里的话，脱敏日志就永远做不了成本利润表。
 	// 两列都放在必选而非可选：缺了 any 一个，对应功能就直接失效而不是降级。
 	logRequiredColumns = []string{"other", "channel_id"}
 	// logOptionalColumns 勾选才加的可选列（跨账号排查用）。
@@ -291,7 +291,7 @@ func exportFingerprint(params LogExportParams) string {
 //
 // channel_id 是成本估算的必需列，但并非所有部署都有（老库、自定义表结构、
 // 或 ClickHouse 迁移中途）。缺列时**不静默跳过**——导出一份没有渠道号的日志，
-// 用户会在生成成本表时才发现，那时已经白导一次了；这里直接少这一列，
+// 用户会在生成成本利润表时才发现，那时已经白导一次了；这里直接少这一列，
 // 由 LogExportColumnsFor 同步反映，并在结果里回传实际列清单供页面提示。
 func buildLogExportSelectWith(includeUserID, hasChannelID bool) string {
 	cols := make([]string, 0, len(logBaseColumns)+len(logRequiredColumns)+len(logOptionalColumns))

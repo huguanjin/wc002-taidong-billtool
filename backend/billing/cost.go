@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// CostRow 成本表的一行：主账单的一个桶再按渠道拆开。
+// CostRow 成本利润表的一行：主账单的一个桶再按渠道拆开。
 //
 // 复用 AggRow 承载前 29 列的语义（模型/分组/倍率/用量/刊例/结算），
 // 额外挂上渠道与上游倍率。
@@ -45,11 +45,11 @@ func (c *CostRow) UpstreamCostCNY(exchangeRate float64) (float64, bool) {
 	return OfficialListCNY(c.AggRow, exchangeRate) * d, true
 }
 
-// AggregateCostByChannel 按 (模型, 分组, 倍率桶, 渠道) 聚合，供成本表使用。
+// AggregateCostByChannel 按 (模型, 分组, 倍率桶, 渠道) 聚合，供成本利润表使用。
 //
 // 刻意与 AggregateFromRows 分开：主账单的桶键不含渠道，把 channelId 加进去
 // 会让账单被按渠道拆成大量重复行（同一模型出现十几行），对客户是明确的回归。
-// 成本表是独立产物，各按各的粒度聚合。
+// 成本利润表是独立产物，各按各的粒度聚合。
 //
 // quotas 是渠道 → 上游倍率；缺失的渠道其成本列留空，由调用方在备注里说明。
 func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, exchangeRate float64,
@@ -237,7 +237,7 @@ type UpstreamRatioStatus struct {
 	// UnknownChannelIDs 日志里有、但渠道表里查不到的渠道号。
 	//
 	// 必须与 Missing 分开：这类渠道多半已在业务库被硬删除，**无法维护倍率**，
-	// 页面不该引导用户去"补录"一个不存在的渠道。成本表里如实标注，
+	// 页面不该引导用户去"补录"一个不存在的渠道。成本利润表里如实标注，
 	// 而不是静默按 0（成本虚低）或按 1（成本虚高）——两种都会误导毛利判断。
 	UnknownChannelIDs []int `json:"unknownChannelIds"`
 }

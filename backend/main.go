@@ -840,13 +840,13 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	// 国产/站内定价标识：一行一个，前端用多行文本框填写；空行自动丢弃。
 	params.DomesticMarkers = parseMarkers(formValue(form, "domesticMarkers"))
 
-	// 成本表：勾选时从本地 PG 装载渠道倍率与渠道名。
+	// 成本利润表：勾选时从本地 PG 装载渠道倍率与渠道名。
 	// 不在这里做「有没有未维护渠道」的判断——那件事需要先读日志里的渠道集合，
 	// 由 billing.GenerateBill 在解析完日志后统一检查，避免把日志读两遍。
 	params.GenerateCost = formValue(form, "generateCost") == "true"
 	if params.GenerateCost {
 		if pgConfig == nil {
-			httpError(w, http.StatusBadRequest, "生成成本表需要先配置 PostgreSQL（BILL_PG_*）并拉取渠道清单")
+			httpError(w, http.StatusBadRequest, "生成成本利润表需要先配置 PostgreSQL（BILL_PG_*）并拉取渠道清单")
 			return
 		}
 		ratios, err := billing.ChannelRatioMap(*pgConfig)
@@ -897,14 +897,18 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	if result.CostPath != "" {
 		resp["costFileName"] = filepath.Base(result.CostPath)
 		resp["costUrl"] = "/api/download/" + jobID + "/cost"
+		// 结果区要展示/复制的成本利润摘要：数字由后端按与表内公式同源的口径算好，
+		// 前端只负责渲染与复制，不再自己拼金额。
+		resp["costSummary"] = result.CostSummary
+		resp["costTotals"] = result.CostTotals
 	}
-	// 被拦下的情形**不是错误**：账单已经生成并登记好了，只是成本表没出，
+	// 被拦下的情形**不是错误**：账单已经生成并登记好了，只是成本利润表没出，
 	// 把待补录的渠道清单交给页面，用户补完倍率再勾一次即可。
 	if result.CostBlocked {
 		resp["costBlocked"] = true
 		resp["missingChannels"] = result.MissingChannelInfos
 	}
-	// 未知渠道无论是否被拦下都要告诉页面：成本表里它们的成本列是空的，
+	// 未知渠道无论是否被拦下都要告诉页面：成本利润表里它们的成本列是空的，
 	// 用户得知道是哪几个渠道号空着。
 	if len(result.UnknownChannelIDs) > 0 {
 		resp["unknownChannelIds"] = result.UnknownChannelIDs

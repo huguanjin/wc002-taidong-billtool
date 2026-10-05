@@ -356,6 +356,45 @@ function fmtMoney(v) {
   return Number(v).toLocaleString('zh-CN', { minimumFractionDigits: 4, maximumFractionDigits: 4 })
 }
 
+// 成本利润摘要的复制。文案由后端给出（与 xlsx 内公式同源），前端不重新拼金额。
+const costSummaryRef = ref(null)
+const copyState = ref('')
+
+// 注意：部署在 http 上时 navigator.clipboard 不可用（只在安全上下文里存在），
+// 所以必须有回退——否则线上点「复制」会静默失败或抛异常。
+async function copyCostSummary() {
+  const text = result.value && result.value.costSummary
+  if (!text) return
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      copyState.value = 'ok'
+    } else {
+      selectCostSummary()
+      copyState.value = 'fail'
+      return
+    }
+  } catch (err) {
+    selectCostSummary()
+    copyState.value = 'fail'
+    return
+  }
+  setTimeout(() => {
+    copyState.value = ''
+  }, 2000)
+}
+
+// 选中摘要文本，供用户按 Ctrl+C；剪贴板 API 不可用时的兜底。
+function selectCostSummary() {
+  const el = costSummaryRef.value
+  if (!el || !window.getSelection) return
+  const range = document.createRange()
+  range.selectNodeContents(el)
+  const sel = window.getSelection()
+  sel.removeAllRanges()
+  sel.addRange(range)
+}
+
 const hasMissingPrice = computed(
   () => result.value && result.value.summary.missingPriceModels && result.value.summary.missingPriceModels.length > 0
 )
@@ -492,7 +531,7 @@ async function checkChannels() {
     usedRatioDraft.value = draft
 
     if (data.missingCount === 0 && data.unknownCount === 0) {
-      checkChannelsMsg.value = `日志用到的 ${usedChannels.value.length} 个渠道都已维护倍率，可以生成成本表。`
+      checkChannelsMsg.value = `日志用到的 ${usedChannels.value.length} 个渠道都已维护倍率，可以生成成本利润表。`
     } else {
       checkChannelsMsg.value = ''
     }
@@ -543,7 +582,7 @@ async function saveUsedRatios() {
       checkChannelsError.value = data.error || `保存失败（${resp.status}）`
       return
     }
-    checkChannelsMsg.value = `已保存 ${data.saved} 个渠道的倍率，可以生成成本表了。`
+    checkChannelsMsg.value = `已保存 ${data.saved} 个渠道的倍率，可以生成成本利润表了。`
     // 保存后刷新两处清单：预检结果与下方维护卡片。
     await checkChannels()
   } catch (err) {
@@ -828,6 +867,8 @@ async function handleSubmit() {
       return
     }
     result.value = data
+    // 上一轮的「已复制 ✓」不能带到这一次结果上，否则会误导。
+    copyState.value = ''
   } catch (err) {
     errorMsg.value = '请求失败：' + err.message
   } finally {
@@ -1296,14 +1337,14 @@ async function handleSubmit() {
           <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
         </select>
         <label><input v-model="form.includeBillingParams" type="checkbox" /> 附带计费参数列（模型/分组倍率等内部参数，默认不导出）</label>
-        <label><input v-model="form.generateCost" type="checkbox" /> 生成成本表（账单全部列 + 渠道/上游折扣/上游成本，需先维护渠道倍率）</label>
+        <label><input v-model="form.generateCost" type="checkbox" /> 生成成本利润表（账单全部列 + 渠道/上游折扣/上游成本，需先维护渠道倍率）</label>
       </div>
 
       <!-- 出账前预检渠道倍率：避免生成完账单才发现有渠道没维护 -->
       <div class="field">
         <label>渠道成本倍率</label>
         <span class="hint">
-          勾选「生成成本表」后，建议先点检查：它会读一遍当前日志，列出里面用到的渠道，
+          勾选「生成成本利润表」后，建议先点检查：它会读一遍当前日志，列出里面用到的渠道，
           没维护倍率的可以就地补录，补完再生成账单。
         </span>
         <div class="path-row">
@@ -1333,7 +1374,7 @@ async function handleSubmit() {
             在下面补录后保存，再生成账单即可。
           </p>
           <p v-else-if="usedUnsavedCount > 0" class="error">
-            有 {{ usedUnsavedCount }} 个倍率已填写但尚未保存，保存后才能用于生成成本表。
+            有 {{ usedUnsavedCount }} 个倍率已填写但尚未保存，保存后才能用于生成成本利润表。
           </p>
           <table>
             <thead>
@@ -1403,13 +1444,25 @@ async function handleSubmit() {
       <div class="downloads">
         <a class="btn" :href="result.billUrl">下载账单：{{ result.billFileName }}</a>
         <a class="btn" v-if="result.sanitizedUrl" :href="result.sanitizedUrl">下载脱敏日志：{{ result.sanitizedFileName }}</a>
-        <a class="btn" v-if="result.costUrl" :href="result.costUrl">下载成本表：{{ result.costFileName }}</a>
+        <a class="btn" v-if="result.costUrl" :href="result.costUrl">下载成本利润表：{{ result.costFileName }}</a>
       </div>
 
-      <!-- 成本表被拦下：账单已生成，只是有渠道没维护倍率。不是错误，给出补录入口。 -->
+      <!-- 成本利润摘要：数字与文字都由后端按与表内公式同源的口径算好，
+           这里只负责展示与复制，避免前端另算一套导致与 xlsx 对不上。 -->
+      <div v-if="result.costSummary" class="cost-summary">
+        <div class="cost-summary-head">
+          <strong>成本利润摘要</strong>
+          <button type="button" class="btn-browse" @click="copyCostSummary">
+            {{ copyState === 'ok' ? '已复制 ✓' : copyState === 'fail' ? '复制失败，请手动选中' : '复制' }}
+          </button>
+        </div>
+        <pre ref="costSummaryRef" class="cost-summary-text" @click="selectCostSummary">{{ result.costSummary }}</pre>
+      </div>
+
+      <!-- 成本利润表被拦下：账单已生成，只是有渠道没维护倍率。不是错误，给出补录入口。 -->
       <div v-if="result.costBlocked" class="cost-blocked">
         <p class="error">
-          成本表未生成：有渠道还没维护上游倍率。账单已正常生成，补录后重新生成即可。
+          成本利润表未生成：有渠道还没维护上游倍率。账单已正常生成，补录后重新生成即可。
         </p>
         <p v-if="result.missingChannels && result.missingChannels.length > 0">
           <strong>待补录渠道</strong>：
@@ -1420,15 +1473,15 @@ async function handleSubmit() {
         <button type="button" class="btn-browse" @click="focusChannelCard">去维护渠道倍率</button>
       </div>
 
-      <!-- 未知渠道提示放在拦截框外面：这类渠道无法补录，成本表照常生成，
-           但用户得知道成本表里哪几个渠道号的成本列是空的。 -->
+      <!-- 未知渠道提示放在拦截框外面：这类渠道无法补录，成本利润表照常生成，
+           但用户得知道表里哪几个渠道号的成本列是空的。 -->
       <p
         v-if="result.unknownChannelIds && result.unknownChannelIds.length > 0"
         class="hint cost-note"
       >
         有 {{ result.unknownChannelIds.length }} 个渠道号在渠道表里查不到（{{
           result.unknownChannelIds.join('，')
-        }}）——这些渠道多半已在业务库被删除，无法维护倍率，成本表里对应的成本列会留空。
+        }}）——这些渠道多半已在业务库被删除，无法维护倍率，成本利润表里对应的成本列会留空。
       </p>
       <table>
         <thead>
@@ -1601,6 +1654,35 @@ async function handleSubmit() {
 }
 .cost-note {
   margin-top: 10px;
+}
+/* 成本利润摘要：可复制的纯文本块 */
+.cost-summary {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border: 1px solid #d6e2f7;
+  border-radius: 6px;
+  background: #f7faff;
+}
+.cost-summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.cost-summary-text {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  background: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  cursor: text;
+  user-select: text;
 }
 /* 填了但还没保存的行：与「从未维护」区分开。
    以前两者共用一个底色，用户填完以为已生效，实际一个字节都没提交。 */
