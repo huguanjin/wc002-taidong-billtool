@@ -903,6 +903,10 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	if result.CostBlocked {
 		resp["costBlocked"] = true
 		resp["missingChannels"] = result.MissingChannelInfos
+	}
+	// 未知渠道无论是否被拦下都要告诉页面：成本表里它们的成本列是空的，
+	// 用户得知道是哪几个渠道号空着。
+	if len(result.UnknownChannelIDs) > 0 {
 		resp["unknownChannelIds"] = result.UnknownChannelIDs
 	}
 	writeJSON(w, http.StatusOK, resp)

@@ -113,6 +113,73 @@ func TestCheckUpstreamRatiosThreeWay(t *testing.T) {
 	assert.Empty(t, st3.UnknownChannelIDs)
 }
 
+// TestCheckUpstreamRatiosMaintainedWinsOverUnknown 回归：渠道表里查不到、但倍率已维护的渠道
+// 必须算 Maintained。
+//
+// 页面会把日志里出现、渠道表里没有的渠道号也列出来供就地补录（main.go 的
+// handleCheckChannels）。如果这里先判渠道表成员资格，那个输入框就是个摆设：
+// 用户填了、保存了，出账时仍被判成 Unknown 而拦下，永远出不来成本表。
+func TestCheckUpstreamRatiosMaintainedWinsOverUnknown(t *testing.T) {
+	channels := map[int]ChannelInfo{101: {ChannelID: 101, Name: "AZ"}}
+	// 101 在渠道表里也已维护；765 不在渠道表里（业务库已硬删除），但同样维护了倍率。
+	ratios := map[int]float64{101: 1.8, 765: 0.15}
+
+	st := CheckUpstreamRatios([]int{101, 765}, ratios, channels)
+
+	require.Len(t, st.Maintained, 2, "已维护倍率的渠道一律算已维护，与渠道表有无无关")
+	require.Empty(t, st.Missing)
+	assert.Empty(t, st.UnknownChannelIDs, "有倍率就不该再报「未知」")
+
+	var find765 *ChannelInfo
+	for i := range st.Maintained {
+		if st.Maintained[i].ChannelID == 765 {
+			find765 = &st.Maintained[i]
+		}
+	}
+	require.NotNil(t, find765, "765 应出现在已维护清单里")
+	assert.Contains(t, find765.Name, "765", "渠道表里查不到名字时要有占位名，不能留空")
+}
+
+// TestGenerateCostTableUnknownChannelDoesNotBlock 回归：未知渠道不该拦住成本表。
+//
+// 这类渠道业务库已查不到、无法补录，拦下来等于成本表永远出不来。
+// 处置与页面提示、DEPLOY.md 一致：成本列留空、不计入合计，但**成本表照常生成**。
+func TestGenerateCostTableUnknownChannelDoesNotBlock(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "template.xlsx")
+	billPath := filepath.Join(dir, "账单.xlsx")
+	buildBillFixtureTemplate(t, templatePath)
+
+	headers, rows := buildCostFixture(t)
+	// 这一批日志原本走 101 与 102。把第一行改成未知渠道 999，
+	// 让日志里只剩「已维护的 102」和「渠道表查不到的 999」——
+	// 这样才只触发未知渠道、不触发待补录，验证的是「未知渠道不拦」。
+	chIdx := 0
+	for i, h := range headers {
+		if h == "channel_id" {
+			chIdx = i
+		}
+	}
+	rows[0][chIdx] = "999"
+
+	params := Params{
+		ChannelUpstreamRatios: map[int]float64{102: 1.8},
+		ChannelNames:          map[int]string{102: "AZ", 999: "渠道 999"},
+		ChannelInfos:          map[int]ChannelInfo{102: {ChannelID: 102, Name: "AZ"}},
+	}
+
+	costPath, blocked, missing, unknown, err := generateCostTable(
+		"", templatePath, billPath, rows, headers,
+		&PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}},
+		params, 7.0, false, 2026, 9)
+	require.NoError(t, err)
+
+	assert.False(t, blocked, "只有未知渠道时不该拦下成本表")
+	assert.Empty(t, missing)
+	assert.Equal(t, []int{999}, unknown, "未知渠道仍要如实报出，供页面提示")
+	assert.NotEmpty(t, costPath, "成本表应正常生成")
+}
+
 // ---- 按渠道展开 ----
 
 // buildCostFixture 造一批日志行：同一 (模型, 分组) 走两个渠道。

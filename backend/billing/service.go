@@ -146,8 +146,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		result.UnknownChannelIDs = unknown
 		if !blocked {
 			result.CostPath = costPath
-		}
-	}
+		}	}
 
 	return result, nil
 }
@@ -164,11 +163,12 @@ func generateCostTable(inputPath, templatePath, billPath string, rows [][]string
 		return "", false, nil, nil, err
 	}
 	status := CheckUpstreamRatios(channelIDs, params.ChannelUpstreamRatios, params.ChannelInfos)
-	if len(status.Missing) > 0 || len(status.UnknownChannelIDs) > 0 {
-		// 未维护倍率的渠道无法估算成本；未知渠道连补录都做不到。
-		// 两种情况都拦下生成，把清单交给页面处理。
+	if len(status.Missing) > 0 {
+		// 未维护倍率的渠道还**能**补录，先拦下把清单交给页面。
 		return "", true, status.Missing, status.UnknownChannelIDs, nil
 	}
+	// 未知渠道不拦：这类渠道业务库已查不到、填不了倍率，拦下来等于成本表永远出不来。
+	// 它们的成本列留空且不计入合计，与页面提示、DEPLOY.md 的说法一致。
 
 	costRows, err := AggregateCostByChannel(rows, headers, book, exchangeRate, preferPriceTable,
 		nil, params.ChannelUpstreamRatios, params.ChannelNames)
@@ -181,7 +181,9 @@ func generateCostTable(inputPath, templatePath, billPath string, rows [][]string
 		params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers); err != nil {
 		return "", false, nil, nil, fmt.Errorf("写出成本表失败: %w", err)
 	}
-	return outPath, false, nil, nil, nil
+	// 未知渠道不拦生成，但必须如实报出：成本表里它们的成本列是空的，
+	// 用户得知道是哪几个渠道号——否则会以为成本表已经算全了。
+	return outPath, false, nil, status.UnknownChannelIDs, nil
 }
 
 // mergeManualPrices 把用户手动补全的价格写入 book.ByModel，作为「哪里都找不到定价」时的

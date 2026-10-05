@@ -428,9 +428,25 @@ const usedChannels = ref([])
 const usedRatioDraft = ref({})
 const savingUsedRatios = ref(false)
 
+// usedMissingCount 数的是**服务端真的没维护**的渠道，用来提示还要补几个。
+// 不能用它决定保存按钮——它有值就等于「已维护」了，按钮会消失。
 const usedMissingCount = computed(
-  () => usedChannels.value.filter((c) => !usedRatioDraft.value[c.channelId]).length
+  () => usedChannels.value.filter((c) => c.upstreamRatio === null || c.upstreamRatio === undefined).length
 )
+
+// usedUnsavedCount 数的是「填了但还没提交」的渠道，和 saveUsedRatios 实际会提交的条数一致。
+// 保存按钮必须看这个：否则把待补录的框填满后 missingCount 归零、按钮消失，
+// 用户会以为已经保存好了，实际一个字节都没写进 PG。
+const usedUnsavedCount = computed(
+  () => usedChannels.value.filter((c) => usedDirty(c)).length
+)
+
+function usedDirty(c) {
+  const raw = (usedRatioDraft.value[c.channelId] ?? '').trim()
+  if (!Number.isFinite(Number(raw)) || raw === '') return false
+  const before = c.upstreamRatio === null || c.upstreamRatio === undefined ? null : c.upstreamRatio
+  return before === null || Number(raw) !== before
+}
 
 async function checkChannels() {
   checkChannelsError.value = ''
@@ -1286,20 +1302,27 @@ async function handleSubmit() {
           <button
             type="button"
             class="btn-browse"
-            v-if="usedMissingCount > 0"
+            v-if="usedUnsavedCount > 0"
             @click="saveUsedRatios"
             :disabled="savingUsedRatios"
           >
-            {{ savingUsedRatios ? '保存中…' : `保存补录的倍率（${usedMissingCount}）` }}
+            {{ savingUsedRatios ? '保存中…' : `保存补录的倍率（${usedUnsavedCount}）` }}
           </button>
         </div>
         <p class="error" v-if="checkChannelsError">{{ checkChannelsError }}</p>
         <span class="hint" v-if="checkChannelsMsg">{{ checkChannelsMsg }}</span>
 
         <div v-if="checkChannelsDone && usedChannels.length > 0">
-          <p v-if="usedMissingCount > 0" class="error">
+          <p v-if="usedMissingCount > 0 && usedUnsavedCount > 0" class="error">
+            日志用到的渠道里有 {{ usedMissingCount }} 个还没维护倍率，你已填了 {{ usedUnsavedCount }} 个但尚未保存——
+            未维护的渠道成本列会留空、不计入合计。点旁边的按钮保存，再生成账单。
+          </p>
+          <p v-else-if="usedMissingCount > 0" class="error">
             日志用到的渠道里有 {{ usedMissingCount }} 个还没维护倍率——未维护的渠道成本列会留空、不计入合计。
-            补录后保存，再生成账单即可。
+            在下面补录后保存，再生成账单即可。
+          </p>
+          <p v-else-if="usedUnsavedCount > 0" class="error">
+            有 {{ usedUnsavedCount }} 个倍率已填写但尚未保存，保存后才能用于生成成本表。
           </p>
           <table>
             <thead>
@@ -1311,7 +1334,14 @@ async function handleSubmit() {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="c in usedChannels" :key="c.channelId" :class="{ 'row-missing': !usedRatioDraft[c.channelId] }">
+              <tr
+                v-for="c in usedChannels"
+                :key="c.channelId"
+                :class="{
+                  'row-missing': c.upstreamRatio === null || c.upstreamRatio === undefined,
+                  'row-unsaved': usedDirty(c),
+                }"
+              >
                 <td>{{ c.channelId }}</td>
                 <td>{{ c.name }}</td>
                 <td>
@@ -1324,7 +1354,13 @@ async function handleSubmit() {
                     class="ratio-input"
                   />
                 </td>
-                <td>{{ usedRatioDraft[c.channelId] ? '已维护' : '未维护' }}</td>
+                <td>
+                  <span v-if="c.upstreamRatio === null || c.upstreamRatio === undefined">未维护</span>
+                  <span v-else>已维护</span>
+                  <!-- 「填了未保存」必须与「从未维护」分开：以前状态列读的是输入框草稿，
+                       一敲键盘就显示「已维护」，用户以为存好了，实际没提交。 -->
+                  <span v-if="usedDirty(c)" class="unsaved-tag">填了未保存</span>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1370,13 +1406,19 @@ async function handleSubmit() {
             {{ c.name }}（{{ c.channelId }}）
           </span>
         </p>
-        <p v-if="result.unknownChannelIds && result.unknownChannelIds.length > 0" class="hint">
-          另有 {{ result.unknownChannelIds.length }} 个渠道号在渠道表里查不到（{{ result.unknownChannelIds.join('，') }}）——
-          这些渠道多半已在业务库被删除，无法维护倍率，成本表里会如实留空。
-        </p>
         <button type="button" class="btn-browse" @click="focusChannelCard">去维护渠道倍率</button>
       </div>
 
+      <!-- 未知渠道提示放在拦截框外面：这类渠道无法补录，成本表照常生成，
+           但用户得知道成本表里哪几个渠道号的成本列是空的。 -->
+      <p
+        v-if="result.unknownChannelIds && result.unknownChannelIds.length > 0"
+        class="hint cost-note"
+      >
+        有 {{ result.unknownChannelIds.length }} 个渠道号在渠道表里查不到（{{
+          result.unknownChannelIds.join('，')
+        }}）——这些渠道多半已在业务库被删除，无法维护倍率，成本表里对应的成本列会留空。
+      </p>
       <table>
         <thead>
           <tr>
@@ -1545,6 +1587,23 @@ async function handleSubmit() {
   border: 1px solid #f0c36d;
   border-radius: 4px;
   background: #fffdf5;
+}
+.cost-note {
+  margin-top: 10px;
+}
+/* 填了但还没保存的行：与「从未维护」区分开。
+   以前两者共用一个底色，用户填完以为已生效，实际一个字节都没提交。 */
+.row-unsaved {
+  background: #eef4ff;
+}
+.unsaved-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 3px;
+  background: #e3ecff;
+  color: #2c6ef2;
+  font-size: 12px;
 }
 .group-picker {
   display: flex;

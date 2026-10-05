@@ -20,13 +20,28 @@ const channelsMessage = ref('')
 const ratioDraft = ref({})
 const ratioNotes = ref({})
 
+// missingChannelCount / maintainedCount 读的是**服务端**的维护状态（c.upstreamRatio），
+// 不是输入框里的草稿——否则一敲键盘「已维护」就涨上去，用户会以为已经存好了。
 const missingChannelCount = computed(
-  () => channels.value.filter((c) => !ratioDraft.value[c.channelId]).length
+  () => channels.value.filter((c) => c.upstreamRatio === null || c.upstreamRatio === undefined).length
 )
 
 const maintainedCount = computed(
-  () => channels.value.filter((c) => ratioDraft.value[c.channelId]).length
+  () => channels.value.filter((c) => c.upstreamRatio !== null && c.upstreamRatio !== undefined).length
 )
+
+// pendingCount 数的是「填了但还没保存」的渠道，与 saveChannelRatios 会提交的条数一致。
+const pendingCount = computed(() => channels.value.filter((c) => isDirty(c)).length)
+
+// isDirty 必须与 saveChannelRatios 的判据保持一致，否则按钮上的数字会和实际提交数对不上。
+function isDirty(c) {
+  const raw = (ratioDraft.value[c.channelId] ?? '').trim()
+  const before =
+    c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
+  const noteBefore = c.note || ''
+  const noteNow = ratioNotes.value[c.channelId] || ''
+  return raw !== before || noteNow !== noteBefore
+}
 
 function syncChannelDraft(list) {
   const rd = {}
@@ -169,13 +184,16 @@ defineExpose({ loadChannels })
         type="button"
         class="btn-browse"
         @click="saveChannelRatios"
-        :disabled="savingChannels || channels.length === 0"
+        :disabled="savingChannels || pendingCount === 0"
       >
-        {{ savingChannels ? '保存中…' : '保存倍率' }}
+        {{ savingChannels ? '保存中…' : `保存倍率${pendingCount > 0 ? `（${pendingCount}）` : ''}` }}
       </button>
     </div>
     <p class="error" v-if="channelsError">{{ channelsError }}</p>
     <span class="hint" v-if="channelsMessage">{{ channelsMessage }}</span>
+    <span class="hint" v-if="pendingCount > 0">
+      有 {{ pendingCount }} 个改动尚未保存，点「保存倍率」提交。
+    </span>
     <span class="hint" v-if="channelsLoaded">
       共 {{ channels.length }} 个渠道，已维护 {{ maintainedCount }} 个<template
         v-if="missingChannelCount > 0"
@@ -198,7 +216,7 @@ defineExpose({ loadChannels })
         <tr
           v-for="c in channels"
           :key="c.channelId"
-          :class="{ 'row-missing': !ratioDraft[c.channelId] }"
+          :class="{ 'row-missing': !c.upstreamRatio, 'row-unsaved': isDirty(c) }"
         >
           <td>{{ c.channelId }}</td>
           <td>{{ c.name }}</td>
@@ -305,6 +323,12 @@ input {
 /* 未维护倍率的行高亮，让需要补录的渠道一眼可见。 */
 .row-missing {
   background: #fff8e1;
+}
+
+/* 填了但还没保存的行：与「从未维护」区分开。
+   以前两者长得一样，用户填完以为已生效，实际一个字节都没提交。 */
+.row-unsaved {
+  background: #eef4ff;
 }
 
 .ratio-input {

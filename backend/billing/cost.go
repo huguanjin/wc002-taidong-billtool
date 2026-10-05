@@ -243,6 +243,10 @@ type UpstreamRatioStatus struct {
 }
 
 // CheckUpstreamRatios 比对日志里用到的渠道集合与已维护的倍率。
+//
+// 判据以**倍率**为先，渠道表成员资格只是「能不能补录」的补充信息：
+// 已维护倍率的渠道一律算 Maintained，哪怕它已不在渠道表里（业务库硬删除的渠道，
+// 历史账期仍可能引用）。否则会出现「页面让人填、填了也不认」的死循环。
 func CheckUpstreamRatios(channelIDs []int, ratios map[int]float64, channels map[int]ChannelInfo) UpstreamRatioStatus {
 	var st UpstreamRatioStatus
 	seen := map[int]bool{}
@@ -252,13 +256,19 @@ func CheckUpstreamRatios(channelIDs []int, ratios map[int]float64, channels map[
 		}
 		seen[id] = true
 
+		if _, has := ratios[id]; has {
+			// 渠道表里查不到名字的，给个占位名，别让清单里出现空白。
+			info, known := channels[id]
+			if !known {
+				info = ChannelInfo{ChannelID: id, Name: fmt.Sprintf("渠道 %d（渠道清单里没有）", id)}
+			}
+			st.Maintained = append(st.Maintained, info)
+			continue
+		}
+
 		info, known := channels[id]
 		if !known {
 			st.UnknownChannelIDs = append(st.UnknownChannelIDs, id)
-			continue
-		}
-		if _, has := ratios[id]; has {
-			st.Maintained = append(st.Maintained, info)
 			continue
 		}
 		st.Missing = append(st.Missing, info)
