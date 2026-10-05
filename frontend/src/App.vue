@@ -1,11 +1,16 @@
 <script setup>
 import { ref, computed, nextTick, onMounted } from 'vue'
 import ChannelRatios from './ChannelRatios.vue'
+import Customers from './Customers.vue'
+import BillTasks from './BillTasks.vue'
 
-// 顶层页面切换：出账（默认）与渠道成本倍率维护。
-// 用标签页而不是 vue-router：整个应用只有两个页面，装一个路由只为切两块内容不划算。
+// 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
+// 用标签页而不是 vue-router：整站就这么几块内容，装一个路由不划算
+// （而且后端把 dist 当静态目录直接托管，没有 SPA fallback，深链会 404）。
 const activePage = ref('bill')
 const channelRatiosRef = ref(null)
+const customersRef = ref(null)
+const billTasksRef = ref(null)
 
 const authChecked = ref(false)
 const authenticated = ref(false)
@@ -910,10 +915,34 @@ async function handleSubmit() {
       >生成账单</button>
       <button
         type="button"
+        :class="{ active: activePage === 'tasks' }"
+        @click="activePage = 'tasks'"
+      >账单任务</button>
+      <button
+        type="button"
+        :class="{ active: activePage === 'customers' }"
+        @click="activePage = 'customers'"
+      >客户信息</button>
+      <button
+        type="button"
         :class="{ active: activePage === 'channels' }"
         @click="activePage = 'channels'"
       >渠道成本倍率</button>
     </div>
+
+    <!-- 账单导出任务：独立页面 -->
+    <BillTasks
+      v-if="activePage === 'tasks'"
+      ref="billTasksRef"
+      @unauthorized="authenticated = false"
+    />
+
+    <!-- 客户信息：独立页面 -->
+    <Customers
+      v-if="activePage === 'customers'"
+      ref="customersRef"
+      @unauthorized="authenticated = false"
+    />
 
     <!-- 渠道成本倍率：独立页面 -->
     <ChannelRatios

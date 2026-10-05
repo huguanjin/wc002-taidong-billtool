@@ -14,6 +14,12 @@ const (
 	DiscountBaseFactor = 7.0
 	// ExcelMaxRowsPerSheet 是 xlsx 格式规定的单个 sheet 最大行数（含表头），超出需拆分到多个 sheet。
 	ExcelMaxRowsPerSheet = 1_048_576
+	// MaxExportDays 单次导出日志的时间跨度上限。logs 表在 (username, created_at) 上
+	// 没有组合索引，跨度过大会扫掉大量行。
+	//
+	// 放在这里而不是 main.go：HTTP 层与「一键任务」链路都要校验它，
+	// 两处各写一个数字迟早会漂移——而漂移的那一侧是没有任何防护的那条路径。
+	MaxExportDays = 92
 )
 
 // CacheReadAbsUSD 缓存读取绝对价（$/MTok）；未列出的模型用 input×CacheReadMult。
@@ -64,12 +70,12 @@ var TieredModelPrices = map[string]TierPrice{
 type PriceUSD struct{ Input, Output float64 }
 
 var OfficialGeminiTextPrices = map[string]PriceUSD{
-	"gemini-3.5-flash":        {1.5, 9.0},
-	"gemini-3.6-flash":        {1.5, 7.5},
-	"gemini-2.5-flash":        {0.3, 2.5},
-	"gemini-2.5-pro":          {1.25, 10.0},
-	"gemini-3-flash-preview":  {0.5, 3.0},
-	"gemini-3.1-pro-preview":  {2.0, 12.0},
+	"gemini-3.5-flash":       {1.5, 9.0},
+	"gemini-3.6-flash":       {1.5, 7.5},
+	"gemini-2.5-flash":       {0.3, 2.5},
+	"gemini-2.5-pro":         {1.25, 10.0},
+	"gemini-3-flash-preview": {0.5, 3.0},
+	"gemini-3.1-pro-preview": {2.0, 12.0},
 }
 
 var OfficialImageTokenPrices = map[string]PriceUSD{
@@ -87,20 +93,20 @@ var OfficialKimiPrices = map[string]PriceUSD{
 }
 
 var OfficialAnthropicPrices = map[string]PriceUSD{
-	"claude-fable-5":            {10.0, 50.0},
-	"claude-mythos-5":           {10.0, 50.0},
-	"claude-opus-5":             {5.0, 25.0},
-	"claude-opus-4-8":           {5.0, 25.0},
-	"claude-opus-4-7":           {5.0, 25.0},
-	"claude-opus-4-6":           {5.0, 25.0},
-	"claude-opus-4-5":           {5.0, 25.0},
-	"claude-opus-4-5-20251101":  {5.0, 25.0},
-	"claude-sonnet-5":           {2.0, 10.0},
-	"claude-sonnet-4-6":         {3.0, 15.0},
-	"claude-sonnet-4-5":         {3.0, 15.0},
+	"claude-fable-5":             {10.0, 50.0},
+	"claude-mythos-5":            {10.0, 50.0},
+	"claude-opus-5":              {5.0, 25.0},
+	"claude-opus-4-8":            {5.0, 25.0},
+	"claude-opus-4-7":            {5.0, 25.0},
+	"claude-opus-4-6":            {5.0, 25.0},
+	"claude-opus-4-5":            {5.0, 25.0},
+	"claude-opus-4-5-20251101":   {5.0, 25.0},
+	"claude-sonnet-5":            {2.0, 10.0},
+	"claude-sonnet-4-6":          {3.0, 15.0},
+	"claude-sonnet-4-5":          {3.0, 15.0},
 	"claude-sonnet-4-5-20250929": {3.0, 15.0},
-	"claude-haiku-4-5":          {1.0, 5.0},
-	"claude-haiku-4-5-20251001": {1.0, 5.0},
+	"claude-haiku-4-5":           {1.0, 5.0},
+	"claude-haiku-4-5-20251001":  {1.0, 5.0},
 }
 
 const (

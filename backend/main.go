@@ -72,6 +72,16 @@ func main() {
 		if err := billing.EnsureChannelSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化渠道倍率表失败，成本估算功能可能不可用: %v", err)
 		}
+		if err := billing.EnsureCustomerSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化客户信息表失败，客户管理与账单任务功能可能不可用: %v", err)
+		}
+		// 任务表有外键指向 customers，必须在客户表之后建。
+		if err := billing.EnsureBillTaskSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化账单任务表失败，账单任务功能可能不可用: %v", err)
+		}
+		if err := billing.EnsureSettingsSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化默认出账参数表失败，账单任务功能可能不可用: %v", err)
+		}
 	}
 
 	go cleanupOldJobs()
@@ -94,6 +104,12 @@ func main() {
 	mux.HandleFunc("/api/channels", withCORS(requireAuth(handleChannels)))
 	mux.HandleFunc("/api/channel-ratios", withCORS(requireAuth(handleSaveChannelRatios)))
 	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
+	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
+	mux.HandleFunc("/api/delete-customer", withCORS(requireAuth(handleDeleteCustomer)))
+	mux.HandleFunc("/api/bill-tasks", withCORS(requireAuth(handleBillTasks)))
+	mux.HandleFunc("/api/run-bill-task", withCORS(requireAuth(handleRunBillTask)))
+	mux.HandleFunc("/api/delete-bill-task", withCORS(requireAuth(handleDeleteBillTask)))
+	mux.HandleFunc("/api/bill-task-settings", withCORS(requireAuth(handleBillTaskSettings)))
 	mux.HandleFunc("/api/download/", withCORS(requireAuth(handleDownload)))
 	mux.HandleFunc("/api/browse", withCORS(requireAuth(handleBrowse)))
 	mux.HandleFunc("/api/health", withCORS(func(w http.ResponseWriter, r *http.Request) {
@@ -295,10 +311,6 @@ func handleLogGroups(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// maxExportDays 单次导出的时间跨度上限。日志表在 (username, created_at) 上没有
-// 组合索引，跨度过大时查询会扫掉大量行；这里挡一下，避免误操作把库拖垮。
-const maxExportDays = 92
-
 // handleExportLogs 按时间段 + 账号从业务库 logs 表导出消费日志为 tsv，
 // 等价于在服务器上手动跑 mysql -e "SELECT ... > xxx.tsv"，省去人工导出步骤。
 // 导出文件落在 data 目录，可直接作为「生成账单」或「日志合并」的输入。
@@ -344,9 +356,9 @@ func handleExportLogs(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if span := end.Sub(start); span > time.Duration(maxExportDays)*24*time.Hour {
+	if span := end.Sub(start); span > time.Duration(billing.MaxExportDays)*24*time.Hour {
 		httpError(w, http.StatusBadRequest,
-			fmt.Sprintf("时间跨度 %.1f 天超过上限 %d 天，请分次导出", span.Hours()/24, maxExportDays))
+			fmt.Sprintf("时间跨度 %.1f 天超过上限 %d 天，请分次导出", span.Hours()/24, billing.MaxExportDays))
 		return
 	}
 
@@ -486,6 +498,323 @@ func handleDeleteLogFile(w http.ResponseWriter, r *http.Request) {
 	jobsMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": filepath.Base(removed)})
+}
+
+// ============================================================
+// 客户信息 + 账单导出任务
+//
+// 这一组接口本身不带文件上传，一律用 JSON body（与 /api/channel-ratios 一致），
+// 所以不涉及 ParseMultipartForm。
+// ============================================================
+
+// decodeJSONBody 解析 JSON 请求体。带请求大小上限，避免异常请求把内存吃满。
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst interface{}) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil {
+		httpError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// handleCustomers 客户信息：GET 列表，POST 新增或更新。
+func handleCustomers(w http.ResponseWriter, r *http.Request) {
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），客户信息不可用")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		customers, err := billing.ListCustomers(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"customers": customers})
+
+	case http.MethodPost:
+		var in billing.Customer
+		if !decodeJSONBody(w, r, &in) {
+			return
+		}
+		saved, err := billing.UpsertCustomer(*pgConfig, in)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"customer": saved})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleDeleteCustomer 删除客户。任务表上是 ON DELETE CASCADE，
+// 该客户的历史任务会一并删除——页面上必须先显示会连带删掉几条。
+func handleDeleteCustomer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if !decodeJSONBody(w, r, &in) {
+		return
+	}
+	if in.ID <= 0 {
+		httpError(w, http.StatusBadRequest, "缺少客户 ID")
+		return
+	}
+	if err := billing.DeleteCustomer(*pgConfig, in.ID); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": in.ID})
+}
+
+// handleBillTasks 账单任务列表 + 按月汇总。
+//
+// 汇总在后端算而不是前端：利润口径（用 costed_settle 而非全部结算额）是正确性关键，
+// 放在前端每次都要重新实现一遍，迟早某处写错。
+func handleBillTasks(w http.ResponseWriter, r *http.Request) {
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+	filter := billing.BillTaskFilter{}
+	if v := strings.TrimSpace(q.Get("year")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			filter.Year = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("month")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			filter.Month = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("customerId")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			filter.CustomerID = n
+		}
+	}
+
+	tasks, err := billing.ListBillTasks(*pgConfig, filter)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// 汇总始终按当前结果集算：筛了月份就只有那一个月，没筛就是全部账期按月分组。
+	summaries := billing.SummarizeTasks(tasks)
+
+	// 前端要用来渲染「默认上月」的账期。
+	prevYear, prevMonth := billing.PreviousMonth(time.Now())
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tasks":             tasks,
+		"summaries":         summaries,
+		"defaultYear":       prevYear,
+		"defaultMonth":      prevMonth,
+		"jobRetentionHours": jobRetentionHours,
+	})
+}
+
+// handleRunBillTask 一键执行：导出该客户日志 → 出账 →（可选）成本利润表 → 落库。
+//
+// 这条链路是同步的，可能要跑几十秒（导日志 + 聚合上百万行）。
+// 不引入任务队列：出账结果是用户马上要下载的东西，排到后台再回来找反而更麻烦。
+func handleRunBillTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+	if dbConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置业务数据库连接信息（BILL_DB_HOST 等环境变量），无法自动导出日志")
+		return
+	}
+
+	var in struct {
+		CustomerID        int64 `json:"customerId"`
+		Year              int   `json:"year"`
+		Month             int   `json:"month"`
+		GenerateSanitized bool  `json:"generateSanitized"`
+		GenerateCost      bool  `json:"generateCost"`
+	}
+	if !decodeJSONBody(w, r, &in) {
+		return
+	}
+	if in.CustomerID <= 0 {
+		httpError(w, http.StatusBadRequest, "请选择客户")
+		return
+	}
+	if in.Year == 0 || in.Month == 0 {
+		httpError(w, http.StatusBadRequest, "请选择账期月份")
+		return
+	}
+
+	jobID := newJobID()
+	jobPath := filepath.Join(jobDir, jobID)
+	if err := os.MkdirAll(jobPath, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	result, err := billing.RunBillExportTask(billing.TaskRunDeps{
+		DB:                *dbConfig,
+		PG:                *pgConfig,
+		DataDir:           dataDir,
+		JobDir:            jobPath,
+		TemplatePath:      filepath.Join(dataDir, "bill_template.xlsx"),
+		PriceTablePath:    filepath.Join(dataDir, "price_table.xlsx"),
+		DBPriceCachePath:  dbPriceCachePath(),
+		CustomerID:        in.CustomerID,
+		Year:              in.Year,
+		Month:             in.Month,
+		GenerateCost:      in.GenerateCost,
+		GenerateSanitized: in.GenerateSanitized,
+	})
+	if err != nil {
+		// 失败就把刚建的 job 目录清掉，不留空目录。
+		// 注意这时**不落库**——任务是按 (客户,账期) 覆盖写的，
+		// 失败也写会把上次的好数字冲掉。
+		_ = os.RemoveAll(jobPath)
+		httpError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+
+	// 登记下载。产物在 jobDir 里，6 小时后由 cleanupOldJobs 连同记录一起清掉——
+	// 这正是「没下载就要重新执行」的语义。
+	rec := jobRecord{
+		billPath:      result.BillPath,
+		sanitizedPath: result.SanitizedPath,
+		costPath:      result.CostPath,
+		createdAt:     time.Now(),
+	}
+	jobsMu.Lock()
+	jobs[jobID] = rec
+	jobsMu.Unlock()
+
+	// 落库：同一客户同一账期覆盖更新。
+	task := result.Task
+	task.JobID = jobID
+	persistErr := billing.UpsertBillTask(*pgConfig, task)
+	if persistErr != nil {
+		// 产物已经生成好了，落库失败不该让用户白跑一趟：把文件链接照常返回，
+		// 只提示统计没记上。
+		log.Printf("警告: 账单任务落库失败（产物已生成）: %v", persistErr)
+	}
+
+	resp := map[string]interface{}{
+		"jobId":            jobID,
+		"task":             task,
+		"billFileName":     filepath.Base(result.BillPath),
+		"billUrl":          "/api/download/" + jobID + "/bill",
+		"logPath":          result.LogPath,
+		"logRowCount":      result.LogRowCount,
+		"summary":          result.Summary,
+		"summaryPersisted": persistErr == nil,
+	}
+	if result.SanitizedPath != "" {
+		resp["sanitizedFileName"] = filepath.Base(result.SanitizedPath)
+		resp["sanitizedUrl"] = "/api/download/" + jobID + "/sanitized"
+	}
+	if result.CostPath != "" {
+		resp["costFileName"] = filepath.Base(result.CostPath)
+		resp["costUrl"] = "/api/download/" + jobID + "/cost"
+		resp["costSummary"] = result.CostSummary
+	}
+	// 成本利润表被拦下不是错误：账单已生成，只是有渠道没维护倍率。
+	// 这种情况任务仍然落库，但成本字段为空，页面要显示「缺成本」。
+	if result.CostBlocked {
+		resp["costBlocked"] = true
+		resp["missingChannels"] = result.MissingChannelInfos
+	}
+	if len(result.UnknownChannelIDs) > 0 {
+		resp["unknownChannelIds"] = result.UnknownChannelIDs
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDeleteBillTask 删除一条任务记录。**只删记录，不删文件**：
+// 产物在 jobDir 里由 6 小时清理兜底，源日志在 dataDir 里由「已导出文件」列表管理。
+func handleDeleteBillTask(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	var in struct {
+		ID int64 `json:"id"`
+	}
+	if !decodeJSONBody(w, r, &in) {
+		return
+	}
+	if in.ID <= 0 {
+		httpError(w, http.StatusBadRequest, "缺少任务 ID")
+		return
+	}
+	if err := billing.DeleteBillTask(*pgConfig, in.ID); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": in.ID})
+}
+
+// handleBillTaskSettings 默认出账参数：GET 读，POST 存。
+func handleBillTaskSettings(w http.ResponseWriter, r *http.Request) {
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s, err := billing.GetSettings(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"settings": s})
+
+	case http.MethodPost:
+		var s billing.BillTaskSettings
+		if !decodeJSONBody(w, r, &s) {
+			return
+		}
+		if err := billing.SaveSettings(*pgConfig, s); err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		saved, err := billing.GetSettings(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"settings": saved})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 // handlePullChannels 从业务库拉取渠道清单落本地 PostgreSQL。
@@ -1063,11 +1392,19 @@ func newJobID() string {
 }
 
 // cleanupOldJobs 定期清理超过 6 小时的任务文件，避免临时目录无限增长。
+// jobRetentionHours 任务产物的保留时长（小时），由 cleanupOldJobs 执行清理。
+//
+// 抽成常量是因为它出现在两个地方：清理逻辑本身，以及「账单任务」接口返回给页面的
+// jobRetentionHours（页面据此告诉用户「文件只保留 N 小时」）。
+// 两处各写一个数字迟早会漂移——而漂移的方向若是「页面说 6 小时、实际 3 小时就清了」，
+// 用户会按页面的说法从容等待，然后发现文件没了。
+const jobRetentionHours = 6
+
 func cleanupOldJobs() {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 	for range ticker.C {
-		cutoff := time.Now().Add(-6 * time.Hour)
+		cutoff := time.Now().Add(-time.Duration(jobRetentionHours) * time.Hour)
 		jobsMu.Lock()
 		for id, rec := range jobs {
 			if rec.createdAt.Before(cutoff) {

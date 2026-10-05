@@ -25,7 +25,12 @@ services:
       # 上传/生成的临时文件，容器重启后仍可保留
       - bill-jobs:/tmp/taidong-bill-jobs
     depends_on:
-      - postgres
+      # 必须等 PG 真正就绪再启动后端：建表在启动时做一次（EnsureXxxSchema），
+      # 而按既有约定建表失败**只打警告不退出**——若此刻 PG 还没起来，
+      # 表就永远不存在，直到下次重启容器。用 service_healthy 而不是裸的
+      # depends_on（那只保证容器被创建，不保证 PG 已能接受连接）。
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
       interval: 30s
