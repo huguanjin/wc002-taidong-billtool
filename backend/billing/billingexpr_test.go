@@ -49,7 +49,7 @@ func TestRunBillingExprTierSelection(t *testing.T) {
 // 传进来的 Len 确实来自原始 prompt_tokens。
 func TestBuildExprParamsLenAndAutoExclusion(t *testing.T) {
 	// 表达式引用了 cr，缓存读 token 应从 p 中扣除
-	params := BuildExprParams("gpt-5.4", 400_000, 400_000, 50_000, 100_000, 0, 0, 0, 0, 0, 0, exprGPT54)
+	params := BuildExprParams("gpt-5.4", 400_000, 50_000, 100_000, 0, 0, 0, 0, 0, 0, exprGPT54)
 	if params.Len != 400_000 {
 		t.Errorf("Len 期望 400000，实际 %v", params.Len)
 	}
@@ -61,7 +61,7 @@ func TestBuildExprParamsLenAndAutoExclusion(t *testing.T) {
 	}
 
 	// glm-5 不引用 cr，缓存读留在 p 里按基础价计
-	params = BuildExprParams("glm-5", 400_000, 400_000, 50_000, 100_000, 0, 0, 0, 0, 0, 0, exprGlm5)
+	params = BuildExprParams("glm-5", 400_000, 50_000, 100_000, 0, 0, 0, 0, 0, 0, exprGlm5)
 	if params.P != 400_000 {
 		t.Errorf("未引用 cr 时期望 P=400000，实际 %v", params.P)
 	}
@@ -69,7 +69,7 @@ func TestBuildExprParamsLenAndAutoExclusion(t *testing.T) {
 
 // Anthropic 语义下 input_tokens 本身只是文本部分，不再做扣减；len 计入缓存。
 func TestBuildExprParamsClaudeSemantic(t *testing.T) {
-	params := BuildExprParams("claude-sonnet-5", 400_000, 400_000, 50_000, 100_000, 1_000, 2_000, 0, 0, 0, 0, exprGPT54)
+	params := BuildExprParams("claude-sonnet-5", 400_000, 50_000, 100_000, 1_000, 2_000, 0, 0, 0, 0, exprGPT54)
 	if params.P != 400_000 {
 		t.Errorf("Claude 语义下 P 期望 400000，实际 %v", params.P)
 	}

@@ -66,7 +66,8 @@ func exprTieredAgg(t *testing.T, model, group, expr string, tiers []string, tok 
 	t.Helper()
 	uncached, cacheRead, out, cache5m, cache1h := tok[0], tok[1], tok[2], tok[3], tok[4]
 
-	params := BuildExprParams(model, uncached+cacheRead+cache5m+cache1h, uncached, out,
+	// 传原始 prompt（uncached+缓存），与生产一致：BuildExprParams 内部自行扣一次缓存。
+	params := BuildExprParams(model, uncached+cacheRead+cache5m+cache1h, out,
 		cacheRead, cache5m, cache1h, 0, 0, 0, 0, expr)
 	res, err := RunBillingExpr(expr, params, exprAt())
 	require.NoError(t, err, "表达式求值失败")
@@ -175,13 +176,18 @@ func TestExprRowReconcileCrossTier(t *testing.T) {
 	_, ok := ExprRowReconcile(testExprAstra, agg, exprAt(), 7.0)
 	assert.False(t, ok, "跨档行不可还原，不能判为一致")
 
-	// 反证：拿聚合后的总长度去求单价，得到的金额还原不出官方刊例。
-	// 所以硬补一句「单价 × 总量」只会把误差藏起来。
+	// 不可还原靠的是**结构判据**（命中过多档），不是「一定算出差值」。
+	// 这份数据里缓存读/写压倒性主导、且它们全在 tier_2（¥2/25），
+	// 于是拿聚合总长度去选档恰好也落在 tier_2，单一单价反而能精确还原——
+	// 差为 0 并不代表这行可以按「单价 × 用量」写进账单。
+	// 真正的风险是聚合总长度选档本身没有依据：总长取的是「各请求长度之和」，
+	// 与任何单个请求的长度都不相等，选到哪一档纯属巧合，混档行随时会选错。
 	total := agg.Uncached + agg.CacheRead + agg.CacheWrite5m + agg.CacheWrite1h
 	rates, err := ExtractExprRates(testExprAstra, exprAt(), total)
 	require.NoError(t, err)
 	diff := math.Abs(ExprUnitAmountUSD(agg, rates)/1e6 - agg.OfficialUSD)
-	assert.Greater(t, diff, 1e-6, "跨档行用单一单价算出的金额与官方刊例必然有差")
+	assert.Less(t, diff, 1e-6,
+		"此数据里缓存读占比极高且都在同一档，单价比巧合地能还原——正因如此，判据不能靠数值差")
 }
 
 // TestTieredBillSingleTierRowIsReproducible 单档行的账单：S 是「单价 × 用量」公式，
@@ -502,7 +508,10 @@ func TestDomesticExprUnitColumnsAreUSD(t *testing.T) {
 			BillingMode: BillingModeTieredExpr, BillingExpr: expr,
 			ExprTiers: []string{"default"}, LastAt: at, ExprUnitCurrency: currency,
 		}
-		params := BuildExprParams(model, 2_000_000, agg.Uncached, agg.Output, 0, 0, 0, 0, 0, 0, 0, expr)
+		// 传原始 prompt（uncached + 各类缓存），与生产一致：BuildExprParams 内部自行扣一次。
+		params := BuildExprParams(model,
+			agg.Uncached+agg.CacheRead+agg.CacheWrite5m+agg.CacheWrite1h, agg.Output,
+			agg.CacheRead, agg.CacheWrite5m, agg.CacheWrite1h, 0, 0, 0, 0, expr)
 		res, err := RunBillingExpr(expr, params, at)
 		require.NoError(t, err)
 		agg.OfficialUSD = res.USD / 1_000_000
@@ -532,7 +541,8 @@ func TestDomesticExprUnitColumnsAreUSD(t *testing.T) {
 		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra,
 		ExprTiers: []string{"base"}, LastAt: at, ExprUnitCurrency: "USD",
 	}
-	params := BuildExprParams(overseas.Model, 2_000_000, overseas.Uncached, overseas.Output,
+	params := BuildExprParams(overseas.Model,
+		overseas.Uncached+overseas.CacheRead+overseas.CacheWrite5m+overseas.CacheWrite1h, overseas.Output,
 		0, 0, 0, 0, 0, 0, 0, testExprAstra)
 	res, err := RunBillingExpr(testExprAstra, params, at)
 	require.NoError(t, err)

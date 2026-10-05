@@ -72,7 +72,11 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
 	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
 
-	buckets := map[[2]string]*AggRow{}
+	// 聚合键包含「本次请求实际使用的分组倍率」：同一分组在账期内可能出现过
+	// 多种倍率，而站内结算额 = 表达式美金 × 倍率，用一个折扣算不全这一组。
+	// 倍率取自日志 other.group_ratio，按 4 位小数归桶以抗浮点误差。
+	buckets := map[[3]string]*AggRow{}
+	// 分组展示顺序仍按原始分组名的首次出现顺序。
 	var groupOrder []string
 	groupSeen := map[string]bool{}
 	monthCounter := map[int]int{}
@@ -98,6 +102,9 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		if hasOther {
 			other = cellAt(row, idxOther)
 		}
+		// 本次请求实际使用的分组倍率：分桶与结算都靠它。
+		// 取不到时记 0，该行单独成桶并交回原有折扣逻辑，不硬套倍率结算。
+		groupRatio, _ := GroupRatioFromOther(other)
 
 		var cacheRead, cacheWrite5m, cacheWrite1h float64
 		if hasCacheTokens && hasCacheCreation {
@@ -183,7 +190,11 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			perCall = 1.0
 		} else if exprStr != "" {
 			img, imgO, ai, ao := ParseExtraTokens(other)
-			params := BuildExprParams(model, prompt, uncached, completion,
+			// 表达式入参必须传原始 prompt，不是扣过缓存的 uncached：
+			// BuildExprParams 内部会按表达式引用的子类变量扣一次，传 uncached 会扣两次，
+			// 把缓存命中的请求算少，并让阶梯档位判断用错长度（跨 272000 阈值会判错档，
+			// 单价差一倍）。与主库 BuildTieredTokenParams 同口径。
+			params := BuildExprParams(model, prompt, completion,
 				cacheRead, cacheWrite5m, cacheWrite1h, img, imgO, ai, ao, exprStr)
 			res, err := RunBillingExpr(exprStr, params, at)
 			if err != nil {
@@ -244,11 +255,26 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			}
 		}
 
-		key := [2]string{model, group}
+		// 倍率归桶：0 表示日志没给 group_ratio，单独成一桶，不与其他倍率混。
+		ratioBucket := ""
+		if groupRatio > 0 {
+			ratioBucket = strconv.FormatFloat(round(groupRatio, 4), 'f', -1, 64)
+		}
+
+		key := [3]string{model, group, ratioBucket}
 		agg, exists := buckets[key]
 		if !exists {
+			// Group 是「含倍率层级」的桶键，折扣、结算、备注都按它查；
+			// KeyGroup 保留原分组名供展示与价表折扣匹配。
+			// 必须用复合键，否则同分组的不同倍率会共用同一个折扣，
+			// 整组金额取决于第一行是哪个模型——不可复现的错误。
+			groupKey := group
+			if ratioBucket != "" {
+				groupKey = group + "|" + ratioBucket
+			}
 			agg = &AggRow{
-				Model: model, Group: group, BillingMode: billingMode, ListOrigin: listOrigin,
+				Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
+				BillingMode: billingMode, ListOrigin: listOrigin,
 				ExprUnitCurrency: exprUnitCurrency,
 			}
 			buckets[key] = agg

@@ -211,9 +211,15 @@ func inZone(at time.Time, tz string) time.Time {
 // 那种语义下 prompt_tokens 已经把缓存、图片等全含在内；Anthropic 语义的 input_tokens
 // 本来就只是文本部分，不做扣减。
 //
-// promptTokens 是日志里的原始 prompt_tokens；uncached 是尚未扣除缓存的部分（Anthropic 语义
-// 下等于 promptTokens）。调用方两者都传，由本函数按语义选择。
-func BuildExprParams(model string, promptTokens, uncached, completion, cacheRead, cacheWrite5m, cacheWrite1h float64,
+// promptTokens 必须是**日志原始 prompt_tokens**，不是扣过缓存的净输入：
+// 扣减只在本函数内部发生一次（上游 BuildTieredTokenParams 也是这个口径）。
+// 曾经这里另有一个 uncached 形参，调用方把「已扣过一次缓存」的值传进来，
+// 结果表达式里再扣一次，缓存命中的请求被少算——而且阶梯档位（Len）也跟着
+// 用了扣减后的长度，跨 272000 阈值的请求会被判进错误的档位。两个语义重叠的
+// 参数正是那个 bug 的温床，所以只保留一个。
+//
+// 净输入（uncached）仍由 UncachedInputTokens 算，供 RowListUSD 使用，与这里无关。
+func BuildExprParams(model string, promptTokens, completion, cacheRead, cacheWrite5m, cacheWrite1h float64,
 	img, imgO, ai, ao float64, exprStr string) ExprParams {
 
 	c, err := compileExpr(exprStr)
@@ -226,10 +232,12 @@ func BuildExprParams(model string, promptTokens, uncached, completion, cacheRead
 
 	isClaudeSemantic := InferUsageSemantic(model, "") == "anthropic"
 
-	p := uncached
+	p := promptTokens
 	comp := completion
 	inputLen := promptTokens
 	if isClaudeSemantic {
+		// Anthropic 语义的 prompt 只是文本部分，缓存本就不在里面，
+		// 档位判断要的是「完整上下文长度」，所以补回来。
 		inputLen = promptTokens + cacheRead + cacheWrite5m + cacheWrite1h
 	} else {
 		if used["cr"] {

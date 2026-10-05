@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -137,13 +138,21 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 	if claudeRow.Uncached != 1_000_000 {
 		t.Errorf("claude 未命中 token 期望 1000000，实际 %v", claudeRow.Uncached)
 	}
-	// 结算金额口径 = 总金额 × 折扣，不再取日志 quota 折算值。
+	// 结算金额口径 = 总金额 × 结算系数（不是展示折扣）。
+	// 反推结算的系数是精确商，展示折扣是它的 3 位取整值，两者有意不同：
+	// 用取整值乘会引入纯显示精度造成的偏差，与业务金额无关。
 	if claudeRow.ListCNY <= 0 {
 		t.Fatalf("claude 刊例期望为正，实际 %v", claudeRow.ListCNY)
 	}
-	wantClaudeSettle := round(claudeRow.ListCNY*claudeRow.Discount, MoneyDecimals)
+	wantClaudeSettle := round(claudeRow.ListCNY*claudeRow.SettleFactor, MoneyDecimals)
 	if claudeRow.SettleCNY != wantClaudeSettle {
-		t.Errorf("claude 结算人民币期望 %v（刊例 × 折扣），实际 %v", wantClaudeSettle, claudeRow.SettleCNY)
+		t.Errorf("claude 结算人民币期望 %v（刊例 × 结算系数），实际 %v",
+			wantClaudeSettle, claudeRow.SettleCNY)
+	}
+	// 结算系数必须与展示折扣接近（同一笔账的两种精度），但不必相等。
+	if diff := math.Abs(claudeRow.SettleFactor - claudeRow.Discount); diff > 0.001 {
+		t.Errorf("结算系数 %v 与展示折扣 %v 偏离过大（差 %v）",
+			claudeRow.SettleFactor, claudeRow.Discount, diff)
 	}
 
 	if gptRow == nil {

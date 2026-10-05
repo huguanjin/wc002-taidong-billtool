@@ -185,7 +185,6 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 
 	firstDataRow := 3
 	discountResult := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable, manualMarkers)
-	groupDiscounts := discountResult.Discounts
 	derivedDiscounts := discountResult.Derived
 	underivable := discountResult.Underivable
 	periodDate := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
@@ -222,7 +221,9 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		f.SetCellValue(sheet, axisPeriod, periodDate)
 		f.SetCellStyle(sheet, axisPeriod, axisPeriod, styleMonth)
 		setStr(2, r, agg.Model)
-		setStr(3, r, agg.Group)
+		// C 列：同分组下出现多种倍率时会被拆成多行，光看同名两行会困惑，
+		// 所以把本次实际倍率缀在后面（Codex(0.4) / Codex(1.0)）。倍率唯一时保持原名。
+		setStr(3, r, agg.DisplayGroup())
 
 		setNum(4, r, agg.Uncached, styleAccounting)
 		setNum(6, r, agg.CacheRead, styleAccounting)
@@ -239,7 +240,10 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		}
 		f.SetCellStyle(sheet, axis17, axis17, styleAccounting)
 
-		disc := groupDiscounts[agg.Group]
+		// T 列折扣：公式引用它算结算额，所以写「结算系数」而不是显示值。
+		// 按倍率结算的行它的精确值是 倍率/7（如 0.057142857），
+		// 单元格套着 3 位小数格式，客户看到 0.057，而 S×T=V 仍然严格成立。
+		disc := discountResult.SettleFactor(agg.Group)
 		axisDisc := axisOf(20, r)
 		f.SetCellValue(sheet, axisDisc, disc)
 		f.SetCellStyle(sheet, axisDisc, axisDisc, styleDiscount)
@@ -383,8 +387,13 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 		}
 		// 折扣来源必须可追：价表/合同里查到的折扣是商务谈定值，
 		// 反推值只能保证账面对得上，不等于谈定的折扣。
-		// 不可反推的分组（站内表达式计费/人工标记为国产）要写明折扣是怎么来的，
-		// 否则账单上那个数看起来和谈定折扣一样，实际来源完全不同。
+		// 按本次请求倍率结算的行说明白，客户拿到表能自己复核这一行为什么金额刚好等于实收。
+		if agg.HasRatioDiscount() {
+			notes = appendNote(notes, fmt.Sprintf(
+				"折扣按本次请求实际使用的分组倍率结算（倍率 %s ÷ %s = %s），金额与站内实收一致",
+				trimRatio(agg.GroupRatio), trimRatio(DiscountBaseFactor),
+				trimRatio(round(agg.RatioDiscount(), DiscountDecimals))))
+		}
 		if reason, bad := underivable[agg.Group]; bad {
 			notes = appendNote(notes, reason+"；本行折扣取站点实际计费倍率，请人工确认合同折扣")
 		}
@@ -392,7 +401,7 @@ func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year
 			notes = appendNote(notes, "折扣为反推值（价表无该分组折扣，按 Σ结算/Σ总金额倒算）")
 		} else if discount != nil {
 			notes = appendNote(notes, "折扣为手工指定值")
-		} else if _, bad := underivable[agg.Group]; !bad {
+		} else if _, bad := underivable[agg.Group]; !bad && !agg.HasRatioDiscount() {
 			notes = appendNote(notes, "折扣取自价表")
 		}
 		if len(notes) > 0 {

@@ -139,7 +139,7 @@ func mergeManualPrices(book *PriceBook, manual map[string]ManualPriceInput) {
 func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string, manualMarkers []string) Summary {
 	rowSummaries := make([]RowSummary, 0, len(agg.Rows))
 	settleTotal, listTotal := 0.0, 0.0
-	groupDiscounts := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable, manualMarkers).Discounts
+	discountResult := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable, manualMarkers)
 
 	for _, a := range agg.Rows {
 		list := 0.0
@@ -148,17 +148,21 @@ func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, p
 		if hasPrice {
 			list = OfficialListCNY(a, exchangeRate)
 		}
-		// 结算金额口径与账单 V 列一致：总金额 × 折扣。日志 quota 折算出的金额
-		// 只作为交叉校验，不再直接当作结算金额，否则账面上的 V 与这里报出的数会对不上。
-		settle := round(list*groupDiscounts[a.Group], MoneyDecimals)
+		// 结算金额口径与账单 V 列一致：总金额 × 结算系数（按倍率结算的行用精确值）。
+		// 日志 quota 折算出的金额只作为交叉校验，不再直接当作结算金额，
+		// 否则账面上的 V 与这里报出的数会对不上。
+		settle := round(list*discountResult.SettleFactor(a.Group), MoneyDecimals)
 		settleTotal += settle
 		listTotal += list
 		rowSummaries = append(rowSummaries, RowSummary{
-			Model: a.Model, Group: a.Group,
+			// Group 用展示名（带倍率），与账单 C 列一致，页面摘要与账单不会对不上。
+			Model: a.Model, Group: a.DisplayGroup(),
 			Uncached: a.Uncached, CacheRead: a.CacheRead, Output: a.Output,
 			CacheWrite5m: a.CacheWrite5m, CacheWrite1h: a.CacheWrite1h, Quota: a.Quota,
-			SettleCNY: settle, ListCNY: list, Discount: groupDiscounts[a.Group],
-			Rows: a.Rows, HasPrice: hasPrice,
+			SettleCNY: settle, ListCNY: list,
+			Discount:     discountResult.Discounts[a.Group],
+			SettleFactor: discountResult.SettleFactor(a.Group),
+			Rows:         a.Rows, HasPrice: hasPrice,
 		})
 	}
 

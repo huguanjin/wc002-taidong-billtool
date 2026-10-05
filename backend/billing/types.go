@@ -1,6 +1,10 @@
 package billing
 
-import "time"
+import (
+	"fmt"
+	"strconv"
+	"time"
+)
 
 // ModelPrice 单模型单价（已换算为 USD/MTok）。
 type ModelPrice struct {
@@ -39,6 +43,16 @@ type AggRow struct {
 	// 折算表达式单价时必须用它，而不是出账时刻——deepseek-v4.1-flash 这类
 	// 表达式带 hour("Asia/Shanghai") 峰谷倍率，用 now() 会得到与账期无关的单价。
 	LastAt time.Time
+	// KeyGroup 原始分组标识，用于账单展示（C 列）与价表折扣匹配。
+	// 与 Group 的区别：Group 可能是「分组+倍率」的复合键（见 GroupRatio），
+	// 而 KeyGroup 始终是日志里那个原始分组名。
+	KeyGroup string
+	// GroupRatio 本桶实际使用的分组倍率（日志 other.group_ratio）。
+	//
+	// 必须把它纳入聚合维度：同一个分组在账期内可能出现过多种倍率（换套餐、
+	// 渠道切换、GroupGroupRatio 变更、共享分组被多个套餐使用），而站内结算额是
+	// 「表达式美金 × 本次倍率」，用单一折扣无法把这组账算对。0 表示日志没给该字段。
+	GroupRatio float64
 	// ListOrigin 本行 OfficialUSD 的来源（见 ListOrigin* 常量）。
 	// 只有外部对标价才能当折扣反推的分母；站内公式自算出来的数字反推不出商务折扣。
 	ListOrigin ListOrigin
@@ -60,6 +74,45 @@ func (a *AggRow) ExprUnitDivisor(exchangeRate float64) float64 {
 		return 1
 	}
 	return exchangeRate
+}
+
+// HasRatioDiscount 该行能否直接按「本次请求实际使用的分组倍率」结算。
+//
+// 只对**阶梯表达式计费**的行成立，因为站内的 quota 就是表达式算出来的：
+//
+//	quota = 表达式USD × GroupRatio × QuotaPerCNY
+//	而 OfficialUSD = 表达式USD
+//
+// 于是 结算额 = OfficialUSD × 汇率 × (GroupRatio / 汇率) = quota / QuotaPerCNY，
+// 与站内实收逐行严格相等。
+//
+// 外部对标价的行（官网价/价表/ratio 快照）不满足这个关系：它们的 GroupRatio
+// 与「对标价」之间没有这种推导关系，硬套会把金额算错，所以返回 false 交回原逻辑。
+func (a *AggRow) HasRatioDiscount() bool {
+	return a.GroupRatio > 0 && a.BillingMode == BillingModeTieredExpr && a.BillingExpr != ""
+}
+
+// RatioDiscount 本次请求实际使用倍率对应的折扣：倍率 / DiscountBaseFactor。
+// 与 group_ratio_source.md 的换算约定一致（倍率 1 对应折扣 1/7）。
+func (a *AggRow) RatioDiscount() float64 {
+	return a.GroupRatio / DiscountBaseFactor
+}
+
+// DisplayGroup 账单 C 列展示用的分组名。
+//
+// 同一分组下出现多种倍率时会被拆成多行，光看「Codex」两行会困惑，
+// 因此把倍率缀在名字后面（Codex(0.4)）让客户能对上号。
+// 倍率唯一时保持原样，账单外观与以前一致。
+func (a *AggRow) DisplayGroup() string {
+	if !a.HasRatioDiscount() {
+		return a.KeyGroup
+	}
+	return fmt.Sprintf("%s(%s)", a.KeyGroup, trimRatio(a.GroupRatio))
+}
+
+// trimRatio 倍率转成展示文本：去掉多余的 0（0.4000 → 0.4，1.0000 → 1）。
+func trimRatio(r float64) string {
+	return strconv.FormatFloat(r, 'f', -1, 64)
 }
 
 // ListOrigin 标出官方刊例（AggRow.OfficialUSD）是从哪里来的。
@@ -215,7 +268,13 @@ type RowSummary struct {
 	Quota        float64 `json:"quota"`
 	SettleCNY    float64 `json:"settleCny"`
 	ListCNY      float64 `json:"listCny"`
-	Discount     float64 `json:"discount"`
+	// Discount 展示用折扣（已按 DiscountDecimals 取整）。
+	Discount float64 `json:"discount"`
+	// SettleFactor 结算用系数：按倍率结算与反推结算时它是**精确值**，
+	// 不是 Discount 的取整值。SettleCNY == round(ListCNY × SettleFactor, 4)，
+	// 用 Discount 去乘只能得到近似值（差额来自显示精度，不是业务差异）。
+	// 页面/账单要复核金额时应该乘这个。
+	SettleFactor float64 `json:"settleFactor"`
 	Rows         int     `json:"rows"`
 	HasPrice     bool    `json:"hasPrice"`
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -578,13 +579,28 @@ func DerivableListPrice(agg *AggRow, manualMarkers []string) bool {
 
 // DiscountResult ComputeGroupDiscounts 的结果。
 type DiscountResult struct {
-	// Discounts 分组 → 折扣。
+	// Discounts 分组 → 折扣（展示用，已按 DiscountDecimals 取整）。
 	Discounts map[string]float64
+	// SettleFactors 分组 → 结算用系数。
+	//
+	// 对按「本次倍率」结算的表达式行，这个值是**精确的**倍率/7，不做四舍五入：
+	// 用取整后的折扣去乘，整表会产生约 0.05 元的系统性偏差（账期越大越明显），
+	// 而那个偏差没有任何业务含义，纯粹是显示精度的副作用。
+	// 其余分组的系数与其展示折扣相同。
+	SettleFactors map[string]float64
 	// Derived 折扣来自「Σ结算/Σ总金额」反推的分组。
 	Derived map[string]bool
 	// Underivable 既没有价表折扣、又不能反推的分组 → 原因，供账单备注写清楚
 	// 折扣是从哪来的、为什么这个数需要人工确认。
 	Underivable map[string]string
+}
+
+// SettleFactor 取该桶的结算系数：优先用精确值，缺失时退回展示折扣。
+func (r DiscountResult) SettleFactor(group string) float64 {
+	if v, ok := r.SettleFactors[group]; ok {
+		return v
+	}
+	return r.Discounts[group]
 }
 
 // ComputeGroupDiscounts 每个分组标识的折扣。
@@ -594,12 +610,15 @@ type DiscountResult struct {
 //  2. 价表折扣 sheet：按模型厂商家族（见 VendorFamily）匹配，命中即用价表值；
 //  3. 反推：该组 Σ结算人民币 / Σ总金额人民币，只累加 DerivableListPrice 为真的行。
 //
-// 只有走到第 3 步的分组才算「折扣为反推值」，需要由调用方在账单备注里写明——
+// 只有走到最后一步的分组才算「折扣为反推值」，需要由调用方在账单备注里写明——
 // 反推值只能保证账面对得上，并不能说明商务上谈定的折扣是多少。
 //
-// 既查不到价表折扣、又没有一行可反推的分组（整组走站内表达式计费，或被人工标记为
-// 站内定价），不能编一个数塞进账单：折扣回退到「分组实际倍率」对应的站点折扣
-// （quota 折算额 ÷ 清单刊例），并记入 Underivable 由调用方在备注里要求人工确认。
+// 折扣按 agg.Group（已含倍率层级的桶键）解析。同一分组下如果出现过多种倍率，
+// 它会被拆成多个桶，每个桶各自结算——用一个折扣套整组必然算错，且错多少取决于
+// 该组第一行是哪个模型，这种不确定性比数值偏差本身更危险。
+//
+// 既查不到价表折扣、又没有一行可反推、也没有可用倍率的分组，不能编一个数塞进账单：
+// 折扣回退到「按 quota 加权的组内平均实际倍率」，并记入 Underivable 由调用方要求人工确认。
 func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool, manualMarkers []string) DiscountResult {
 	if forcedDiscount != nil {
 		result := map[string]float64{}
@@ -607,7 +626,8 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 			result[agg.Group] = round(*forcedDiscount, DiscountDecimals)
 		}
 		return DiscountResult{
-			Discounts: result, Derived: map[string]bool{}, Underivable: map[string]string{},
+			Discounts: result, SettleFactors: map[string]float64{},
+			Derived: map[string]bool{}, Underivable: map[string]string{},
 		}
 	}
 
@@ -619,20 +639,45 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 		if book == nil {
 			break
 		}
+		if _, already := discounts[agg.Group]; already {
+			continue
+		}
 		if d, ok := tableDiscount(book, agg.Model); ok {
-			if _, seen := discounts[agg.Group]; !seen || tableGroups[agg.Group] {
-				discounts[agg.Group] = round(d, DiscountDecimals)
-				tableGroups[agg.Group] = true
-			}
+			discounts[agg.Group] = round(d, DiscountDecimals)
+			tableGroups[agg.Group] = true
 		}
 	}
 
-	// 分母只累加口径可信的行。整组都不可信时下面会退到站点折扣，不会拿半截分母做除法。
+	derived := map[string]bool{}
+	underivable := map[string]string{}
+	// 结算系数：只在按倍率结算时与展示折扣不同（精确值 vs 取整值）。
+	settleFactors := map[string]float64{}
+
+	// 站内表达式计费的行直接按「本次请求实际使用的倍率」结算：
+	// 站内 quota = 表达式USD × GroupRatio × QuotaPerCNY，而 OfficialUSD = 表达式USD，
+	// 于是 折扣 = GroupRatio / DiscountBaseFactor 时，
+	// 结算额 = OfficialUSD × 汇率 × 折扣 == quota / QuotaPerCNY，与实收逐行严格相等。
+	// 这是表达式行的正确口径，不需要（也不能）靠反推得到。
+	for _, agg := range rows {
+		if _, already := discounts[agg.Group]; already {
+			continue
+		}
+		if !agg.HasRatioDiscount() {
+			continue
+		}
+		discounts[agg.Group] = round(agg.RatioDiscount(), DiscountDecimals)
+		// 结算用未取整的精确比值，避免整表累计出 0.05 元量级的无意义偏差。
+		settleFactors[agg.Group] = agg.RatioDiscount()
+	}
+
+	// 剩下的走反推：分母只累加口径可信的行。
+	// 表达式行与倍率行不参与——它们的折扣已由上面的分支确定，且比值型口径
+	// 反推出来的只是式子里的 group_ratio，不是商务折扣。
 	settleByGroup := map[string]float64{}
 	listByGroup := map[string]float64{}
 	skippedByGroup := map[string]int{}
 	for _, agg := range rows {
-		if !DerivableListPrice(agg, manualMarkers) {
+		if !DerivableListPrice(agg, manualMarkers) || agg.HasRatioDiscount() {
 			skippedByGroup[agg.Group]++
 			continue
 		}
@@ -640,37 +685,67 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 		listByGroup[agg.Group] += OfficialListCNY(agg, exchangeRate)
 	}
 
-	derived := map[string]bool{}
-	underivable := map[string]string{}
 	for _, agg := range rows {
 		if _, ok := discounts[agg.Group]; ok {
-			if skippedByGroup[agg.Group] > 0 {
-				underivable[agg.Group] = underivableReason(agg, manualMarkers)
-			}
+			// 已定折扣的桶：如果组内还有别的桶没能定折扣，这里不做处理——
+			// underivable 是按桶键记录的，会在下面各自那轮里写入。
 			continue
 		}
 		listing := listByGroup[agg.Group]
 		if listing <= 0 {
-			// 一行都不可反推（或整组零用量）：不编折扣，退到站点实际倍率。
-			discounts[agg.Group] = round(siteDiscount(agg, exchangeRate), DiscountDecimals)
+			// 该桶一行都不可反推、也没有可用倍率：退到加权的实际倍率。
+			exact := weightedSiteDiscount(rows, agg.Group, exchangeRate)
+			discounts[agg.Group] = round(exact, DiscountDecimals)
+			settleFactors[agg.Group] = exact
 			underivable[agg.Group] = underivableReason(agg, manualMarkers)
 			continue
 		}
-		raw := settleByGroup[agg.Group] / listing
-		discounts[agg.Group] = round(raw, DiscountDecimals)
+		// 反推值同样「显示取整、结算用精确商」：分母是刊例、分子是实收，
+		// 用精确商结算时 结算额 == Σ quota，账实逐行相符；
+		// 把商四舍五入到 3 位再乘会引入与金额无关的、纯显示精度造成的偏差。
+		//
+		// 每个桶都要单独算一遍：同一分组拆出的多个桶各自的「结算/刊例」并不相同，
+		// 用一个桶的值去填另一个桶就会互相覆盖（先写入的被后写入的盖掉）。
+		exact := settleByGroup[agg.Group] / listing
+		discounts[agg.Group] = round(exact, DiscountDecimals)
+		settleFactors[agg.Group] = exact
 		derived[agg.Group] = true
 		if skippedByGroup[agg.Group] > 0 {
 			underivable[agg.Group] = underivableReason(agg, manualMarkers)
 		}
 	}
-	return DiscountResult{Discounts: discounts, Derived: derived, Underivable: underivable}
+	return DiscountResult{
+		Discounts: discounts, SettleFactors: settleFactors,
+		Derived: derived, Underivable: underivable,
+	}
 }
 
-// siteDiscount 分组实际倍率对应的折扣：quota 折算人民币 ÷ 该行清单刊例人民币。
+// weightedSiteDiscount 同一桶内按 quota 加权的实际倍率对应的折扣。
+//
+// 取代原来「取分组第一行代表整组」的写法：那个做法下，整组折扣取决于第一行
+// 是哪个模型，账期数据顺序一变金额就变，属于不可复现的错误。
+// 这里用 quota 加权，整桶折算额除以整桶刊例，与账实相符的含义一致。
+func weightedSiteDiscount(rows []*AggRow, groupKey string, exchangeRate float64) float64 {
+	if exchangeRate <= 0 {
+		return 0
+	}
+	var settle, listing float64
+	for _, agg := range rows {
+		if agg.Group != groupKey || agg.OfficialUSD <= 0 {
+			continue
+		}
+		settle += agg.Quota / QuotaPerCNY
+		listing += agg.OfficialUSD * exchangeRate
+	}
+	if listing <= 0 {
+		return 0
+	}
+	return settle / listing
+}
+
+// siteDiscount 单行的实际倍率对应折扣：quota 折算人民币 ÷ 该行清单刊例人民币。
 // 分子分母都换成人民币比较，量纲才对得上——拿人民币除美金会得出一个
 // 被汇率放大的数（如 3.5 而不是 0.5），那种数字写进账单比不写更误导。
-// 这是「站点实际上按几折在收」，属于账实相符的兜底值，不是商务谈定的折扣，
-// 因此调用方必须配合 Underivable 的备注要求人工确认。
 func siteDiscount(agg *AggRow, exchangeRate float64) float64 {
 	if agg.OfficialUSD <= 0 || exchangeRate <= 0 {
 		return 0
@@ -775,6 +850,72 @@ func IsDomesticMarked(model, group string, manualMarkers []string) bool {
 	}
 	return false
 }
+
+// GroupRatioFromOther 从日志 other 里取本次请求实际使用的分组倍率。
+//
+// 解析走容错的 iterTextCandidates（原文 → URL 解码 → 去转义引号），与
+// ExtractCacheFields 同一套：日志里确实存在整段不是合法 JSON 的 other
+// （admin_info.channel_affinity.key_hint 里嵌了转义引号，形如 "{\"de...28\"}"），
+// 严格的 json.Unmarshal 会整行失败，导致这些行取不到倍率、
+// 在按倍率分档结算时被误判。ok=false 表示该行没有给倍率。
+func GroupRatioFromOther(other string) (float64, bool) {
+	text := strings.TrimSpace(other)
+	if text == "" {
+		return 0, false
+	}
+	for _, candidate := range iterTextCandidates(text) {
+		parsed, ok := parseJSONValue(candidate)
+		if !ok {
+			parsed, ok = parseEmbeddedJSON(candidate)
+		}
+		if !ok {
+			continue
+		}
+		if v, found := findKeyRecursive(parsed, "group_ratio"); found {
+			if n, isNum := parseFloatValue(v); isNum && n > 0 {
+				return n, true
+			}
+		}
+	}
+	// 整段都解析不出来时退回正则，从原始文本里抠出这个字段。
+	if m := groupRatioRe.FindStringSubmatch(text); m != nil {
+		if f, err := strconv.ParseFloat(m[1], 64); err == nil && f > 0 {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+// parseFloatValue 从 JSON 解出来的值里取浮点数。
+// 不能复用 cache.go 的 parseNumber——它返回 int64，会把倍率 0.4 截断成 0。
+func parseFloatValue(value interface{}) (float64, bool) {
+	switch t := value.(type) {
+	case float64:
+		return t, true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f, true
+		}
+		return 0, false
+	case string:
+		s := strings.Trim(strings.TrimSpace(t), `"'`)
+		if s == "" {
+			return 0, false
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return f, true
+		}
+		return 0, false
+	}
+	return 0, false
+}
+
+// groupRatioRe 兜底的 group_ratio 提取：匹配 "group_ratio": 0.4 这类片段。
+var groupRatioRe = regexp.MustCompile(`"group_ratio"\s*:\s*"?([0-9]*\.?[0-9]+)"?`)
 
 // ParseDiscountText 对应 parse_discount_text：兼容百分数、"6折"、纯小数写法。
 func ParseDiscountText(value string) (float64, bool) {
