@@ -3,7 +3,9 @@ package billing
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -258,7 +260,7 @@ func TestSummarizeCostSkipsUnpricedRows(t *testing.T) {
 	priced := mk(101, f(0.4))
 	unpriced := mk(102, nil)
 
-	totals, text := SummarizeCost([]*CostRow{priced, unpriced}, NewPriceBook(), nil, rate, false, nil, 2026, 9)
+	totals, text := SummarizeCost([]*CostRow{priced, unpriced}, NewPriceBook(), nil, rate, false, nil, 2026, 9, nil)
 
 	assert.Equal(t, 2, totals.TotalRows)
 	assert.Equal(t, 1, totals.PricedRows, "只有一行参与合计")
@@ -286,7 +288,7 @@ func TestFormatCostSummaryFullCoverage(t *testing.T) {
 		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
 		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
 	}
-	text := FormatCostSummary(totals, 2026, 9)
+	text := FormatCostSummary(totals, 2026, 9, nil)
 
 	assert.NotContains(t, text, "未计入", "全覆盖时不该有保留说明")
 	assert.Contains(t, text, "账期：2026-09")
@@ -295,6 +297,61 @@ func TestFormatCostSummaryFullCoverage(t *testing.T) {
 	assert.Contains(t, text, "利润：¥6146.6056")
 	assert.Contains(t, text, "毛利率 40.58%", "毛利率 = 利润/结算额，保留两位")
 	assert.Contains(t, text, "覆盖渠道：3 个")
+
+	// header 为 nil 时必须与加头之前逐字节一致：手动上传日志那条路径没有客户与时段，
+	// 凭空多出「客户：」这种空行会让人以为漏传了参数。
+	assert.NotContains(t, text, "客户：")
+	assert.NotContains(t, text, "账号：")
+	assert.NotContains(t, text, "时段：")
+	assert.True(t, strings.HasPrefix(text, "账期：2026-09"), "无头时账期仍应是第一行")
+}
+
+// TestFormatCostSummaryWithHeader 有定位行时，客户/账号/时段必须写在账期之前。
+//
+// 顺序和位置都要钉住：这几行是给收件人确认「这段话覆盖的是谁、哪一段」用的，
+// 掉到金额后面或者互相换位，读起来就是另一回事了。
+func TestFormatCostSummaryWithHeader(t *testing.T) {
+	totals := CostTotals{
+		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
+	}
+	header := []string{"客户：钛动", "账号：tecdc3.0、tecdc3.1", "时段：2026-09-01 00:00:00 ~ 2026-09-30 23:59:59"}
+
+	text := FormatCostSummary(totals, 2026, 9, header)
+
+	// 摘要文字是按行读的，整体比对最不容易漏掉中间某个字段被挪走。
+	want := `客户：钛动
+账号：tecdc3.0、tecdc3.1
+时段：2026-09-01 00:00:00 ~ 2026-09-30 23:59:59
+账期：2026-09
+结算金额：¥15146.6056
+上游成本：¥9000
+利润：¥6146.6056（毛利率 40.58%）
+覆盖渠道：3 个；明细行：12 行`
+	assert.Equal(t, want, text)
+}
+
+// TestSummaryHeader 定位行的内容与时段格式。
+func TestSummaryHeader(t *testing.T) {
+	customer := Customer{Name: "钛动", Usernames: "tecdc3.0\ntecdc3.1"}
+	// 服务端可能跑在 UTC，这里故意给 UTC 时刻：必须转成北京时间再打印，
+	// 否则写出去的时间比页面看到的早 8 小时，对账时对不上。
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC).In(cstLocation)
+	end := time.Date(2026, 9, 30, 23, 59, 59, 0, time.UTC).In(cstLocation)
+
+	got := summaryHeader(customer, start, end)
+	want := []string{
+		"客户：钛动",
+		"账号：tecdc3.0、tecdc3.1",
+		"时段：2026-09-01 08:00:00 ~ 2026-10-01 07:59:59",
+	}
+	assert.Equal(t, want, got)
+
+	// 没配账号时不写空行：一个空的「账号：」比不写更让人困惑。
+	noAccount := summaryHeader(Customer{Name: "某客户"}, start, end)
+	assert.Len(t, noAccount, 2)
+	assert.Equal(t, "客户：某客户", noAccount[0])
+	assert.True(t, strings.HasPrefix(noAccount[1], "时段："))
 }
 
 // ---- 按渠道展开 ----

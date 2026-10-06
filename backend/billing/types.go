@@ -208,6 +208,18 @@ type Params struct {
 	// ChannelInfos 渠道 ID → 渠道信息，用于成本估算前的倍率检查。
 	ChannelInfos map[int]ChannelInfo
 
+	// CustomerName 客户名，只用于给产物文件名加后缀。
+	//
+	// 产物都落在同一个 job 目录（下载用），但用户会同时下载好几个客户的账单，
+	// 落到本地 Downloads 里全叫「账单_xxx.xlsx」，分不清谁是谁。
+	// 手动上传日志那条路径没有客户概念，留空即可——为空时文件名与原来完全一致。
+	CustomerName string
+
+	// SummaryHeader 成本利润摘要开头的定位行（客户、账号、时段），由调用方拼好后传入。
+	// billing 包不认识「客户」这个概念，也不知道时段是从哪来的，所以这里只负责原样印出去。
+	// 为空表示不写——手动上传日志那条路径没有这些信息。
+	SummaryHeader []string
+
 	// DomesticMarkers 人工标记的国产/站内定价标识：一条一个，可以是分组标识
 	// （精确匹配，如「国产模型」），也可以是模型名前缀（前缀匹配，如「doubao」）。
 	// 命中的 (模型,分组) 不参与折扣反推——模型名推厂商家族覆盖不全，识别不到时

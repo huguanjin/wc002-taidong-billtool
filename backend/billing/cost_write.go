@@ -118,7 +118,7 @@ func WriteCostFromTemplate(templatePath, outputPath string, rows []*CostRow, yea
 // 未维护倍率的行两边都跳过：成本不计入，结算额也不计入——否则会出现
 // 「利润 = 全量结算 − 部分成本」这种把毛利算虚高的组合。
 func SummarizeCost(rows []*CostRow, book *PriceBook, discount *float64, exchangeRate float64,
-	preferPriceTable bool, manualMarkers []string, year, month int) (CostTotals, string) {
+	preferPriceTable bool, manualMarkers []string, year, month int, header []string) (CostTotals, string) {
 
 	// 结算系数按 Group 取，与写出时同一套 ComputeGroupDiscounts。
 	discountResult := ComputeGroupDiscounts(aggRowsOf(rows), book, exchangeRate, discount, preferPriceTable, manualMarkers)
@@ -145,14 +145,18 @@ func SummarizeCost(rows []*CostRow, book *PriceBook, discount *float64, exchange
 	totals.ProfitCNY = round(totals.SettleCNY-totals.CostCNY, MoneyDecimals)
 	totals.ChannelCount = len(channelSeen)
 
-	return totals, FormatCostSummary(totals, year, month)
+	return totals, FormatCostSummary(totals, year, month, header)
 }
 
 // FormatCostSummary 生成结果区那段可复制的文字。
 //
 // 分开成一个纯函数是为了能用测试固定住文案：它是给人复制到聊天/邮件里的，
 // 数字口径改了却忘了改这里，会直接导致对外报错数。
-func FormatCostSummary(t CostTotals, year, month int) string {
+//
+// header 是开头的定位行（客户、账号、时段），由调用方拼好——见 Params.SummaryHeader。
+// 它让收件人一眼看出这段话覆盖的是谁、哪段时间：同一客户按月一条、按周一条时，
+// 两段文字除了金额完全一样，没有这几行就无法确认自己在看哪一条。
+func FormatCostSummary(t CostTotals, year, month int, header []string) string {
 	period := fmt.Sprintf("%d-%02d", year, month)
 	margin := 0.0
 	if t.SettleCNY > 0 {
@@ -160,6 +164,10 @@ func FormatCostSummary(t CostTotals, year, month int) string {
 	}
 
 	var b strings.Builder
+	for _, line := range header {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
 	fmt.Fprintf(&b, "账期：%s\n", period)
 	fmt.Fprintf(&b, "结算金额：¥%s\n", trimMoney(t.SettleCNY))
 	fmt.Fprintf(&b, "上游成本：¥%s\n", trimMoney(t.CostCNY))

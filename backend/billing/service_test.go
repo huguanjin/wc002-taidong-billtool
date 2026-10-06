@@ -4,8 +4,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -165,5 +168,114 @@ func TestGenerateBillEndToEnd(t *testing.T) {
 	}
 	if gptRow.ListCNY <= 0 {
 		t.Errorf("gpt-5.4 期望刊例为正，实际 %v", gptRow.ListCNY)
+	}
+}
+
+// TestOutputNamesCarryCustomerName 三类产物文件名都要能认出客户。
+//
+// 一次批量执行会同时产出好几个客户的账单，下载到本地 Downloads 后全叫
+// 「账单_日志查询_...xlsx」，只能靠打开看才知道是谁的——文件名带上客户名是唯一的解法。
+func TestOutputNamesCarryCustomerName(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "bill_template.xlsx")
+	priceTablePath := filepath.Join(dir, "price_table.xlsx")
+	// 文件名含「日志查询」，以便出账时被 defaultOutputName 改名为「账单」——
+	// 与「导出日志明细」产物的真实形状一致（见 ExportLogFileName）。
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_ab12cd.xlsx")
+	outDir := filepath.Join(dir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+
+	buildFixtureTemplate(t, templatePath)
+	buildFixturePriceTable(t, priceTablePath)
+	buildFixtureLog(t, logPath)
+
+	result, err := GenerateBill(logPath, templatePath, priceTablePath, "", outDir, Params{
+		ExchangeRate: 7,
+		SanitizedLog: true,
+		CustomerName: "钛动",
+	})
+	if err != nil {
+		t.Fatalf("GenerateBill 失败: %v", err)
+	}
+
+	assert.Equal(t, "账单_2026-09-01_2026-09-30_ab12cd_钛动.xlsx",
+		filepath.Base(result.BillPath), "账单名末尾应带客户名")
+	assert.Equal(t, "脱敏日志_2026-09-01_2026-09-30_ab12cd_钛动.xlsx",
+		filepath.Base(result.SanitizedPath), "脱敏日志名末尾应带客户名")
+
+	// 成本利润表的名字由账单名推出（账单_xxx → 成本利润_xxx），
+	// 客户名放末尾才能保证这条推导仍然成立、三张表名字对齐。
+	costPath := costOutputPath(result.BillPath)
+	assert.Equal(t, "成本利润_2026-09-01_2026-09-30_ab12cd_钛动.xlsx",
+		filepath.Base(costPath), "成本利润表名应沿用同一后缀")
+}
+
+// TestOutputNamesWithoutCustomer 没传客户名时文件名与改动前逐字节一致。
+//
+// 「手动上传日志」那条路径没有客户概念，凭空多出一个「_」会让老用户以为出了 bug。
+func TestOutputNamesWithoutCustomer(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "bill_template.xlsx")
+	priceTablePath := filepath.Join(dir, "price_table.xlsx")
+	logPath := filepath.Join(dir, "8月日志.xlsx")
+	outDir := filepath.Join(dir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+
+	buildFixtureTemplate(t, templatePath)
+	buildFixturePriceTable(t, priceTablePath)
+	buildFixtureLog(t, logPath)
+
+	result, err := GenerateBill(logPath, templatePath, priceTablePath, "", outDir, Params{
+		ExchangeRate: 7,
+		SanitizedLog: true,
+	})
+	if err != nil {
+		t.Fatalf("GenerateBill 失败: %v", err)
+	}
+
+	// SanitizedFormat 留空即默认 xlsx（见 sanitizedFormatInfo）。
+	assert.Equal(t, "8月账单.xlsx", filepath.Base(result.BillPath))
+	assert.Equal(t, "8月脱敏日志.xlsx", filepath.Base(result.SanitizedPath))
+}
+
+// TestCustomerNameSanitizedInFileName 客户名是自由文本，必须洗成合法文件名。
+//
+// 不洗的话 `/` 会让 filepath.Join 把文件写到别的目录（甚至逃出 job 目录），
+// Windows 上 `:` `*` `?` 则直接导致创建失败——两种都是执行时才炸，很难查。
+func TestCustomerNameSanitizedInFileName(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "bill_template.xlsx")
+	priceTablePath := filepath.Join(dir, "price_table.xlsx")
+	logPath := filepath.Join(dir, "8月日志.xlsx")
+	outDir := filepath.Join(dir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+
+	buildFixtureTemplate(t, templatePath)
+	buildFixturePriceTable(t, priceTablePath)
+	buildFixtureLog(t, logPath)
+
+	cases := []struct {
+		name     string
+		customer string
+		want     string
+	}{
+		{"路径分隔符", `ACME/华东\区`, "8月账单_ACME_华东_区.xlsx"},
+		{"Windows 非法字符", `A*B?C:D"E<F>G|H`, "8月账单_A_B_C_D_E_F_G_H.xlsx"},
+		{"首尾空白", "  钛动  ", "8月账单_钛动.xlsx"},
+		{"末尾点号", "ACME Inc.", "8月账单_ACME Inc.xlsx"},
+		{"清洗后为空", "///", "8月账单.xlsx"},
+		{"超长按字符截断", strings.Repeat("客", 50), "8月账单_" + strings.Repeat("客", 40) + ".xlsx"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := GenerateBill(logPath, templatePath, priceTablePath, "", outDir,
+				Params{ExchangeRate: 7, CustomerName: tc.customer})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, filepath.Base(result.BillPath))
+			// 关键：产物必须仍然落在 job 目录里，不能被客户名里的 `/` 带出去。
+			assert.Equal(t, outDir, filepath.Dir(result.BillPath))
+			assert.NotContains(t, filepath.Base(result.BillPath), "/")
+			assert.NotContains(t, filepath.Base(result.BillPath), "\\")
+		})
 	}
 }

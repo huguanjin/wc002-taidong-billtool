@@ -70,13 +70,13 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 	}
 
 	stem := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
-	billPath := filepath.Join(outputDir, defaultOutputName(stem)+".xlsx")
+	billPath := filepath.Join(outputDir, withCustomerSuffix(defaultOutputName(stem), params.CustomerName)+".xlsx")
 
 	var sanitizedWriter SanitizedWriter
 	var sanitizedPath string
 	if params.SanitizedLog {
 		ext, delimiter, isDelimited := sanitizedFormatInfo(params.SanitizedFormat)
-		sanitizedPath = filepath.Join(outputDir, defaultSanitizedName(stem)+ext)
+		sanitizedPath = filepath.Join(outputDir, withCustomerSuffix(defaultSanitizedName(stem), params.CustomerName)+ext)
 		if isDelimited {
 			sanitizedWriter, err = NewCSVSanitizedWriter(sanitizedPath, headers, delimiter, params.IncludeBillingParams)
 		} else {
@@ -194,7 +194,7 @@ func generateCostTable(inputPath, templatePath, billPath string, rows [][]string
 	}
 	// 合计与文字用与表内公式同源的口径算，避免结果区报的数与 xlsx 里的 SUM 对不上。
 	totals, text := SummarizeCost(costRows, book, params.Discount, exchangeRate,
-		preferPriceTable, params.DomesticMarkers, year, month)
+		preferPriceTable, params.DomesticMarkers, year, month, params.SummaryHeader)
 	// 未知渠道不拦生成，但必须如实报出：成本利润表里它们的成本列是空的，
 	// 用户得知道是哪几个渠道号——否则会以为成本利润表已经算全了。
 	return outPath, &totals, text, false, nil, status.UnknownChannelIDs, nil
@@ -289,6 +289,52 @@ func defaultSanitizedName(stem string) string {
 		return strings.Replace(stem, "日志", "脱敏日志", 1)
 	}
 	return stem + "_脱敏日志"
+}
+
+// withCustomerSuffix 给产物文件名加客户名后缀，形如「账单_日志查询_..._钛动.xlsx」。
+//
+// 客户名放在**末尾**：成本利润表的名字是由账单名推出来的（见 costOutputPath，
+// 把开头的「账单」换成「成本利润」），客户名插在中间会推出「成本利润_钛动_…」
+// 这种读不通的形状，放末尾则三张表天然一致。
+//
+// 客户名是用户随手填的自由文本，可能含路径分隔符或 Windows 保留字符。
+// 这里统一清洗：不清的话 filepath.Join 之后可能真正写到别的目录，
+// 或者落盘直接失败（Windows 上 `:` `*` `?` 都是非法字符）。
+// 清洗后没有实质内容（比如客户名就叫「///」）则不加后缀，退回原来的命名——
+// 「账单___」这种文件名不提供任何信息，只是噪音。
+func withCustomerSuffix(name, customer string) string {
+	safe := sanitizeFileNamePart(customer)
+	if strings.Trim(safe, "_") == "" {
+		return name
+	}
+	return name + "_" + safe
+}
+
+// sanitizeFileNamePart 把一段自由文本洗成能安全做文件名的一部分。
+func sanitizeFileNamePart(s string) string {
+	// 路径分隔符与控制字符一律换成下划线；顺手压掉首尾空白。
+	s = strings.Map(func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|':
+			return '_'
+		}
+		if r < 0x20 || r == 0x7f {
+			return '_'
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+
+	// Windows 上文件名不能以点或空格结尾（会被默默截掉，或直接创建失败）。
+	s = strings.TrimRight(s, ". ")
+
+	// 客户名可能很长，也会被塞进 Content-Disposition。按**字符**截断而不是字节，
+	// 否则中文会被砍成半个字变成乱码。
+	const maxRunes = 40
+	if runes := []rune(s); len(runes) > maxRunes {
+		s = strings.TrimSpace(string(runes[:maxRunes]))
+	}
+	return s
 }
 
 // sanitizedFormatInfo 把「脱敏日志格式」参数解析为输出扩展名/分隔符；

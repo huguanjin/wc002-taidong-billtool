@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import { copyText, selectElementText } from './clipboard'
 
 // 账单导出任务：**可维护的计划** + 选择性批量执行。
 //
@@ -48,8 +49,8 @@ const validationResults = ref([])
 const runFailures = computed(() => runResults.value.filter((r) => !r.ok))
 const runSuccesses = computed(() => runResults.value.filter((r) => r.ok))
 
-const copyState = ref('')
-const copyRef = ref(null)
+// 复制按钮的状态，按任务 ID 记（见 copySummary）。
+const copyStates = ref({})
 
 const settingsDraft = ref({
   priceSource: 'db',
@@ -432,28 +433,33 @@ async function deleteSelected() {
   await loadTasks()
 }
 
-async function copyText(text) {
-  if (!text) return
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-      copyState.value = 'ok'
-      setTimeout(() => { copyState.value = '' }, 2000)
-      return
-    }
-  } catch (err) {
-    // 落到手动选中
+// 复制一条成功结果的成本利润摘要。
+//
+// 状态按任务 ID 记：批量执行后页面上会有好几条摘要，用单个全局状态的话
+// 点其中一个，所有按钮会一起变成「已复制 ✓」——用户根本不知道复制了哪条。
+async function copySummary(r) {
+  const id = r.taskId
+  const state = await copyText(r.costSummary)
+  copyStates.value = { ...copyStates.value, [id]: state }
+  if (state === 'fail') {
+    // 连 execCommand 都不行（极老的浏览器）：把文字选中，让用户自己按 Ctrl+C。
+    selectElementText(summaryEls.get(id))
   }
-  // http 部署下剪贴板 API 不可用（只在安全上下文存在），退化为选中文本。
-  const el = copyRef.value
-  if (el && window.getSelection) {
-    const range = document.createRange()
-    range.selectNodeContents(el)
-    const sel = window.getSelection()
-    sel.removeAllRanges()
-    sel.addRange(range)
-  }
-  copyState.value = 'fail'
+  setTimeout(() => {
+    const next = { ...copyStates.value }
+    delete next[id]
+    copyStates.value = next
+  }, 2000)
+}
+
+// summaryEls 任务 ID → 摘要 <pre> 元素。
+//
+// 不能再用 ref="copyRef"：它在 v-for 里，Vue 3 会把循环内的 ref 收集成**数组**，
+// 拿它当单个元素用（selectNodeContents）会直接抛异常——这正是之前「点了没反应」的原因。
+const summaryEls = new Map()
+function setSummaryEl(el, id) {
+  if (el) summaryEls.set(id, el)
+  else summaryEls.delete(id)
 }
 
 // ---- 展示辅助 ----
@@ -688,11 +694,11 @@ defineExpose({ loadAll })
         <div v-if="r.costSummary" class="cost-summary">
           <div class="cost-summary-head">
             <strong>{{ r.taskName || ('任务 ' + r.taskId) }} 成本利润摘要</strong>
-            <button type="button" class="btn-browse" @click="copyText(r.costSummary)">
-              {{ copyState === 'ok' ? '已复制 ✓' : copyState === 'fail' ? '复制失败，请手动选中' : '复制' }}
+            <button type="button" class="btn-browse" @click="copySummary(r)">
+              {{ copyStates[r.taskId] === 'ok' ? '已复制 ✓' : copyStates[r.taskId] === 'fail' ? '复制失败，请手动选中' : '复制' }}
             </button>
           </div>
-          <pre ref="copyRef" class="cost-summary-text">{{ r.costSummary }}</pre>
+          <pre :ref="(el) => setSummaryEl(el, r.taskId)" class="cost-summary-text">{{ r.costSummary }}</pre>
         </div>
       </div>
     </div>

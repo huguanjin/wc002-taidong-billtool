@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -23,6 +24,30 @@ func (t BillTask) DisplayName() string {
 			t.StartTime.Format("01-02"), t.EndTime.Format("01-02"))
 	}
 	return t.CustomerName
+}
+
+// summaryHeader 拼出成本利润摘要开头的定位行：客户、账号、时段。
+//
+// 只在这里拼，因为这是唯一同时握着 customer 与 start/end 的地方；
+// billing 包不认识「客户」，也不知道时段从哪来，只负责把这几行原样印出来。
+//
+// 时段用北京时间墙上时间、精确到秒，与页面 datetime-local 的口径一致。
+// 不要图省事用 task.StartAt()——那是给输入框用的 "2026-09-01T00:00:00"，
+// T 分隔符不是给人读的。
+func summaryHeader(customer Customer, start, end time.Time) []string {
+	lines := []string{fmt.Sprintf("客户：%s", customer.Name)}
+
+	// 账号可能配了多个（换行/逗号分隔），全部写出来：收件人据此确认覆盖范围，
+	// 少写一个就可能被当成「这部分没算进去」。
+	if usernames := customer.UsernameList(); len(usernames) > 0 {
+		lines = append(lines, fmt.Sprintf("账号：%s", strings.Join(usernames, "、")))
+	}
+
+	lines = append(lines, fmt.Sprintf("时段：%s ~ %s",
+		start.In(cstLocation).Format("2006-01-02 15:04:05"),
+		end.In(cstLocation).Format("2006-01-02 15:04:05")))
+
+	return lines
 }
 
 // TaskRunDeps 一次任务执行需要的外部依赖。
@@ -134,6 +159,10 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		IncludeBillingParams: settings.IncludeBillingParams,
 		DomesticMarkers:      settings.DomesticMarkerList(),
 		GenerateCost:         task.GenerateCost,
+		SummaryHeader:        summaryHeader(customer, start, end),
+		// 产物文件名带上客户名：一个 job 目录里可能同时躺着好几个客户的表，
+		// 下载到本地后全叫「账单_xxx.xlsx」就分不清了。
+		CustomerName: customer.Name,
 	}
 
 	// 成本利润表需要渠道上游倍率；从本地 PG 读好传进去（billing 的算账逻辑不连 PG）。

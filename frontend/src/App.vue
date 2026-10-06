@@ -3,6 +3,7 @@ import { ref, computed, nextTick, onMounted } from 'vue'
 import ChannelRatios from './ChannelRatios.vue'
 import Customers from './Customers.vue'
 import BillTasks from './BillTasks.vue'
+import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
 // 用标签页而不是 vue-router：整站就这么几块内容，装一个路由不划算
@@ -365,39 +366,20 @@ function fmtMoney(v) {
 const costSummaryRef = ref(null)
 const copyState = ref('')
 
-// 注意：部署在 http 上时 navigator.clipboard 不可用（只在安全上下文里存在），
-// 所以必须有回退——否则线上点「复制」会静默失败或抛异常。
 async function copyCostSummary() {
   const text = result.value && result.value.costSummary
   if (!text) return
-  try {
-    if (navigator.clipboard && window.isSecureContext) {
-      await navigator.clipboard.writeText(text)
-      copyState.value = 'ok'
-    } else {
-      selectCostSummary()
-      copyState.value = 'fail'
-      return
-    }
-  } catch (err) {
-    selectCostSummary()
-    copyState.value = 'fail'
-    return
-  }
+  const state = await copyText(text)
+  if (state === 'fail') selectCostSummary()
+  copyState.value = state
   setTimeout(() => {
     copyState.value = ''
   }, 2000)
 }
 
-// 选中摘要文本，供用户按 Ctrl+C；剪贴板 API 不可用时的兜底。
+// 选中摘要文本，供用户按 Ctrl+C；连 execCommand 都不行时的兜底。
 function selectCostSummary() {
-  const el = costSummaryRef.value
-  if (!el || !window.getSelection) return
-  const range = document.createRange()
-  range.selectNodeContents(el)
-  const sel = window.getSelection()
-  sel.removeAllRanges()
-  sel.addRange(range)
+  selectElementText(costSummaryRef.value)
 }
 
 const hasMissingPrice = computed(
