@@ -505,7 +505,12 @@ const blockedGrouped = computed(() => {
     }
     const sections = Object.keys(byGroup)
       .sort()
-      .map((g) => ({ group: g, channels: byGroup[g] }))
+      .map((g) => ({
+        group: g,
+        // 组内按「影响行数」降序：渠道多的时候，先补影响面最大的那个，
+        // 而不是按渠道号大小排——用户关心的是补哪个划算。
+        channels: byGroup[g].slice().sort((a, b) => (b.rowCount || 0) - (a.rowCount || 0)),
+      }))
     out.push({
       taskId: r.taskId,
       taskName: r.taskName || r.task?.name || `任务 ${r.taskId}`,
@@ -516,21 +521,54 @@ const blockedGrouped = computed(() => {
   return out
 })
 
-// blockedUnknownChannels 全部被拦任务里「渠道清单里查不到」的渠道号。
-// 这些补不了（业务库已删），只能如实报出——引导用户去补一个不存在的渠道
-// 只会让他徒劳地在清单里找。
-const blockedUnknownChannels = computed(() => {
+// blockedUnknownCount 全部被拦任务里「渠道清单里查不到」的渠道数。
+//
+// 这些渠道**照样能填倍率**（倍率表以 channel_id 为主键，与清单无关），
+// 只是不在清单里、拿不到渠道名。从前这里把它们当成"补不了"而不给输入框，
+// 结果是清单快照没拉到的渠道永远算不出成本——用户看得到账单上的缺失，
+// 界面上却没有地方可填。
+const blockedUnknownCount = computed(() => {
   const set = new Set()
   for (const r of runBlocked.value) {
-    for (const id of r.channelCheck?.unknownChannelIds || []) set.add(id)
+    for (const m of r.channelCheck?.missing || []) {
+      if (m.known === false) set.add(m.channelId)
+    }
   }
-  return [...set].sort((a, b) => a - b)
+  return set.size
 })
 
 // blockedMissGroupRatio 全部被拦任务里 group_ratio 缺失的行数。
 const blockedMissGroupRatio = computed(() =>
   runBlocked.value.reduce((sum, r) => sum + (r.channelCheck?.missingGroupRatioRows || 0), 0)
 )
+
+// 算不出成本的行数按原因分类（键见后端 CostSkipReason）。
+// 分开是必要的：缺倍率能补、缺渠道号只能查日志，混成一句「392 行未计入成本」
+// 用户不知道该干什么——那正是这次修的问题。
+const SKIP_REASON_LABELS = {
+  no_upstream_ratio: '渠道未维护上游倍率',
+  unknown_channel: '渠道不在本地清单里',
+  no_channel: '日志里取不到渠道号',
+  multi_channel: '一行经多个渠道无法分摊',
+  no_group_ratio: '缺分组倍率（group_ratio）',
+}
+
+// blockedSkipReasons 把各任务的原因表合并成一个列表，按固定顺序展示。
+function skipReasonText(rowReasons) {
+  const order = [
+    'no_upstream_ratio',
+    'unknown_channel',
+    'no_channel',
+    'multi_channel',
+    'no_group_ratio',
+  ]
+  const parts = []
+  for (const k of order) {
+    const n = rowReasons?.[k]
+    if (n > 0) parts.push(`${n} 行${SKIP_REASON_LABELS[k] || k}`)
+  }
+  return parts.join('、')
+}
 
 // blockedUnknownCount 全部被拦任务里取不到渠道号的任务数（noChannelInfo）。
 const blockedNoChannelInfo = computed(() =>
@@ -916,13 +954,15 @@ defineExpose({ loadAll })
         other 里也没有 use_channel），这一份做不了检查。请用「导出日志明细」重新导出带
         channel_id 的日志，或到「生成账单」页手动处理。
       </p>
-      <p class="error" v-if="blockedMissGroupRatio > 0">
-        另有 {{ blockedMissGroupRatio }} 行缺少分组倍率（group_ratio），这些行的官方刊例
-        反推不出来，成本与利润会留空。
+      <!-- 逐条列出「还差什么、各多少行」。只说总数会让人去翻日志，
+           说清原因才知道是去补倍率还是去查导出方式。 -->
+      <p class="hint" v-for="b in blockedGrouped" :key="'why-' + b.taskId"
+         v-if="skipReasonText(b.channelCheck?.uncostableRows)">
+        {{ b.taskName }}：{{ skipReasonText(b.channelCheck?.uncostableRows) }}
       </p>
-      <p class="error" v-if="blockedUnknownChannels.length > 0">
-        渠道 {{ blockedUnknownChannels.join('、') }} 在本地渠道清单里查不到（业务库可能已删除），
-        无法补录倍率，它们的成本不入成本合计。
+      <p class="hint" v-if="blockedUnknownCount > 0">
+        有 {{ blockedUnknownCount }} 个渠道不在本地渠道清单里（多半是新加的，还没点过「拉取渠道清单」）。
+        它们**仍然可以补录倍率**——倍率表只认渠道号，不依赖清单，直接填就行。
       </p>
 
       <div v-for="b in blockedGrouped" :key="'blk-' + b.taskId" class="blocked-task">
@@ -944,7 +984,10 @@ defineExpose({ loadAll })
             <tbody>
               <tr v-for="ch in sec.channels" :key="b.taskId + '-' + ch.channelId">
                 <td>{{ ch.channelId }}</td>
-                <td>{{ ch.name }}</td>
+                <td>
+                  {{ ch.name }}
+                  <span v-if="ch.known === false" class="tag warn">不在渠道清单里</span>
+                </td>
                 <td>
                   <input
                     v-model="blockedRatioDraft[ch.channelId]"
@@ -960,6 +1003,8 @@ defineExpose({ loadAll })
                        在一节里填了，另一节也会立刻显示已填，不会让人以为那边还没填。 -->
                   <span v-if="String(blockedRatioDraft[ch.channelId] ?? '').trim() !== ''">待保存</span>
                   <span v-else>未维护</span>
+                  <!-- 影响行数：用户据此决定先补哪一个。 -->
+                  <span v-if="ch.rowCount" class="hint inline">（影响 {{ ch.rowCount }} 行）</span>
                 </td>
               </tr>
             </tbody>

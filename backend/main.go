@@ -1470,9 +1470,49 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	status := billing.CheckUpstreamRatios(channelIDs, ratios, infoMap)
+	// 按**行**判据统计（与出账、与任务预检共用 RowCostReason）。
+	//
+	// 从前这里只遍历「有渠道号的行」（ExtractChannelUsage 会把没有渠道号的行跳过），
+	// 于是这些行对检查完全隐形：页面显示「都维护好了」，出账时却报
+	// 「392 行缺少渠道倍率或分组倍率」。用户按页面提示补完再来查还是这句话。
+	knownIDs := make(map[int]bool, len(channelList))
+	for _, c := range channelList {
+		knownIDs[c.ChannelID] = true
+	}
+	rowCounts, missingRatios, rowsPerChannel := billing.CountRowCostReasons(headers, rows, ratios, knownIDs)
+	if rowCounts[billing.SkipNoUpstreamRatio] > 0 {
+		// 缺倍率的渠道要能在页面上就地补，所以补进 infoMap 供填写。
+		for _, id := range missingRatios {
+			if _, ok := infoMap[id]; !ok {
+				infoMap[id] = billing.ChannelInfo{ChannelID: id, Name: fmt.Sprintf("渠道 %d（不在渠道清单里）", id)}
+			}
+		}
+	}
+
+	// 待补录清单直接用 CheckChannelRatios：它从**倍率表**推，
+	// 因而包含渠道清单里查不到的那些（它们照样能填倍率），
+	// 而 CheckUpstreamRatios 会把它们当成「补不了」排除掉。
+	check := billing.CheckChannelRatios(usage, ratios, infoMap, rowsPerChannel)
+	// 兼容旧字段：missingChannels 从前是 []ChannelInfo，前端与既有测试都按那个形状读。
+	// 新的 missingIssues 带 groups / known / rowCount，页面按分组分节展示用它。
+	missingInfos := make([]billing.ChannelInfo, 0, len(check.Missing))
+	for _, m := range check.Missing {
+		missingInfos = append(missingInfos, billing.ChannelInfo{
+			ChannelID: m.ChannelID, Name: m.Name, ChannelGroup: m.ChannelGroup,
+		})
+	}
 
 	// 把「日志里用到的渠道」整份返回（含已维护的），页面可直接就地编辑补录。
+	uncostable := map[string]int{}
+	uncostableTotal := 0
+	for reason, n := range rowCounts {
+		if reason == billing.SkipNone || reason == billing.SkipZeroDelta || n == 0 {
+			continue
+		}
+		uncostable[string(reason)] = n
+		uncostableTotal += n
+	}
+
 	used := make([]billing.ChannelWithRatio, 0, len(channelIDs))
 	for _, id := range channelIDs {
 		info := infoMap[id]
@@ -1487,18 +1527,22 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"hasChannelColumn":  true,
 		"usedChannels":      used,
-		"maintainedCount":   len(status.Maintained),
-		"missingCount":      len(status.Missing),
-		"unknownCount":      len(status.UnknownChannelIDs),
-		"missingChannels":   status.Missing,
-		"unknownChannelIds": status.UnknownChannelIDs,
+		"maintainedCount":   len(check.Maintained),
+		"missingCount":      len(check.Missing),
+		"unknownCount":      len(check.UnknownChannelIDs),
+		"missingChannels":   missingInfos,
+		"missingIssues":     check.Missing,
+		"unknownChannelIds": check.UnknownChannelIDs,
 		"channelTableEmpty": len(channelList) == 0,
 		// 按分组归类的渠道（页面分节展示用，见上面的 groupChannels）。
 		"groupChannels": groupChannels,
 		// group_ratio 缺失的行数：这些行的官方刊例反推不出来，成本列会留空。
 		// 与「渠道没维护倍率」是两件事（一个补倍率、一个查日志），所以分开报。
-		"missingGroupRatioRows": billing.CountMissingGroupRatioRows(headers, rows),
-		"totalRows":             len(rows),
+		"missingGroupRatioRows": rowCounts[billing.SkipNoGroupRatio],
+		// 算不出成本的行数按原因分类，页面据此说清「还差什么」。
+		"uncostableRows":  uncostable,
+		"uncostableTotal": uncostableTotal,
+		"totalRows":       len(rows),
 	})
 }
 

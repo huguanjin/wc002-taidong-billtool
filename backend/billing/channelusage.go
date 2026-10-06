@@ -164,6 +164,142 @@ func parseChannelList(v string) []int {
 	return out
 }
 
+// CostSkipReason 一行日志没能算出成本的原因。
+//
+// 枚举而不是几个计数器，是因为**检查与出账必须按同一套判据**：
+// 之前检查侧只遍历「有渠道号的行」，出账侧却遍历全部行，于是
+// 「检查通过、成本全空」这种自相矛盾的结果就出现了——用户看到预检放行，
+// 却在账单上读到「392 行缺少渠道倍率」。
+type CostSkipReason string
+
+const (
+	// SkipNone 这一行能算出成本。
+	SkipNone CostSkipReason = ""
+	// SkipNoGroupRatio 日志缺 group_ratio，反推不出官方刊例。
+	SkipNoGroupRatio CostSkipReason = "no_group_ratio"
+	// SkipNoChannel 取不到渠道号（channel_id 列与 other.use_channel 都没有）。
+	SkipNoChannel CostSkipReason = "no_channel"
+	// SkipMultiChannel 一行经多个渠道，额度怎么分摊不明，不猜。
+	SkipMultiChannel CostSkipReason = "multi_channel"
+	// SkipUnknownChannel 渠道号在本地清单里查不到（业务库多半已删，填不了倍率）。
+	SkipUnknownChannel CostSkipReason = "unknown_channel"
+	// SkipNoUpstreamRatio 渠道在清单里，但还没维护上游倍率——**唯一能靠补录解决的一种**。
+	SkipNoUpstreamRatio CostSkipReason = "no_upstream_ratio"
+	// SkipZeroDelta 这一行不改动额度（补扣/退款但金额为 0），对成本没有影响。
+	//
+	// 单列一类而不是并进上面几类：它不该被算作"缺成本"。任务行常常记
+	// task_id + 0 额度当占位，把它们计进缺失数会让用户看到一个夸张的行数，
+	// 去补一堆本来不影响成本的倍率。
+	SkipZeroDelta CostSkipReason = "zero_delta"
+)
+
+// RowCostReason 这一行为什么算不出成本，以及它用到的渠道号。
+//
+// 出账与检查共用它的判据（见 CostSkipReason 的说明）。
+func RowCostReason(row []string, idxChannel int, hasChannelCol bool,
+	idxOther int, hasOtherCol bool, ratios map[int]float64, known map[int]bool,
+	delta float64) (CostSkipReason, []int) {
+
+	ids := rowChannelIDs(row, idxChannel, hasChannelCol, idxOther, hasOtherCol)
+	switch {
+	case len(ids) == 0:
+		// 额度为 0 的行没有成本可言，先于「没渠道号」判定：
+		// 否则任务占位行会被报成需要补录的缺失行。
+		if delta == 0 {
+			return SkipZeroDelta, nil
+		}
+		return SkipNoChannel, ids
+	case len(ids) > 1:
+		return SkipMultiChannel, ids
+	}
+	if r, ok := ratios[ids[0]]; ok && r >= 0 {
+		return SkipNone, ids
+	}
+	// 有渠道号但没倍率。两种可能，判据只能是**渠道清单**：
+	//
+	//	清单里有 → 只是还没填，补一下就能算成本（这是这个功能存在的意义）
+	//	清单里没有 → 业务库已硬删除，填不了，只能在账单上如实说明
+	//
+	// 不能靠「known 为空就当成未知」来省事：首次使用时清单本来就是空的，
+	// 那会把「还没填倍率」全报成「渠道不存在」，引导用户去补一个根本补不了的渠道。
+	if known != nil && !known[ids[0]] {
+		return SkipUnknownChannel, ids
+	}
+	return SkipNoUpstreamRatio, ids
+}
+
+// CountRowCostReasons 扫一遍日志，按原因统计算不出成本的行数，并收集缺失的渠道号。
+//
+// **按行统计而不是按渠道**：一个渠道可能只在大批行里出现在少数几行上，
+// 只报渠道会让用户以为补了倍率就万事大吉，实际还有别的行因别的原因算不出来。
+func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float64,
+	known map[int]bool) (counts map[CostSkipReason]int, missingChannels []int, rowsPerChannel map[int]int) {
+
+	col := map[string]int{}
+	for i, h := range headers {
+		if h != "" {
+			col[h] = i
+		}
+	}
+	idxChannel, hasChannelCol := col["channel_id"]
+	idxOther, hasOtherCol := col["other"]
+	idxQuota, hasQuota := col["quota"]
+	idxType, hasType := col["type"]
+
+	counts = map[CostSkipReason]int{}
+	rowsPerChannel = map[int]int{}
+	// 缺失渠道按**渠道**去重计数，而不是按行：一个渠道可能出现在几万行里，
+	// 按行报会得到「12000 行渠道未维护倍率」这种数字——用户要补的其实只有 1 个渠道，
+	// 报行数只会让人以为工作量很大。
+	//
+	// 但每个渠道**各影响多少行**要单独留着（rowsPerChannel）：
+	// 用户补录时按行数排优先级，先补影响面最大的那个。
+	missingByChannel := map[int]bool{}
+
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		other := ""
+		if hasOtherCol {
+			other = cellAt(row, idxOther)
+		}
+
+		// delta 的口径必须与 AggregateSimpleBill 完全一致（退款为负、补扣为正），
+		// 否则「额度为 0 的行」在这边被算成缺失、在那边被忽略，两处又对不上。
+		delta := 0.0
+		if hasQuota {
+			delta = ToFloat(cellAt(row, idxQuota))
+		}
+		if IsTaskQuotaAdjustment(other) {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			d, ok := QuotaAdjustmentDelta(logType, delta)
+			if !ok {
+				continue
+			}
+			delta = -d
+		}
+
+		reason, ids := RowCostReason(row, idxChannel, hasChannelCol,
+			idxOther, hasOtherCol, ratios, known, delta)
+		if reason == SkipNoUpstreamRatio && len(ids) == 1 {
+			rowsPerChannel[ids[0]]++
+			if !missingByChannel[ids[0]] {
+				missingByChannel[ids[0]] = true
+				counts[reason]++
+				missingChannels = append(missingChannels, ids[0])
+			}
+			continue
+		}
+		counts[reason]++
+	}
+	sort.Ints(missingChannels)
+	return counts, missingChannels, rowsPerChannel
+}
+
 // UsedChannelIDs 取 usage 里的渠道号，去重升序。
 //
 // 排序是为了让展示稳定：map 的遍历顺序是随机的，直接输出会让同一份日志
@@ -201,13 +337,29 @@ type ChannelIssue struct {
 	ChannelGroup string `json:"channelGroup"`
 	// Groups 该渠道在本次日志里实际出现过的分组名，页面据此分节展示。
 	Groups []string `json:"groups"`
+	// Known 该渠道号在本地渠道清单里是否存在。
+	//
+	// **它不决定「能不能补录」**：倍率表以 channel_id 为主键，与渠道清单无关
+	// （见 UpsertChannelRatios，它不校验清单）。从前清单里查不到的渠道不给输入框，
+	// 结果是一批新上线、清单快照还没拉到的渠道永远算不出成本，而且预检不拦——
+	// 用户只看到账单上一句「392 行未计入成本」，界面上却无处可填。
+	Known bool `json:"known"`
+	// RowCount 该渠道在本次日志里未计入成本的行数，供页面按工作量排序/提示。
+	RowCount int `json:"rowCount"`
 }
 
 // ChannelCheckResult 一次「上游倍率维护情况」检查的结果。
 type ChannelCheckResult struct {
 	// UsedChannels 本次日志用到的全部渠道（含已维护的），供页面展示完整清单。
 	UsedChannels []UsedChannel `json:"usedChannels"`
-	// Missing 未维护倍率、且渠道表里查得到的——可以就地补录。
+	// Maintained 已维护倍率的渠道。
+	Maintained []ChannelInfo `json:"maintained"`
+	// Missing 未维护倍率、需要补录的渠道（**含渠道清单里查不到的**）。
+	//
+	// 从前这里只放「清单里查得到」的，清单里查不到的那批被塞进 UnknownChannelIDs
+	// 并当成「补不了」。那个判断是错的：倍率表不依赖渠道清单，清单里没有的渠道
+	// 照样能填倍率。改成一律进 Missing（Known 字段标明是不是清单之外），
+	// 页面就能对它们一视同仁地给输入框。
 	Missing []ChannelIssue `json:"missing"`
 	// UnknownChannelIDs 渠道表里查不到的（多半已在业务库被硬删除）——补不了，
 	// 只能如实报出，让用户知道这些渠道的成本算不全。
@@ -215,6 +367,14 @@ type ChannelCheckResult struct {
 	// MissingGroupRatioRows group_ratio 缺失、无法反推官方刊例的行数。
 	// 大于 0 时这些行的成本同样算不出来（见 AggregateSimpleBill）。
 	MissingGroupRatioRows int `json:"missingGroupRatioRows"`
+	// UncostableRows 算不出成本的行数，按原因分类。
+	//
+	// 它是**唯一权威的口径**：预检拦不拦、账面上成本留不留空，都以它为准。
+	// 从前预检只遍历「有渠道号的行」，而成本侧遍历全部行，于是会出现
+	// 「预检放行、账单上却写着 392 行缺倍率」——两个数都自称是缺失行数。
+	UncostableRows map[string]int `json:"uncostableRows,omitempty"`
+	// UncostableTotal 上面那张表的总和（不含 zero_delta）。
+	UncostableTotal int `json:"uncostableTotal"`
 	// TotalRows 日志数据行数，供页面显示「检查了多少行」。
 	TotalRows int `json:"totalRows"`
 	// NoChannelInfo 这份日志里一个渠道号都没有——渠道检查做不了。
@@ -237,8 +397,8 @@ type UsedChannel struct {
 //
 // ratios 只含已维护的渠道（见 ChannelRatioMap）；channels 是本地渠道清单。
 // 判定复用 CheckUpstreamRatios，这里只负责把结果映射成带分组的展示结构。
-func CheckChannelRatios(usage map[int]*ChannelUsage,
-	ratios map[int]float64, channels map[int]ChannelInfo) ChannelCheckResult {
+func CheckChannelRatios(usage map[int]*ChannelUsage, ratios map[int]float64,
+	channels map[int]ChannelInfo, rowCounts map[int]int) ChannelCheckResult {
 
 	ids := make([]int, 0, len(usage))
 	for id := range usage {
@@ -248,8 +408,13 @@ func CheckChannelRatios(usage map[int]*ChannelUsage,
 
 	status := CheckUpstreamRatios(ids, ratios, channels)
 	result := ChannelCheckResult{
-		UsedChannels:      make([]UsedChannel, 0, len(ids)),
+		UsedChannels: make([]UsedChannel, 0, len(ids)),
+		// Missing 从**倍率表**直接推，不再只认 CheckUpstreamRatios 的结论：
+		// 那个函数把清单之外的渠道归进 UnknownChannelIDs 并当作「补不了」，
+		// 而倍率表根本不需要渠道清单（主键就是 channel_id）。
+		// 结果是：清单快照没拉到的渠道再也算不出成本，页面上还没有输入框可以填。
 		Missing:           []ChannelIssue{},
+		Maintained:        status.Maintained,
 		UnknownChannelIDs: status.UnknownChannelIDs,
 	}
 
@@ -258,7 +423,7 @@ func CheckChannelRatios(usage map[int]*ChannelUsage,
 		info, known := channels[id]
 		name := info.Name
 		if !known {
-			name = fmt.Sprintf("渠道 %d（渠道清单里没有）", id)
+			name = fmt.Sprintf("渠道 %d（不在渠道清单里）", id)
 		}
 		var ratio *float64
 		if v, ok := ratios[id]; ok {
@@ -269,18 +434,12 @@ func CheckChannelRatios(usage map[int]*ChannelUsage,
 			ChannelID: id, Name: name, ChannelGroup: info.ChannelGroup,
 			Groups: u.Groups, UpstreamRatio: ratio, Known: known,
 		})
-	}
-
-	// Missing 沿用 CheckUpstreamRatios 的语义（渠道表里有、但没倍率），
-	// 只把 Groups 补上——那是页面分节展示的依据。
-	for _, info := range status.Missing {
-		issue := ChannelIssue{
-			ChannelID: info.ChannelID, Name: info.Name, ChannelGroup: info.ChannelGroup,
+		if ratio == nil {
+			result.Missing = append(result.Missing, ChannelIssue{
+				ChannelID: id, Name: name, ChannelGroup: info.ChannelGroup,
+				Groups: u.Groups, Known: known, RowCount: rowCounts[id],
+			})
 		}
-		if u, ok := usage[info.ChannelID]; ok {
-			issue.Groups = u.Groups
-		}
-		result.Missing = append(result.Missing, issue)
 	}
 	return result
 }

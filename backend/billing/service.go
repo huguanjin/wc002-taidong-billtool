@@ -216,6 +216,7 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 	// 列集合固定，否则同一份产物在两种开关下结构不同，下游脚本会莫名对不上。
 	summaryRows, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
 		UpstreamRatios: params.ChannelUpstreamRatios,
+		KnownChannels:  params.ChannelKnownIDs,
 		CostColumns:    params.CheckCost,
 		// 汇率与模板一同一来源：两边的成本都经这一步换算，用不同的汇率会得出两个成本数。
 		ExchangeRate: params.ExchangeRate,
@@ -307,9 +308,14 @@ func FormatSimpleBillSummary(rows []SimpleBillRow, totals SimpleBillTotals, year
 	fmt.Fprintf(&b, "账单金额：¥%s\n", trimMoney(totals.TotalCostCNY))
 	fmt.Fprintf(&b, "请求次数：%d 次；汇总行：%d 行\n", totals.HitCount, len(rows))
 
-	// 成本三项只在算全了才写（见 SumSimpleBill）。写一个「只覆盖了一部分行」的成本，
-	// 收到这段文字的人会把它当成整体成本，进而把利润当成整体毛利——
-	// 那比不写成本危险得多，所以宁可缺、不可错。
+	// 成本三项：只要有行算出了成本就写，**并把覆盖率一起写出来**。
+	//
+	// 从前这里是「算不全就一个都不写」，结果是 504100 行里 392 行算不出来时，
+	// 整段摘要里连成本两个字都没有。那既不诚实（明明算出来了 99.9%）也没用
+	// （用户拿不到任何参考）。现在改成：给数 + 说清覆盖了多少行、没覆盖的是哪几类原因。
+	//
+	// 反过来，一行都没算出来时（倍率全没维护）仍然一个数都不给——
+	// 那时报 0 会被读成「上游免费」，利润虚高，那是成本核算最不能出的错。
 	if totals.UpstreamCostCNY != nil && totals.OfficialListUSD != nil && totals.ProfitCNY != nil {
 		fmt.Fprintf(&b, "官方刊例：$%s\n", trimFixed(*totals.OfficialListUSD, 2))
 		fmt.Fprintf(&b, "上游成本：¥%s\n", trimMoney(*totals.UpstreamCostCNY))
@@ -322,11 +328,25 @@ func FormatSimpleBillSummary(rows []SimpleBillRow, totals SimpleBillTotals, year
 		// 毛利率单独用逗号收尾，不套括号——与 FormatCostSummary 同一写法。
 		fmt.Fprintf(&b, "利润：¥%s，毛利率 %s%%\n",
 			trimMoney(*totals.ProfitCNY), trimPercent(margin))
-	} else if totals.Cost.TotalRows > 0 && totals.Cost.MissingRatioRows+totals.Cost.MissingChannelRows > 0 {
-		// 开了成本核算但算不全：如实说一句「没算」，而不是静默省略——
+		if skipped := totals.Cost.SkippedRows(); skipped > 0 {
+			// 上面的毛利率分母只是「有成本的那部分金额」，所以它是**这部分**的，
+			// 不是整张账单的。这条说明必须紧跟其后，否则会被当成整体毛利。
+			fmt.Fprintf(&b, "成本覆盖：%d/%d 行，金额 ¥%s/¥%s\n",
+				totals.Cost.Rows, totals.Cost.TotalRows,
+				trimMoney(totals.AmountCoveredCNY), trimMoney(totals.TotalCostCNY))
+			// 把「没覆盖的都是哪一类」写清楚：只说行数，用户还是要自己去翻日志。
+			if desc := DescribeSkipReasons(totals.Cost.SkipReasons); desc != "" {
+				fmt.Fprintf(&b, "未计入成本的原因：%s\n", desc)
+			}
+		}
+	} else if totals.Cost.TotalRows > 0 && len(totals.Cost.SkipReasons) > 0 {
+		// 一行都没算出来：如实说清是哪些行、什么原因，而不是静默省略——
 		// 省略会让人以为这张表本来就不含成本，于是拿另一份有成本的账单去对，越对越乱。
-		fmt.Fprintf(&b, "成本：未能核算（%d 行缺少渠道倍率或分组倍率）\n",
-			totals.Cost.MissingRatioRows+totals.Cost.MissingChannelRows)
+		if desc := DescribeSkipReasons(totals.Cost.SkipReasons); desc != "" {
+			fmt.Fprintf(&b, "成本：未能核算（%s）\n", desc)
+		} else {
+			b.WriteString("成本：未能核算\n")
+		}
 	}
 
 	// 按分组给小计：客户通常按分组核对，给一份分组合计比只给总额更省一轮沟通。

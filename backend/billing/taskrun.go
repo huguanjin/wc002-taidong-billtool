@@ -172,33 +172,69 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			return nil, cerr
 		}
 		infoMap := make(map[int]ChannelInfo, len(channelList))
+		knownIDs := make(map[int]bool, len(channelList))
 		for _, c := range channelList {
 			infoMap[c.ChannelID] = c.ChannelInfo
+			knownIDs[c.ChannelID] = true
 		}
 
-		usage, hasChannelInfo := ExtractChannelUsage(headers, rows)
-		if !hasChannelInfo {
-			// 这份日志里一个渠道号都没有（既没有 channel_id 列，other 里也没有
-			// use_channel）——做不了渠道检查。如实报出，而不是当成「无需检查」：
-			// 后者会让用户以为已经检查过了。
-			blocked = &ChannelCheckResult{
-				UsedChannels:          []UsedChannel{},
-				Missing:               []ChannelIssue{},
-				MissingGroupRatioRows: CountMissingGroupRatioRows(headers, rows),
-				TotalRows:             len(rows),
+		// 按**行**判据统计（与出账侧同一个 RowCostReason），而不是按渠道。
+		//
+		// 这是修一个真实故障：从前这里用 ExtractChannelUsage，而它会把
+		// 「没有渠道号的行」直接跳过。于是这些行对预检完全隐形，预检放行，
+		// 出账时它们却被判为缺失——用户看到「预检通过」却在账单上读到
+		// 「392 行缺少渠道倍率或分组倍率」，而且重跑再也不会弹出补录界面。
+		counts, missingRatios, rowsPerChannel := CountRowCostReasons(headers, rows, ratios, knownIDs)
+
+		// 用同一份行级统计填结果，无论走不走 CheckChannelRatios 都是这几个数——
+		// 免得同一个「缺多少行」在两条分支上有两个来源。
+		fill := func(c *ChannelCheckResult) {
+			c.UncostableRows = map[string]int{}
+			c.UncostableTotal = 0
+			for reason, n := range counts {
+				// zero_delta 不计入：额度为 0 的行不影响成本，
+				// 算进去会让用户去补一批无关的倍率。
+				if reason == SkipNone || reason == SkipZeroDelta || n == 0 {
+					continue
+				}
+				c.UncostableRows[string(reason)] = n
+				c.UncostableTotal += n
 			}
-			blocked.NoChannelInfo = true
-		} else {
-			check := CheckChannelRatios(usage, ratios, infoMap)
-			check.MissingGroupRatioRows = CountMissingGroupRatioRows(headers, rows)
-			check.TotalRows = len(rows)
-			if len(check.Missing) > 0 {
-				blocked = &check
-			}
+			c.MissingGroupRatioRows = counts[SkipNoGroupRatio]
+			c.TotalRows = len(rows)
+		}
+
+		check := ChannelCheckResult{}
+		fill(&check)
+		// 待补录渠道：**含渠道清单里查不到的**。倍率表以 channel_id 为主键，
+		// 与清单无关，所以清单没拉到的渠道照样能填——把它们排除在外，
+		// 就是那 392 行永远算不出成本、界面上还没地方可填的原因。
+		//
+		// 只有当确实存在「有渠道号但没倍率」的行时才走这条路径（missingRatios 非空）。
+		if len(missingRatios) > 0 {
+			usage, _ := ExtractChannelUsage(headers, rows)
+			check = CheckChannelRatios(usage, ratios, infoMap, rowsPerChannel)
+			fill(&check)
+		}
+
+		// 拦下的条件收紧了：只有**补得动**的缺口才拦。
+		//
+		//	渠道没填倍率 → 拦住，用户填完就能算（这是这个功能存在的理由）
+		//	渠道清单里没有 → 不拦，填不了；拦住等于让它永远出不来账
+		//	日志缺 group_ratio / 没渠道号 / 多渠道路由 → 不拦，补倍率也没用，
+		//	    它们在账单上如实报出「N 行未计入成本」
+		//
+		// 从前这里只看 `len(check.Missing) > 0`，而 Missing 只覆盖第一种情形，
+		// 于是另外三种情形既不拦、也不在结果里说清，用户只能对着账单上的
+		// 一句「未能核算」猜哪里出了问题。现在四种都在结果里分开报。
+		if len(check.Missing) > 0 {
+			blocked = &check
 		}
 		if blocked != nil {
 			return &TaskRunResult{TaskID: task.ID, Task: task, Customer: customer, ChannelCheck: blocked}, nil
 		}
+		// 没被拦下时不另外传话给出账侧：出账侧用同一个 RowCostReason 自己算，
+		// 两边的数必然一致。多传一份反而多一个可能不同步的地方。
 	}
 
 	// ---- 4. 装载默认出账参数 ----
@@ -253,13 +289,19 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			return nil, err
 		}
 		params.ChannelUpstreamRatios = ratios
-		// 渠道名与渠道信息只有模板一写成本利润表时才用得上。模板二不需要它们，
-		// 就不读渠道清单了——少一次全表扫描，也少一个「清单读不到就整单跑不出来」的失败点。
+
+		channels, err := ListChannels(deps.PG)
+		if err != nil {
+			return nil, err
+		}
+		// 模板二只用这份清单来判断「这个缺倍率的渠道还有没有救」：
+		// 清单里有的可以补录，没有的（业务库已删）补不了，账单备注里要分开说。
+		params.ChannelKnownIDs = make(map[int]bool, len(channels))
+		for _, c := range channels {
+			params.ChannelKnownIDs[c.ChannelID] = true
+		}
+		// 渠道名与渠道信息只有模板一写成本利润表时才用得上。
 		if !IsSimpleBillTemplate(task.BillTemplate) {
-			channels, err := ListChannels(deps.PG)
-			if err != nil {
-				return nil, err
-			}
 			params.ChannelNames = make(map[int]string, len(channels))
 			params.ChannelInfos = make(map[int]ChannelInfo, len(channels))
 			for _, c := range channels {

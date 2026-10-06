@@ -41,7 +41,7 @@ type SimpleBillRow struct {
 	// TotalCostCNY 金额 = 额度 / QuotaPerCNY，即站点实收。
 	TotalCostCNY float64 `json:"totalCostCny"`
 
-	// ---- 成本核算。未维护倍率的渠道让这三项整体为 nil（见 SimpleBillRow.CostMissing）。----
+	// ---- 成本核算。三项要么都有值、要么整体为 nil（见 SimpleBillRow.CostPartial）。----
 
 	// OfficialListUSD 官方刊例（美金）＝ Σ(quota ÷ group_ratio) ÷ QuotaPerCNY。
 	//
@@ -55,20 +55,25 @@ type SimpleBillRow struct {
 	UpstreamCostCNY *float64 `json:"upstreamCostCny"`
 	// ProfitCNY 利润 ＝ 金额 − 上游成本。
 	ProfitCNY *float64 `json:"profitCny"`
-	// CostMissing 该行有行的渠道倍率没维护，成本算不全，上面三项为 nil。
+	// CostPartial 为真表示上面三项只覆盖了一部分行（有行算不出成本）。
 	//
-	// 为什么是 nil 而不是 0：0 会被读成「上游免费」，利润虚高——这正是成本核算
-	// 最不能出的错（与成本利润表同一约定，见 taskrun.go 里三个成本字段保持 nil 的理由）。
-	CostMissing bool `json:"costMissing"`
+	// 与「整行为空」是两种不同的状态，必须分开：整行为空是「没法算」，
+	// CostPartial 是「算了，但只算了 99.9%」。前者不能给数，后者要给数并说明。
+	//
+	// 从前这里只有「全有或全无」两态：504100 行里有 392 行算不出来，
+	// 整张表的成本列就全空。那个取舍是错的——用 99.9% 的行算出来的成本
+	// 远比一片空白有用，只要把覆盖率说清楚就行（用户可以自己判断够不够用）。
+	CostPartial bool `json:"costPartial"`
 	// CostRows 参与了成本核算的行数；TotalRows 是该汇总行覆盖的全部消费行数。
-	// 两者不等说明有一部分行的渠道倍率没维护。
 	CostRows  int `json:"costRows"`
 	TotalRows int `json:"totalRows"`
-	// MissingRatioRows / MissingChannelRows 没算进成本的行数，按原因分开——
-	// 前者是日志缺 group_ratio（反推不出刊例），后者是渠道号取不到或没维护上游倍率。
-	// 分开是为了让提示能说清去哪儿补，而不是笼统的一句「有行没算成本」。
-	MissingRatioRows   int `json:"missingRatioRows"`
-	MissingChannelRows int `json:"missingChannelRows"`
+	// SkippedQuota 没算进成本的那部分净额度。用户据此判断这点缺口要不要紧：
+	// 少 392 行里如果只差几块钱，成本数就是可用的；差一大截才需要去补。
+	SkippedQuota float64 `json:"skippedQuota"`
+	// SkipReasons 算不出成本的行数按原因分类（键见 CostSkipReason）。
+	//
+	// 分类而不是一个总数：缺倍率要补、缺渠道号要查日志，去处完全不同。
+	SkipReasons map[string]int `json:"skipReasons,omitempty"`
 }
 
 // SimpleBillColumns 模板二的列名，账单与汇总脱敏日志共用同一套（客户已确认两者列一致）。
@@ -101,6 +106,12 @@ type SimpleBillOptions struct {
 	// 关掉时三列**仍然存在**但整列为空：列集合是固定的十列（账单与脱敏日志必须同构，
 	// 见 WriteSimpleBill），所以关闭只意味着不填，不意味着少三列。
 	CostColumns bool
+	// KnownChannels 本地渠道清单里存在的渠道号集合。
+	//
+	// 用来区分两种缺失：清单里有的渠道补一下倍率就能算成本（值得提示用户去补），
+	// 清单里没有的（业务库已硬删除）补不了，只能如实说明。两者混在一起会让
+	// 用户去清单里找一个根本不存在的渠道。
+	KnownChannels map[int]bool
 	// ExchangeRate 人民币/美金汇率，用于把反推出来的刊例（美金）换回人民币去算成本。
 	//
 	// <= 0 时用 DefaultExchangeRate。这里必须与出账用的汇率一致：
@@ -119,22 +130,51 @@ func (o SimpleBillOptions) rateOr() float64 {
 
 // SimpleBillCostStat 成本覆盖情况，供调用方在结果里如实报出。
 //
-// 需要它是因为「部分行的渠道没维护倍率」时成本是按有倍率的那部分算的：
+// 需要它是因为「部分行算不出成本」时成本是按能算的那部分算的：
 // 页面若只显示一个利润数字，读的人会以为它是整体毛利。与成本利润表的
 // CostTotals.PricedRows/TotalRows 同一个用意。
 type SimpleBillCostStat struct {
 	// Rows 参与成本核算的行数；TotalRows 是本表覆盖的全部消费行数。
 	Rows      int
 	TotalRows int
-	// MissingRatioRows group_ratio 缺失、无法反推刊例的行数。
-	MissingRatioRows int
-	// MissingChannelRows 渠道号取不到、或渠道没维护上游倍率的行数。
-	MissingChannelRows int
+	// SkippedQuota 未计入成本的那部分净额度。
+	SkippedQuota float64
+	// SkipReasons 未计入成本的行数按原因分类。
+	SkipReasons map[string]int
 }
 
 // Complete 全部行都参与了成本核算。
 func (s SimpleBillCostStat) Complete() bool {
 	return s.TotalRows > 0 && s.Rows == s.TotalRows
+}
+
+// SkippedRows 未计入成本的行数。
+func (s SimpleBillCostStat) SkippedRows() int { return s.TotalRows - s.Rows }
+
+// DescribeSkipReasons 把原因表拼成给人读的一句话，如
+// 「392 行无渠道号、12 行缺上游倍率」。原因按固定顺序输出，保证文案稳定
+// （map 遍历顺序随机，直接拼会让同一份结果显示成好几种样子）。
+func DescribeSkipReasons(reasons map[string]int) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	order := []struct {
+		key   CostSkipReason
+		label string
+	}{
+		{SkipNoUpstreamRatio, "渠道未维护上游倍率"},
+		{SkipUnknownChannel, "渠道不在本地清单里"},
+		{SkipNoChannel, "日志里取不到渠道号"},
+		{SkipMultiChannel, "一行经多个渠道无法分摊"},
+		{SkipNoGroupRatio, "缺分组倍率（group_ratio）"},
+	}
+	parts := []string{}
+	for _, o := range order {
+		if n := reasons[string(o.key)]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d 行%s", n, o.label))
+		}
+	}
+	return strings.Join(parts, "、")
 }
 
 // AggregateSimpleBill 把日志行按 (分组, 模型) 汇总。
@@ -202,6 +242,9 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 	// 逐桶的成本累加器：行级算完再加进来，全部是「按这个桶里每行自己的倍率算出来的」。
 	// 与 SimpleBillRow 上的展示字段分开存，是因为三者要分别判断「算没算全」。
 	type costAcc struct {
+		// skippedQuota 未能计入成本的净额度，以及按原因分类的行数。
+		skippedQuota float64
+		skipReasons  map[string]int
 		// officialQuota 是反推出来的官方刊例，单位与 quota 相同（不是人民币）。
 		//
 		// 这是整个反推里最容易搞错单位的一处，所以名字写成 -Quota 而不是 -CNY：
@@ -217,13 +260,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		// 用「汇总刊例 × 某一个渠道的倍率」会整体偏掉，而表面上完全看不出来。
 		upstreamCNY float64
 		rows        int // 参与成本核算的行数
-		// 逐行成本是否都算得出来。任何一行缺 group_ratio / 缺渠道倍率就置 false，
-		// 整桶的成本与利润随之留空——哪怕其余的 99 行都算得出来。
-		allRows bool
-		// 未参与成本核算的行数，按原因分开数：页面要能说清"是缺渠道倍率还是缺分组倍率"，
-		// 因为这决定了用户该去哪补——前者去渠道倍率页，后者说明日志本身有问题。
-		noRatioRows   int
-		noChannelRows int
+
 	}
 	costs := map[key]*costAcc{}
 	rate := opts.rateOr()
@@ -252,7 +289,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		}
 		r.TotalRows++
 		if _, ok := costs[k]; !ok {
-			costs[k] = &costAcc{allRows: true}
+			costs[k] = &costAcc{}
 		}
 		ca := costs[k]
 
@@ -288,20 +325,35 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		// 退款行也一起算：它冲抵的是某一行的额度，那一行的正负号变了，
 		// 挂在它上面的刊例与成本按同一比例跟着变才是对的。跳过退款行会让
 		// 成本与金额对不上——金额冲抵了、成本没冲抵，利润凭空变高。
+		// 判据与预检共用 RowCostReason：两边各写一套的话，会出现
+		// 「预检说没问题、账单说 392 行缺倍率」这种自相矛盾（那是修这个 bug 的起因）。
+		reason, ids := RowCostReason(row, idxChannel, hasChannel, idxOther, hasOther,
+			opts.UpstreamRatios, opts.KnownChannels, delta)
+		if reason != SkipNone {
+			// zero_delta 不计入缺失：额度为 0 的行本来就不影响成本，
+			// 把它算进去会让用户去补一堆无关的倍率。
+			if reason != SkipZeroDelta {
+				ca.skippedQuota += delta
+				if ca.skipReasons == nil {
+					ca.skipReasons = map[string]int{}
+				}
+				ca.skipReasons[string(reason)]++
+			}
+			continue
+		}
+
 		costRatio, ok := GroupRatioFromOther(other)
 		if !ok || costRatio <= 0 {
-			// 没有 group_ratio 就反推不出刊例。按 0 算会让刊例虚高到无穷，
-			// 所以这一行**整体不计入成本**，并让整桶的成本留空（见 allRows）。
-			ca.allRows = false
-			ca.noRatioRows++
+			// RowCostReason 只判渠道与倍率，group_ratio 在它之后判：
+			// 反推刊例需要 group_ratio，没有它就把这一行算作缺分组倍率。
+			ca.skippedQuota += delta
+			if ca.skipReasons == nil {
+				ca.skipReasons = map[string]int{}
+			}
+			ca.skipReasons[string(SkipNoGroupRatio)]++
 			continue
 		}
-		upstream, ok := rowUpstreamRatio(row, idxChannel, hasChannel, idxOther, hasOther, opts.UpstreamRatios)
-		if !ok {
-			ca.allRows = false
-			ca.noChannelRows++
-			continue
-		}
+		upstream := opts.UpstreamRatios[ids[0]]
 		ca.rows++
 		// 净额口径与 TotalQuota 一致（退款行为负），否则同一条退款在
 		// 金额列与成本列上冲抵的方向会相反。
@@ -325,12 +377,15 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		if opts.CostColumns {
 			ca := costs[k]
 			r.CostRows = ca.rows
-			r.MissingRatioRows = ca.noRatioRows
-			r.MissingChannelRows = ca.noChannelRows
-			// 只要有一行算不出来就不写成本：部分渠道算了、部分没算的成本看着像完整的，
-			// 比留空更危险。官刊例同样要求算全——它虽然只要 group_ratio，
-			// 但缺的那几行会让刊例偏小，客户拿去与上游对账时对不上。
-			if ca.allRows && ca.rows > 0 {
+			r.SkippedQuota = round(ca.skippedQuota, MoneyDecimals)
+			r.SkipReasons = ca.skipReasons
+			// 覆盖率不足但**不是零**时照样给数：504100 行里 392 行算不出来，
+			// 拿剩下的 503708 行算出来的成本远比一片空白有用。把 CostPartial
+			// 标出来，页面上说明「未覆盖 N 行、差 ¥X」，让用户自己判断够不够用。
+			//
+			// 一行都没算出来时（ca.rows == 0，比如渠道全都没维护倍率）才留空：
+			// 那时没有任何依据可以外推，报 0 会被读成「上游免费」。
+			if ca.rows > 0 {
 				// 三项都 round 到金额精度：客户会拿计算器逐格复核，
 				// 显示 4 位而内部多留几位，会让他手算的结果与表里差最后一位。
 				officialUSD := round(ca.officialQuota/QuotaPerCNY, MoneyDecimals)
@@ -339,8 +394,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 				r.OfficialListUSD = &officialUSD
 				r.UpstreamCostCNY = &upstreamCNY
 				r.ProfitCNY = &profit
-			} else {
-				r.CostMissing = true
+				r.CostPartial = ca.rows < r.TotalRows
 			}
 		}
 		out = append(out, *r)
@@ -511,7 +565,7 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 	// 成本三列的样式按单列分别设：列数固定十列，若用循环写区间，
 	// 将来插一列就会连样式一起串位。
 	costStyles := []int{styleMoney, styleMoney, styleMoney}
-	costMissing := false // 有任何一行没算出成本，就不写成本列的合计
+	costPartial := false // 有任何一行没算出成本，就不写成本列的合计
 
 	// 数据从第 2 行开始：这张表没有模板里那种「第二行写说明」的约定，
 	// 多留一行空白只会让客户以为是漏填。
@@ -522,8 +576,8 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		// 成本列**先补齐成空串**再逐格赋值：SetSheetRow 收的是一个定长切片，
 		// 少给几格会让后面的列整体左移。空串与「没写」在 Excel 里都是空单元格。
 		values = append(values, "", "", "")
-		if r.CostMissing {
-			costMissing = true
+		if r.CostPartial || (r.TotalRows > 0 && r.CostRows == 0) {
+			costPartial = true
 		}
 		costVals := []*float64{r.OfficialListUSD, r.UpstreamCostCNY, r.ProfitCNY}
 		for j, v := range costVals {
@@ -579,7 +633,7 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 			// 于是合计看起来是个正常数字，实际只加了有成本的那部分。
 			// 那比留空更糟——留空至少看得出来"没算"，一个偏小的合计看不出来。
 			isCostCol := sc.col >= SimpleBillCostColFirst+1 && sc.col <= SimpleBillCostColLast+1
-			if isCostCol && costMissing {
+			if isCostCol && costPartial {
 				continue
 			}
 			letter, _ := excelize.ColumnNumberToName(sc.col)
@@ -595,31 +649,26 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		// 成本算不全时在表末写一行说明。不写的话，收件人看到成本列是空的，
 		// 只会以为是漏填或程序出错；写清楚了才知道是"这几个渠道还没维护上游倍率"，
 		// 而且要去找谁补。这条说明与成本利润表末尾的处理一致。
-		if costMissing {
+		if costPartial {
 			noteRow := totalRow + 1
-			// 按原因分开报：只说"有 3 行没算"会让人去查日志，
-			// 说清是渠道倍率还是分组倍率，用户直接知道去哪儿补。
-			noRatio, noChannel := 0, 0
+			// 按原因分开写：只说"有 392 行没算"会让人去翻日志，
+			// 说清是渠道倍率还是分组倍率（或没有渠道号），用户直接知道去哪儿补。
+			reasons := map[string]int{}
+			var skippedQuota float64
 			for _, r := range rows {
-				noRatio += r.MissingRatioRows
-				noChannel += r.MissingChannelRows
+				for k, n := range r.SkipReasons {
+					reasons[k] += n
+				}
+				skippedQuota += r.SkippedQuota
 			}
-			var reasons []string
-			if noChannel > 0 {
-				reasons = append(reasons, fmt.Sprintf("%d 行的渠道未维护上游倍率", noChannel))
+			note := "注：有行的上游成本未计入——" + DescribeSkipReasons(reasons)
+			if skippedQuota != 0 {
+				note += fmt.Sprintf("，涉及净额度 ¥%s", trimMoney(skippedQuota/QuotaPerCNY))
 			}
-			if noRatio > 0 {
-				reasons = append(reasons, fmt.Sprintf("%d 行缺少分组倍率", noRatio))
+			note += "。"
+			if reasons[string(SkipNoUpstreamRatio)] > 0 {
+				note += "渠道倍率可在「账单导出任务」页补录后重新出账。"
 			}
-			note := "注：有行的上游成本未计入——" + strings.Join(reasons, "；")
-			var subject []string
-			if noChannel > 0 {
-				subject = append(subject, "请在渠道倍率维护页补齐后重新出账")
-			}
-			if noRatio > 0 {
-				subject = append(subject, "缺分组倍率的行请检查日志来源")
-			}
-			note += "；" + strings.Join(subject, "，") + "。"
 			if err := f.SetCellValue(sheet, axis(1, noteRow), note); err != nil {
 				return err
 			}
@@ -680,7 +729,7 @@ type SimpleBillTotals struct {
 func SumSimpleBill(rows []SimpleBillRow) SimpleBillTotals {
 	var t SimpleBillTotals
 	var official, upstream, profit float64
-	costed := true
+	hasCost := false
 	for _, r := range rows {
 		t.HitCount += r.HitCount
 		t.TotalPrompt += r.TotalPrompt
@@ -692,24 +741,34 @@ func SumSimpleBill(rows []SimpleBillRow) SimpleBillTotals {
 		// 只在有成本的行上累加的话，「有 2 行没算成本」这件事根本进不了合计，
 		// 调用方也就无从判断这个成本口径完整不完整。
 		t.Cost.TotalRows += r.TotalRows
-		t.Cost.MissingRatioRows += r.MissingRatioRows
-		t.Cost.MissingChannelRows += r.MissingChannelRows
+		t.Cost.SkippedQuota += r.SkippedQuota
+		for k, n := range r.SkipReasons {
+			if t.Cost.SkipReasons == nil {
+				t.Cost.SkipReasons = map[string]int{}
+			}
+			t.Cost.SkipReasons[k] += n
+		}
 
-		// 三列要么同时有值要么同时为空（见 AggregateSimpleBill），
+		// 三列要么同时有值要么整体为 nil（见 AggregateSimpleBill），
 		// 所以只看其中一个就够，不必三处都判。
 		if r.UpstreamCostCNY == nil || r.OfficialListUSD == nil || r.ProfitCNY == nil {
-			// 一行都没启用成本列时，这里也会把 costed 置 false——
-			// 于是合计里根本没有成本，调用方据此不显示成本区，符合预期。
-			costed = false
+			// 这一行没有成本（整桶一行都没算出来，或没开成本核算）。
+			// 不把整体置 false——**部分覆盖也要给合计**：
+			// 504100 行里 392 行算不出来时，用剩下的算出来的成本远比不给有用。
 			continue
 		}
 		t.Cost.Rows += r.CostRows
+		hasCost = true
 		official += *r.OfficialListUSD
 		upstream += *r.UpstreamCostCNY
 		profit += *r.ProfitCNY
 		t.AmountCoveredCNY += r.TotalCostCNY
 	}
-	if costed && len(rows) > 0 {
+	// 只要**有任何一行**算出了成本就给合计：行数覆盖率由 Cost 如实带上，
+	// 调用方据此决定要不要加一句「只覆盖了 N/M 行」。
+	// 全表一行都没算出来（比如倍率全没维护）时给 nil——那时没有任何依据，
+	// 报 0 会被读成「上游免费」。
+	if hasCost {
 		o := round(official, MoneyDecimals)
 		u := round(upstream, MoneyDecimals)
 		p := round(profit, MoneyDecimals)

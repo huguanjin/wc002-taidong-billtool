@@ -276,6 +276,9 @@ type Params struct {
 	ChannelNames map[int]string
 	// ChannelInfos 渠道 ID → 渠道信息，用于成本估算前的倍率检查。
 	ChannelInfos map[int]ChannelInfo
+	// ChannelKnownIDs 本地渠道清单里存在的渠道号集合。用来区分「清单里有、只是没填倍率」
+	// 与「清单里根本没有」——前者补一下就能算成本，后者补不了（业务库已删）。
+	ChannelKnownIDs map[int]bool
 
 	// CustomerName 客户名，只用于给产物文件名加后缀。
 	//

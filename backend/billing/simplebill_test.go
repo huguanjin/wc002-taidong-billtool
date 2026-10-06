@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -461,7 +462,7 @@ func TestSimpleBillCostReverseDerivation(t *testing.T) {
 	assert.Equal(t, 15, r.HitCount)
 	assert.Equal(t, 15, r.CostRows)
 	assert.Equal(t, 15, r.TotalRows)
-	assert.False(t, r.CostMissing)
+	assert.False(t, r.CostPartial, "全部行都算了，不是部分覆盖")
 
 	// 金额 = 15 × 108000 / 500000 = 3.24
 	assert.InDelta(t, 3.24, r.TotalCostCNY, 1e-9)
@@ -532,14 +533,16 @@ func TestSimpleBillCostMissingGroupRatio(t *testing.T) {
 	require.Len(t, got, 1)
 
 	r := got[0]
-	assert.Nil(t, r.OfficialListUSD, "有一行缺 group_ratio，整行成本留空")
-	assert.Nil(t, r.UpstreamCostCNY)
-	assert.Nil(t, r.ProfitCNY)
-	assert.True(t, r.CostMissing)
+	// 两行里有一行缺 group_ratio：**照样给成本**，但标出只覆盖了一半。
+	// 从前这里整行留空，导致 504100 行里 392 行算不出来时整张表没有成本——
+	// 那是这个 bug 的一半，另一半是预检看不见这些行（见 TestRowCostReason*）。
+	require.NotNil(t, r.OfficialListUSD, "有行能算就要给数，而不是整行留空")
+	require.NotNil(t, r.UpstreamCostCNY)
+	assert.True(t, r.CostPartial, "只覆盖了一部分行")
 	assert.Equal(t, 1, r.CostRows, "只有一行参与了反推")
 	assert.Equal(t, 2, r.TotalRows)
-	assert.Equal(t, 1, r.MissingRatioRows)
-	assert.Equal(t, 0, r.MissingChannelRows)
+	assert.Equal(t, 1, r.SkipReasons[string(SkipNoGroupRatio)])
+	assert.InDelta(t, 45000, r.SkippedQuota, 1e-9, "漏掉的那行净额度要报出来")
 	// 金额照写：它不需要 group_ratio。
 	assert.InDelta(t, 0.18, r.TotalCostCNY, 1e-9)
 }
@@ -560,11 +563,14 @@ func TestSimpleBillCostMissingUpstreamRatio(t *testing.T) {
 	require.Len(t, got, 1)
 
 	r := got[0]
+	// 一行都没算出来：**一个数都不给**。这时报 0 会被读成"上游免费"，
+	// 利润虚高——那是成本核算最不能出的错（与"部分覆盖"是两种状态）。
+	assert.Nil(t, r.OfficialListUSD)
 	assert.Nil(t, r.UpstreamCostCNY)
 	assert.Nil(t, r.ProfitCNY)
-	assert.Nil(t, r.OfficialListUSD, "官方刊例与成本同进同退：只有成本算得出来时它才有意义")
 	assert.Equal(t, 0, r.CostRows)
-	assert.Equal(t, 1, r.MissingChannelRows)
+	assert.Equal(t, 1, r.SkipReasons[string(SkipNoUpstreamRatio)])
+	assert.False(t, r.CostPartial, "一行都没算出来时不算 partial，是整体缺")
 }
 
 // TestSimpleBillCostSpansChannels 一个 (分组, 模型) 横跨多个渠道时，成本逐行加权。
@@ -645,7 +651,7 @@ func TestSimpleBillCostDisabledLeavesColumnsEmpty(t *testing.T) {
 	assert.Nil(t, got[0].OfficialListUSD)
 	assert.Nil(t, got[0].UpstreamCostCNY)
 	assert.Nil(t, got[0].ProfitCNY)
-	assert.False(t, got[0].CostMissing, "没开成本核算时不算「算不全」")
+	assert.False(t, got[0].CostPartial, "没开成本核算时不算「部分覆盖」")
 	assert.Zero(t, got[0].CostRows)
 	assert.InDelta(t, 0.09, got[0].TotalCostCNY, 1e-9)
 }
@@ -688,34 +694,36 @@ func TestSimpleBillCostMultiChannelRowSkipped(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 1)
 
-	assert.Nil(t, got[0].UpstreamCostCNY, "多渠道路由的行不猜分摊，成本留空")
-	assert.True(t, got[0].CostMissing)
+	assert.Nil(t, got[0].UpstreamCostCNY, "多渠道路由的行不猜分摊，一行都没算出来就没有成本")
+	assert.Equal(t, 1, got[0].SkipReasons[string(SkipMultiChannel)])
 }
 
-// TestSumSimpleBillCostNilWhenIncomplete 只要有一行没算出成本，成本合计就是 nil。
+// TestSumSimpleBillCostPartialGivesTotals 部分行有成本时**照样给合计**，并把覆盖率报出来。
 //
-// 关键：SUM 会跳过空值，所以「把有成本的行加起来」会得到一个看着正常、
-// 实际漏了一部分上游成本的数。那正是成本核算最不能出的错。
-func TestSumSimpleBillCostNilWhenIncomplete(t *testing.T) {
+// 这条改的是「全有或全无」的老取舍：从前只要有一行算不出成本，合计就是 nil，
+// 于是 504100 行里 392 行算不出来时整张表没有成本。现在给数 + 说明覆盖范围——
+// 拿 99.9% 的行算出来的成本远比一片空白有用，只要不说成整体毛利就行。
+func TestSumSimpleBillCostPartialGivesTotals(t *testing.T) {
 	official, cost, profit := 1.8, 0.72, 1.08
 	rows := []SimpleBillRow{
 		{Group: "A", Model: "m1", TotalCostCNY: 3.24,
 			OfficialListUSD: &official, UpstreamCostCNY: &cost, ProfitCNY: &profit,
 			CostRows: 15, TotalRows: 15},
-		// 这一行没有成本
-		{Group: "A", Model: "m2", TotalCostCNY: 1.0, CostMissing: true,
-			CostRows: 0, TotalRows: 2, MissingChannelRows: 2},
+		// 这一行没有成本（例如渠道没维护倍率）
+		{Group: "A", Model: "m2", TotalCostCNY: 1.0,
+			CostRows: 0, TotalRows: 2, SkippedQuota: 500000,
+			SkipReasons: map[string]int{string(SkipNoUpstreamRatio): 2}},
 	}
 
 	totals := SumSimpleBill(rows)
-	assert.Nil(t, totals.OfficialListUSD, "有一行没成本，合计必须是 nil，而不是「有成本的那部分之和」")
-	assert.Nil(t, totals.UpstreamCostCNY)
-	assert.Nil(t, totals.ProfitCNY)
+	require.NotNil(t, totals.OfficialListUSD, "部分覆盖也要给合计")
+	assert.InDelta(t, 0.72, *totals.UpstreamCostCNY, 1e-9)
 	// 但要如实报出覆盖情况，让调用方能说清「利润只覆盖了 15/17 行」。
 	assert.Equal(t, 15, totals.Cost.Rows)
 	assert.Equal(t, 17, totals.Cost.TotalRows)
-	assert.Equal(t, 2, totals.Cost.MissingChannelRows)
-	assert.False(t, totals.Cost.Complete())
+	assert.Equal(t, 2, totals.Cost.SkipReasons[string(SkipNoUpstreamRatio)])
+	assert.Equal(t, 2, totals.Cost.SkippedRows())
+	assert.False(t, totals.Cost.Complete(), "覆盖不全，页面必须说明")
 }
 
 // TestSumSimpleBillCostComplete 全部行都有成本时合计给全，且利润口径是
@@ -779,12 +787,12 @@ func TestWriteSimpleBillCostColumns(t *testing.T) {
 	}
 }
 
-// TestWriteSimpleBillCostMissingNoSum 有行没算出成本时，合计行不写成本列的 SUM，
+// TestWriteSimpleBillCostPartialNoSum 有行没算出成本时，合计行不写成本列的 SUM，
 // 并在表末写一行说明。
 //
 // SUM 会跳过空单元格，于是合计看起来是个正常数字、实际只加了有成本的那部分——
 // 那比留空更糟：留空至少看得出来「没算」，一个偏小的合计看不出来。
-func TestWriteSimpleBillCostMissingNoSum(t *testing.T) {
+func TestWriteSimpleBillCostPartialNoSum(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "成本不全.xlsx")
 
@@ -794,7 +802,8 @@ func TestWriteSimpleBillCostMissingNoSum(t *testing.T) {
 			OfficialListUSD: &official, UpstreamCostCNY: &cost, ProfitCNY: &profit,
 			CostRows: 3, TotalRows: 3},
 		{Group: "Codex", Model: "m2", TotalQuota: 100000, TotalCostCNY: 0.2,
-			CostMissing: true, CostRows: 0, TotalRows: 2, MissingChannelRows: 2},
+			CostPartial: true, CostRows: 0, TotalRows: 2, SkippedQuota: 100000,
+			SkipReasons: map[string]int{string(SkipNoUpstreamRatio): 2}},
 	}
 	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
 
@@ -813,11 +822,12 @@ func TestWriteSimpleBillCostMissingNoSum(t *testing.T) {
 		assert.Empty(t, got, "%s 不该写 SUM——它会跳过空值，得到一个偏小的合计", col)
 	}
 
-	// 表末说明要写清原因与去处。
+	// 表末说明要写清原因与去处，以及漏掉了多少额度。
 	note, err := f.GetCellValue(sheet, "A5")
 	require.NoError(t, err)
-	assert.Contains(t, note, "未维护上游倍率")
-	assert.Contains(t, note, "补齐")
+	assert.Contains(t, note, "2 行渠道未维护上游倍率")
+	assert.Contains(t, note, "补录")
+	assert.Contains(t, note, "0.2", "要写出涉及多少净额度，用户才知道这点缺口要不要紧")
 }
 
 // TestWriteSimpleBillCostNoteDistinguishesReason 表末说明按原因分开写，
@@ -828,9 +838,11 @@ func TestWriteSimpleBillCostNoteDistinguishesReason(t *testing.T) {
 
 	rows := []SimpleBillRow{
 		{Group: "A", Model: "m1", TotalQuota: 100, TotalCostCNY: 0.1,
-			CostMissing: true, CostRows: 0, TotalRows: 1, MissingChannelRows: 1},
+			CostPartial: true, CostRows: 0, TotalRows: 1,
+			SkipReasons: map[string]int{string(SkipNoUpstreamRatio): 1}},
 		{Group: "A", Model: "m2", TotalQuota: 100, TotalCostCNY: 0.1,
-			CostMissing: true, CostRows: 0, TotalRows: 1, MissingRatioRows: 1},
+			CostPartial: true, CostRows: 0, TotalRows: 1,
+			SkipReasons: map[string]int{string(SkipNoGroupRatio): 1}},
 	}
 	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
 
@@ -841,8 +853,8 @@ func TestWriteSimpleBillCostNoteDistinguishesReason(t *testing.T) {
 	// 合计行在第 4 行（两条数据行之后），说明写在第 5 行。
 	note, err := f.GetCellValue(f.GetSheetName(0), "A5")
 	require.NoError(t, err)
-	assert.Contains(t, note, "1 行的渠道未维护上游倍率")
-	assert.Contains(t, note, "1 行缺少分组倍率")
+	assert.Contains(t, note, "1 行渠道未维护上游倍率")
+	assert.Contains(t, note, "1 行缺分组倍率")
 }
 
 // simpleCell 读指定格的值。excelize 对「从未写过的单元格」会报错，
@@ -856,7 +868,10 @@ func simpleCell(t *testing.T, f *excelize.File, sheet string, col, row int) stri
 	return v
 }
 
-// TestSimpleBillCostSummaryLines 摘要里带上成本三项，且算不全时不写成本。
+// TestSimpleBillCostSummaryLines 摘要里带上成本三项，以及覆盖率说明。
+//
+// 覆盖率那两行是关键：毛利率的分母只是「有成本的那部分金额」，
+// 不写清楚会被当成整张账单的毛利率——那是这个功能最容易误导人的地方。
 func TestSimpleBillCostSummaryLines(t *testing.T) {
 	official, cost, profit := 1.8, 0.72, 1.08
 	rows := []SimpleBillRow{
@@ -869,16 +884,195 @@ func TestSimpleBillCostSummaryLines(t *testing.T) {
 	assert.Contains(t, got, "上游成本：¥0.72")
 	// 毛利率 = 1.08 / 1.8 = 60%
 	assert.Contains(t, got, "利润：¥1.08，毛利率 60.00%")
+	assert.NotContains(t, got, "成本覆盖", "全算出来了就不用写覆盖率")
 
-	// 算不全时：不写成本数字，但要说清「没算」而不是静默省略——
-	// 静默省略会让人以为这张表本来就不含成本。
+	// 部分覆盖：**照样写成本数字**，但必须跟一行覆盖率 + 原因说明。
 	partial := append(rows, SimpleBillRow{
-		Group: "Codex", Model: "m2", TotalCostCNY: 0.2,
-		CostMissing: true, CostRows: 0, TotalRows: 1, MissingChannelRows: 1,
+		Group: "Codex", Model: "m2", TotalCostCNY: 0.2, CostPartial: true,
+		CostRows: 0, TotalRows: 392, SkippedQuota: 500000,
+		SkipReasons: map[string]int{string(SkipNoChannel): 392},
 	})
 	got = FormatSimpleBillSummary(partial, SumSimpleBill(partial), 2026, 9, nil)
-	assert.NotContains(t, got, "上游成本")
-	assert.Contains(t, got, "成本：未能核算（1 行缺少渠道倍率或分组倍率）")
+	assert.Contains(t, got, "上游成本", "有行能算就要给数，不能因为 392 行算不出来就整段省略")
+	assert.Contains(t, got, "成本覆盖：5/397 行")
+	assert.Contains(t, got, "未计入成本的原因：392 行日志里取不到渠道号")
+}
+
+// TestFormatSimpleBillSummaryNoCostAtAll 一行都没算出来时不给数，
+// 但要说清「没算」以及为什么——静默省略会让人以为这张表本来就不含成本。
+func TestFormatSimpleBillSummaryNoCostAtAll(t *testing.T) {
+	rows := []SimpleBillRow{
+		{Group: "Codex", Model: "m1", HitCount: 5, TotalCostCNY: 1.8,
+			CostRows: 0, TotalRows: 5,
+			SkipReasons: map[string]int{string(SkipNoUpstreamRatio): 5}},
+	}
+	got := FormatSimpleBillSummary(rows, SumSimpleBill(rows), 2026, 9, nil)
+	assert.NotContains(t, got, "上游成本", "一行都没算出来时报 0 会被读成上游免费")
+	assert.Contains(t, got, "成本：未能核算（5 行渠道未维护上游倍率）")
+}
+
+// TestSimpleBillPartialCostEndToEnd 端到端复现用户报的那个故障。
+//
+// 现场：504100 次请求、5 个汇总行，账单上却写着「成本：未能核算（392 行缺少渠道倍率
+// 或分组倍率）」。两个原因叠在一起：
+//
+//  1. 预检只遍历「有渠道号的行」，这 392 行压根没有渠道号，于是预检放行、
+//     出账时它们才被判为缺失——所以重跑再也弹不出补录界面；
+//  2. 出账是「全有或全无」：392 行算不出来，整张表的成本列就全空，
+//     哪怕另外 504000 行都算得出来。
+//
+// 这个用例把两个都钉住：成本必须给出数来，覆盖率与原因必须写在摘要里。
+func TestSimpleBillPartialCostEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_ab12cd.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	headers := []interface{}{"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "other", "type", "channel_id", "created_at"}
+
+	f := excelize.NewFile()
+	sheet := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sheet, "A1", &headers))
+
+	row := 2
+	add := func(model, group string, quota int, other, ch string) {
+		require.NoError(t, f.SetSheetRow(sheet, fmt.Sprintf("A%d", row), &[]interface{}{
+			model, group, 1000, 100, quota, other, 2, ch, 1789430400,
+		}))
+		row++
+	}
+	// 5 个汇总行，渠道都维护了倍率 → 这些行算得出成本。
+	add("opus5", "AWSB opus5", 9000000, `{"group_ratio":0.4}`, "1108")
+	add("m2", "AWSB opus5", 8000000, `{"group_ratio":0.4}`, "1108")
+	add("m3", "Codex", 7000000, `{"group_ratio":1.8}`, "849")
+	add("m4", "Codex", 6000000, `{"group_ratio":1.8}`, "849")
+	add("m5", "anti", 5000000, `{"group_ratio":1.8}`, "900")
+	// 392 行没有渠道号（channel_id 为 0，other 里也没有 use_channel）——
+	// 预检从前看不见它们，出账侧却把它们算作缺失。
+	for i := 0; i < 392; i++ {
+		add("orphan", "AWSB opus5", 1000, `{"group_ratio":0.4}`, "0")
+	}
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	result, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate:  BillTemplateSimple,
+		CustomerName:  "网宿科技wangsukeji",
+		SummaryHeader: []string{"客户：网宿科技wangsukeji"},
+		CheckCost:     true,
+		ChannelUpstreamRatios: map[int]float64{
+			1108: 0.4, 849: 0.4, 900: 0.4,
+		},
+		ChannelKnownIDs: map[int]bool{1108: true, 849: true, 900: true},
+	})
+	require.NoError(t, err)
+
+	// 这一条是这个 bug 的核心：成本必须出现，而不是「未能核算」。
+	assert.Contains(t, result.BillSummary, "上游成本",
+		"有行算得出成本时不能因为少数行缺失就整段省略")
+	assert.NotContains(t, result.BillSummary, "成本：未能核算")
+	// 覆盖率与原因必须写清楚，否则读者会把利润当成整体毛利。
+	assert.Contains(t, result.BillSummary, "成本覆盖：5/397 行")
+	assert.Contains(t, result.BillSummary, "392 行日志里取不到渠道号")
+	// 金额不受影响：它是额度本身的折算，与渠道无关。
+	assert.Contains(t, result.BillSummary, "账单金额：¥")
+
+	// 汇总行数：5 个正常 + 1 个 orphan（392 行同模型同分组合成一行）。
+	assert.Contains(t, result.BillSummary, "汇总行：6 行")
+}
+
+// TestPreCheckAndCostAgreeOnSkipReason 预检与出账必须按同一套判据分类。
+//
+// 这是修上面那个故障的关键：两边各写一套判据，就会出现
+// 「预检说都维护好了、账单说 392 行缺倍率」这种自相矛盾。
+func TestPreCheckAndCostAgreeOnSkipReason(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		{"m1", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "101"},
+		// 没有渠道号
+		{"m2", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "0"},
+		// 渠道清单里没有的渠道
+		{"m3", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "999"},
+		// 清单里有、但没维护倍率
+		{"m4", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "202"},
+	}
+	ratios := map[int]float64{101: 0.4}
+	known := map[int]bool{101: true, 202: true}
+
+	counts, missing, _ := CountRowCostReasons(headers, rows, ratios, known)
+	assert.Equal(t, 1, counts[SkipNoChannel])
+	assert.Equal(t, 1, counts[SkipUnknownChannel])
+	assert.Equal(t, 1, counts[SkipNoUpstreamRatio])
+	assert.Equal(t, 1, counts[SkipNone], "渠道 101 那行是能算的")
+	// 只有「清单里有、没填倍率」的才值得提示用户去补。
+	assert.Equal(t, []int{202}, missing, "渠道 999 补不了，不该出现在待补录清单里")
+
+	// 出账侧对同一批行给出同样的分类。
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+		CostColumns: true, UpstreamRatios: ratios, KnownChannels: known,
+	})
+	require.NoError(t, err)
+	require.Len(t, got, 4)
+	byModel := map[string]SimpleBillRow{}
+	for _, r := range got {
+		byModel[r.Model] = r
+	}
+	assert.Equal(t, 1, byModel["m2"].SkipReasons[string(SkipNoChannel)],
+		"出账侧与预检侧必须给出同一个原因")
+	assert.Equal(t, 1, byModel["m3"].SkipReasons[string(SkipUnknownChannel)])
+	assert.Equal(t, 1, byModel["m4"].SkipReasons[string(SkipNoUpstreamRatio)])
+	assert.Nil(t, byModel["m1"].SkipReasons, "算得出来的行不该有缺失原因")
+}
+
+// TestRowCostReasonZeroDeltaNotCounted 额度为 0 的行不算「缺成本」。
+//
+// 任务占位行常记 task_id + 0 额度。把它们计进缺失数会让用户看到几百行"缺失"，
+// 跑去补一堆本来不影响成本的倍率。
+func TestRowCostReasonZeroDeltaNotCounted(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		// 有 task_id（说明是任务调整行）但没有渠道号、额度也是 0。
+		{"m1", "Codex", "0", "0", "0", `{"task_id":7,"group_ratio":0.4}`, "6", "0"},
+	}
+	counts, _, _ := CountRowCostReasons(headers, rows, map[int]float64{}, map[int]bool{})
+	assert.Equal(t, 1, counts[SkipZeroDelta])
+	assert.Zero(t, counts[SkipNoChannel], "零额度行不该报成缺渠道号")
+}
+
+// TestRowCostReasonFirstUseNoChannelTable 首次使用、渠道清单还是空的时候，
+// 缺倍率要报成「没维护」而不是「渠道不存在」。
+//
+// 报成后者的后果很实际：页面会告诉用户这个渠道补不了，而其实只要填个倍率就行。
+func TestRowCostReasonFirstUseNoChannelTable(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		{"m1", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "101"},
+	}
+	// known 为 nil = 还没拉过渠道清单。
+	counts, missing, _ := CountRowCostReasons(headers, rows, map[int]float64{}, nil)
+	assert.Equal(t, 1, counts[SkipNoUpstreamRatio])
+	assert.Zero(t, counts[SkipUnknownChannel])
+	assert.Equal(t, []int{101}, missing, "要能被提示去补录")
+}
+
+// TestDescribeSkipReasonsOrderStable 原因文案的顺序固定。
+//
+// map 遍历顺序随机，直接拼会让同一份结果显示成好几种样子——
+// 这段文字是给人复制到聊天里的，来回变会让人以为数变了。
+func TestDescribeSkipReasonsOrderStable(t *testing.T) {
+	reasons := map[string]int{
+		string(SkipNoGroupRatio):    1,
+		string(SkipNoUpstreamRatio): 2,
+		string(SkipNoChannel):       3,
+		string(SkipMultiChannel):    4,
+		string(SkipUnknownChannel):  5,
+	}
+	want := "2 行渠道未维护上游倍率、5 行渠道不在本地清单里、3 行日志里取不到渠道号、" +
+		"4 行一行经多个渠道无法分摊、1 行缺分组倍率（group_ratio）"
+	for i := 0; i < 10; i++ {
+		assert.Equal(t, want, DescribeSkipReasons(reasons), "多跑几次确保不受 map 顺序影响")
+	}
 }
 
 // TestSimpleBillCostSummaryMarginUsesCoveredAmount 利润口径用「参与核算的金额」
