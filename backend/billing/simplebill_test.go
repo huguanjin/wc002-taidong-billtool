@@ -876,8 +876,13 @@ func TestSimpleBillHasNoCostColumns(t *testing.T) {
 	require.NoError(t, f.SetSheetRow(sh, "A1", &[]interface{}{
 		"model_name", "group", "prompt_tokens", "completion_tokens",
 		"quota", "other", "type", "channel_id", "created_at"}))
+	// 两行消费 + 一行退款：退款行不该出现在客户版脱敏日志里。
 	require.NoError(t, f.SetSheetRow(sh, "A2", &[]interface{}{
 		"m1", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SetSheetRow(sh, "A3", &[]interface{}{
+		"m2", "AZ", 2000, 200, 4500000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SetSheetRow(sh, "A4", &[]interface{}{
+		"m2", "AZ", 0, 0, 500000, `{"task_id":7,"group_ratio":1.8}`, 6, 849, 1789430400}))
 	require.NoError(t, f.SaveAs(logPath))
 	require.NoError(t, f.Close())
 
@@ -890,50 +895,123 @@ func TestSimpleBillHasNoCostColumns(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, res.SanitizedPath)
 
-	headerOf := func(p string) []string {
+	sheetRows := func(p string) [][]string {
 		ff, err := excelize.OpenFile(p)
 		require.NoError(t, err)
 		defer ff.Close()
 		rows, err := ff.GetRows(ff.GetSheetName(0))
 		require.NoError(t, err)
 		require.NotEmpty(t, rows)
-		return rows[0]
+		return rows
 	}
 
 	// 账单：客户版七列，一个成本列都不许有。
-	billHeader := headerOf(res.BillPath)
-	assert.Equal(t, SimpleBillColumns, billHeader)
+	billRows := sheetRows(res.BillPath)
+	assert.Equal(t, SimpleBillColumns, billRows[0])
 	for _, banned := range []string{"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）"} {
-		assert.NotContains(t, billHeader, banned,
+		assert.NotContains(t, billRows[0], banned,
 			"客户版账单绝不能出现 %s —— 那是站内成本数据", banned)
 	}
 
-	// 脱敏日志：与账单完全同构。
-	sanitizedHeader := headerOf(res.SanitizedPath)
-	assert.Equal(t, billHeader, sanitizedHeader, "脱敏日志与账单列集合必须一致")
+	// 脱敏日志：**逐行明细**，不是账单的复刻。
+	//
+	// 这是一次真实回归：从前这里把汇总表原样再写一份当脱敏日志，
+	// 于是两个文件内容一模一样——客户拿它核不了任何一笔账。
+	sanitizedRows := sheetRows(res.SanitizedPath)
+	assert.NotEqual(t, billRows[0], sanitizedRows[0],
+		"脱敏日志是明细表，列集合不该与汇总账单相同")
+	assert.Contains(t, sanitizedRows[0], "model_name", "明细日志要保留原始日志列")
+	assert.NotContains(t, sanitizedRows[0], "other",
+		"other 整列丢弃——那是脱敏的首要一条")
+	// 两行消费 → 表头 + 2 行；退款行不写进来。
+	assert.Equal(t, 3, len(sanitizedRows), "退款行不该出现在客户版明细里：%v", sanitizedRows)
+	assert.Equal(t, "m1", sanitizedRows[1][0], "第一行是第一条明细")
 
-	// 成本表：才是唯一带成本三列的地方，且行数与账单一致。
+	// 成本表：才是唯一带成本三列的地方，且行数与账单一致（同源汇总）。
 	require.NotEmpty(t, res.CostPath, "勾了成本核算就要出成本表")
-	costHeader := headerOf(res.CostPath)
-	assert.Equal(t, SimpleBillCostColumns, costHeader, "成本表带成本三列")
-	assert.Contains(t, costHeader, "上游成本（人民币）")
-	assert.Contains(t, costHeader, "利润（人民币）")
+	costRows := sheetRows(res.CostPath)
+	assert.Equal(t, SimpleBillCostColumns, costRows[0], "成本表带成本三列")
+	assert.Contains(t, costRows[0], "上游成本（人民币）")
+	assert.Contains(t, costRows[0], "利润（人民币）")
 	assert.Contains(t, filepath.Base(res.CostPath), "成本二",
 		"成本表的文件名要与账单区分开，用户一眼能看出是哪种表")
+	assert.Equal(t, len(billRows), len(costRows), "成本表基于同一份汇总行")
+}
 
-	// 三张表的行数应当一致（行相同、只是列不同）。
-	rowsOf := func(p string) int {
+// TestSimpleBillSanitizedIsRowDetail 脱敏日志必须是**逐行明细**，不是账单的复刻。
+//
+// 这是一次真实回归，也是这个功能最容易理解错的地方：模板二起初把那张
+// (分组, 模型) 汇总表原样再写一份当脱敏日志，于是两个文件内容一模一样。
+// 那根本不是脱敏日志——客户拿它核不了任何一笔账，也看不到自己每次请求的用量。
+//
+// 正确的形态：账单是汇总，脱敏日志是 logs 表里一行一次请求的明细，
+// 与模板一给客户的明细同构（other 整列丢弃、缓存与明细列展开）。
+func TestSimpleBillSanitizedIsRowDetail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_cc.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	f := excelize.NewFile()
+	sh := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sh, "A1", &[]interface{}{
+		"id", "username", "type", "created_at", "token_id", "token_name", "model_name",
+		"group", "prompt_tokens", "completion_tokens", "quota", "use_time", "is_stream",
+		"request_id", "other", "channel_id"}))
+	row := func(r, typ int, model, other string, p, c, q int) {
+		vals := []interface{}{
+			1000 + r, "someone@example.com", typ, 1789430400, 1, "tk", model,
+			"AZ", p, c, q, 1200, 1, "req-x", other, 849,
+		}
+		axis, _ := excelize.CoordinatesToCellName(1, r)
+		require.NoError(t, f.SetSheetRow(sh, axis, &vals))
+	}
+	row(2, 2, "gpt-5-mini", `{"group_ratio":1.8}`, 1000, 100, 9000000)
+	row(3, 2, "gpt-5.4", `{"group_ratio":1.8}`, 2000, 200, 9000000)
+	// 退款行：客户版明细里不该出现。
+	row(4, 6, "gpt-5.4", `{"task_id":7,"group_ratio":1.8}`, 0, 0, 500000)
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	res, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate: BillTemplateSimple, CheckCost: true, SanitizedLog: true,
+		SanitizedFormat: "xlsx", ExchangeRate: 7,
+		ChannelUpstreamRatios: map[int]float64{849: 0.4},
+		ChannelKnownIDs:       map[int]bool{849: true},
+	})
+	require.NoError(t, err)
+
+	read := func(p string) [][]string {
 		ff, err := excelize.OpenFile(p)
 		require.NoError(t, err)
 		defer ff.Close()
 		rows, err := ff.GetRows(ff.GetSheetName(0))
 		require.NoError(t, err)
-		return len(rows)
+		return rows
 	}
-	assert.Equal(t, rowsOf(res.BillPath), rowsOf(res.SanitizedPath),
-		"账单与脱敏日志的行应当一样，只是列不同")
-	assert.Equal(t, rowsOf(res.BillPath), rowsOf(res.CostPath),
-		"成本表也基于同一份汇总行")
+
+	bill := read(res.BillPath)
+	san := read(res.SanitizedPath)
+
+	// 汇总 vs 明细：列集合不同、行数也不同。
+	assert.Equal(t, SimpleBillColumns, bill[0])
+	assert.NotEqual(t, bill[0], san[0], "明细日志的列不该与汇总账单相同")
+
+	// 明细保留了原始日志列，且 other 被丢弃（脱敏的首要一条）。
+	assert.Contains(t, san[0], "model_name")
+	assert.Contains(t, san[0], "quota")
+	assert.NotContains(t, san[0], "other", "other 整列必须丢弃")
+
+	// 展开出来的明细列也在（与模板一同构）。
+	for _, c := range []string{"cache_tokens", "uncached_input_tokens", "usage_semantic"} {
+		assert.Contains(t, san[0], c, "明细列 %s 应当存在", c)
+	}
+
+	// 两行消费 → 表头 + 2；退款行不写。
+	assert.Equal(t, 3, len(san), "退款行不该出现在客户版明细里")
+	// 账单是汇总：一个 (分组, 模型) 一行，两个模型 → 表头 + 2 + 合计行。
+	assert.Equal(t, 4, len(bill))
+	assert.Equal(t, "合计", bill[len(bill)-1][0])
 }
 
 // TestSimpleBillNoCostTableWhenUnchecked 没勾成本核算时不出成本表。

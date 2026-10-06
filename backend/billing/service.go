@@ -242,11 +242,20 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		return nil, fmt.Errorf("写出简易账单失败: %w", err)
 	}
 
+	// 脱敏日志是**逐行明细**（logs 表里一行一次请求），与账单那张汇总表不是一回事。
+	//
+	// 从前这里把汇总表原样再写一份当脱敏日志，于是两个文件内容一模一样——
+	// 客户拿它核不了任何一笔账。汇总留在账单里，明细才是脱敏日志该有的样子。
+	//
+	// 格式跟随全局设置（xlsx / csv / tsv），与模板一同一个开关：
+	// 客户要什么格式的明细，不该因为出账模板不同而变。
 	var sanitizedPath string
 	if params.SanitizedLog {
-		sanitizedPath = filepath.Join(outputDir, withCustomerSuffix(simpleSanitizedName(stem), params.CustomerName)+".xlsx")
-		if err := WriteSimpleBill(sanitizedPath, summaryRows, "汇总明细", SimpleBillWriteOptions{}); err != nil {
-			return nil, fmt.Errorf("写出汇总脱敏日志失败: %w", err)
+		ext, _, _ := sanitizedFormatInfo(params.SanitizedFormat)
+		sanitizedPath = filepath.Join(outputDir, withCustomerSuffix(simpleSanitizedName(stem), params.CustomerName)+ext)
+		if err := WriteSimpleSanitizedLog(sanitizedPath, headers, rows,
+			params.SanitizedFormat, params.IncludeBillingParams); err != nil {
+			return nil, fmt.Errorf("写出脱敏日志失败: %w", err)
 		}
 	}
 

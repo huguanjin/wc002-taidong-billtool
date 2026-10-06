@@ -2,6 +2,7 @@ package billing
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -142,6 +143,120 @@ func (o SimpleBillOptions) rateOr() float64 {
 		return o.ExchangeRate
 	}
 	return DefaultExchangeRate
+}
+
+// WriteSimpleSanitizedLog 为模板二写逐行明细的脱敏日志。
+//
+// **它与账单不是一张表**：账单是 (分组, 模型) 的汇总，脱敏日志是 logs 表里的
+// 逐条明细（一行一次请求）。
+//
+// 从前这里图省事，把汇总表当成脱敏日志写出去，结果是「脱敏日志」与「账单」
+// 内容一模一样——那根本不是脱敏日志：客户拿它核不了任何一笔账，
+// 也看不到自己每次请求的用量。汇总留在账单里，明细才是脱敏日志该有的样子。
+//
+// 复用模板一的那套写出器（SanitizedWriter），所以列的加工口径完全一致：
+// other 整列丢弃、缓存列展开成四列、明细列从 other 里提出来。
+// 这是刻意的——两套模板给客户的明细格式不该长得不一样。
+func WriteSimpleSanitizedLog(path string, headers []string, rows [][]string,
+	format string, includeBilling bool) error {
+
+	ext, delimiter, isDelimited := sanitizedFormatInfo(format)
+	_ = ext
+
+	var w SanitizedWriter
+	var err error
+	if isDelimited {
+		w, err = NewCSVSanitizedWriter(path, headers, delimiter, includeBilling)
+	} else {
+		w, err = NewExcelSanitizedWriter(path, headers, includeBilling)
+	}
+	if err != nil {
+		return fmt.Errorf("初始化脱敏日志写出失败: %w", err)
+	}
+
+	writeErr := streamSimpleSanitizedRows(w, headers, rows, includeBilling)
+	// Close 必须调用：Excel 写出器是流式的，不关就写不出完整的文件——
+	// 而且不关的话文件可能是半截的，客户拿到会打不开。
+	if closeErr := w.Close(); closeErr != nil && writeErr == nil {
+		writeErr = fmt.Errorf("写出脱敏日志失败: %w", closeErr)
+	}
+	return writeErr
+}
+
+// streamSimpleSanitizedRows 逐行展开缓存与明细列并写出。
+//
+// 与模板一的 AggregateFromRows 里那段写出逻辑同源（同样的取缓存列规则、
+// 同样的退款行拦截），但**不跑计价**：模板二本来就不参与定价，
+// 拉一本价表进来只为写明细，会在没有价表的部署上直接失败。
+func streamSimpleSanitizedRows(w SanitizedRowWriter, headers []string, rows [][]string, includeBilling bool) error {
+	col := map[string]int{}
+	for i, h := range headers {
+		if h != "" {
+			col[h] = i
+		}
+	}
+	idxOther, hasOther := col["other"]
+	idxType, hasType := col["type"]
+	idxPrompt, hasPrompt := col["prompt_tokens"]
+	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
+	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
+
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		other := ""
+		if hasOther {
+			other = cellAt(row, idxOther)
+		}
+
+		// 退款/补扣行不写进客户版明细：那是站点与用户之间的额度往来，
+		// 不是一次请求。与模板一同一处拦截，口径不能两样。
+		if IsTaskQuotaAdjustment(other) {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			if _, ok := QuotaAdjustmentDelta(logType, ToFloat(cellAt(row, col["quota"]))); ok {
+				continue
+			}
+		}
+
+		var cacheRead, cacheWrite5m, cacheWrite1h float64
+		if hasCacheTokens && hasCacheCreation {
+			cacheReadCol := ToFloat(cellAt(row, idxCacheTokens))
+			creationCol := ToFloat(cellAt(row, idxCacheCreation))
+			cr2, w5, w1 := ParseCacheTokens(other)
+			if w5 != 0 || w1 != 0 || strings.Contains(other, "cache_creation_tokens_5m") {
+				cacheRead = math.Max(cacheReadCol, cr2)
+				cacheWrite5m, cacheWrite1h = w5, w1
+			} else {
+				cacheRead = cacheReadCol
+				cacheWrite5m, cacheWrite1h = creationCol, 0
+			}
+		} else {
+			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
+		}
+
+		details := ParseRowDetails(other, includeBilling)
+		// 未命中输入量是个派生值（见 UncachedInputTokens），模板一由 priceRow 算出。
+		// 这里不跑计价，就按同一个函数自己算——复用函数而不是复制算式，
+		// 否则两套模板的「输入（未命中）」会算出不同的数。
+		details.UncachedInputTokens = UncachedInputTokens(
+			toFloatIdx(row, idxPrompt, hasPrompt), cacheRead, cacheWrite5m, cacheWrite1h, details.UsageSemantic)
+		if err := w.WriteRow(row, cacheRead, cacheWrite5m, cacheWrite1h, details); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// toFloatIdx 取指定列的数字，列不存在时返回 0。
+func toFloatIdx(row []string, idx int, ok bool) float64 {
+	if !ok {
+		return 0
+	}
+	return ToFloat(cellAt(row, idx))
 }
 
 // SimpleBillCostStat 成本覆盖情况，供调用方在结果里如实报出。
