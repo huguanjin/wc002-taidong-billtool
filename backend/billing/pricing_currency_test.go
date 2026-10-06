@@ -175,4 +175,3 @@ func TestAggregateFromRowsSubtractsCacheForDomesticVendorModel(t *testing.T) {
 	// 真实结算 quota/500000/group_ratio ≈ 0.75/0.75=0.0202（CNY，未打折前）。
 	assert.InDelta(t, 0.0202, OfficialListCNY(agg, 7.0), 0.001)
 }
-

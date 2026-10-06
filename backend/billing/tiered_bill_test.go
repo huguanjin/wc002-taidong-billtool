@@ -489,7 +489,6 @@ func TestExtractDistinctGroupsFeedsDomesticMarkers(t *testing.T) {
 	assert.False(t, DerivableListPrice(row, groups), "勾选该分组后不再参与反推")
 }
 
-
 // TestDomesticExprUnitColumnsAreUSD 人民币计价的表达式系数必须归一成美金再进单价列。
 //
 // 账单模板的单价列表头写的是「美金/百万token」，而国产模型在站上按人民币报价

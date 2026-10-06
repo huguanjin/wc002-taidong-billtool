@@ -208,4 +208,3 @@ func LoadDBPriceCache(cachePath string) (*PriceBook, *BillingExprSetting, time.T
 	}
 	return book, setting, file.FetchedAt, nil
 }
-

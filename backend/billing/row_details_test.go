@@ -58,7 +58,7 @@ func TestParseRowDetailsAudioInputFallback(t *testing.T) {
 // 与 URL 编码形态：json.Unmarshal 到 map 会失败，函数必须返回零值，不得 panic、不得报错。
 func TestParseRowDetailsDoubleEncodedAndURLEncoded(t *testing.T) {
 	cases := []string{
-		`"{\"cache_tokens\":1000}"`,     // 双重编码：整体是一个 JSON 字符串字面量
+		`"{\"cache_tokens\":1000}"`,    // 双重编码：整体是一个 JSON 字符串字面量
 		`%7B%22cache_tokens%22%3A5%7D`, // URL 编码，不是合法 JSON
 	}
 	for _, other := range cases {
@@ -88,7 +88,7 @@ func TestParseRowDetailsToolSurcharges(t *testing.T) {
 	single := ParseRowDetails(`{"tool_surcharges":[{"name":"web_search","count":1,"price":10}]}`, false)
 	assert.Equal(t, "web_search×1@10", single.ToolSurcharges)
 
-	multi := ParseRowDetails(`{"tool_surcharges":[{"name":"web_search","count":1,"price":10},` +
+	multi := ParseRowDetails(`{"tool_surcharges":[{"name":"web_search","count":1,"price":10},`+
 		`{"name":"image_gen","count":2,"price":5}]}`, false)
 	assert.Equal(t, "web_search×1@10;image_gen×2@5", multi.ToolSurcharges)
 

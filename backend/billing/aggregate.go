@@ -167,7 +167,6 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
 		}
 
-
 		// 该请求发生的时间：日志的 created_at 是 Unix 秒。出账面对历史日志，
 		// 带 hour() 一类的表达式必须按请求当时的时刻判断（见 RunBillingExpr）。
 		at := time.Now()
@@ -373,7 +372,8 @@ func containsString(list []string, v string) bool {
 	return false
 }
 
-func parseUnixTimestamp(v string) (int64, bool) {	s := strings.TrimSpace(v)
+func parseUnixTimestamp(v string) (int64, bool) {
+	s := strings.TrimSpace(v)
 	if s == "" {
 		return 0, false
 	}

@@ -163,7 +163,6 @@ func DescribeSkipReasons(reasons map[string]int) string {
 		label string
 	}{
 		{SkipNoUpstreamRatio, "渠道未维护上游倍率"},
-		{SkipUnknownChannel, "渠道不在本地清单里"},
 		{SkipNoChannel, "日志里取不到渠道号"},
 		{SkipMultiChannel, "一行经多个渠道无法分摊"},
 		{SkipNoGroupRatio, "缺分组倍率（group_ratio）"},
@@ -328,7 +327,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		// 判据与预检共用 RowCostReason：两边各写一套的话，会出现
 		// 「预检说没问题、账单说 392 行缺倍率」这种自相矛盾（那是修这个 bug 的起因）。
 		reason, ids := RowCostReason(row, idxChannel, hasChannel, idxOther, hasOther,
-			opts.UpstreamRatios, opts.KnownChannels, delta)
+			opts.UpstreamRatios, delta)
 		if reason != SkipNone {
 			// zero_delta 不计入缺失：额度为 0 的行本来就不影响成本，
 			// 把它算进去会让用户去补一堆无关的倍率。

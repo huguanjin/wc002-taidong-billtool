@@ -148,6 +148,25 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			customer.Name, start.Format("2006-01-02"), end.Format("2006-01-02"), len(usernames))
 	}
 
+	// 两个预检都要读一遍日志，这里做一次惰性加载共享结果。
+	//
+	// 不能各读各的：日志常是几百 MB（实测 548MB），多读一遍就是多几十秒，
+	// 而且两个预检本来就该看同一份数据，各自读还可能读到不一致的中间状态。
+	var preHeaders []string
+	var preRows [][]string
+	preLoaded := false
+	loadForCheck := func() ([]string, [][]string, error) {
+		if preLoaded {
+			return preHeaders, preRows, nil
+		}
+		h, r, err := LoadLogRows(exported.Path, "", "")
+		if err != nil {
+			return nil, nil, err
+		}
+		preHeaders, preRows, preLoaded = h, r, true
+		return h, r, nil
+	}
+
 	// ---- 3.5 成本核算预检：日志用到的渠道是否都维护了上游倍率 ----
 	//
 	// 放在这里（导出之后、出账之前）是唯一可选的时点：要判断缺哪些倍率，
@@ -158,7 +177,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	// 保存后重新执行即可。
 	var blocked *ChannelCheckResult
 	if task.CheckCost || task.GenerateCost {
-		headers, rows, rerr := LoadLogRows(exported.Path, "", "")
+		headers, rows, rerr := loadForCheck()
 		if rerr != nil {
 			return nil, fmt.Errorf("读取已导出的日志失败: %w", rerr)
 		}
@@ -184,7 +203,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		// 「没有渠道号的行」直接跳过。于是这些行对预检完全隐形，预检放行，
 		// 出账时它们却被判为缺失——用户看到「预检通过」却在账单上读到
 		// 「392 行缺少渠道倍率或分组倍率」，而且重跑再也不会弹出补录界面。
-		counts, missingRatios, rowsPerChannel := CountRowCostReasons(headers, rows, ratios, knownIDs)
+		counts, missingRatios, rowsPerChannel := CountRowCostReasons(headers, rows, ratios)
 
 		// 用同一份行级统计填结果，无论走不走 CheckChannelRatios 都是这几个数——
 		// 免得同一个「缺多少行」在两条分支上有两个来源。
@@ -217,16 +236,16 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			fill(&check)
 		}
 
-		// 拦下的条件收紧了：只有**补得动**的缺口才拦。
+		// 拦下的判据：只要存在**没维护倍率的渠道**就拦。
 		//
-		//	渠道没填倍率 → 拦住，用户填完就能算（这是这个功能存在的理由）
-		//	渠道清单里没有 → 不拦，填不了；拦住等于让它永远出不来账
+		//	渠道没填倍率（无论它在不在本地渠道清单里）→ 拦住，填完就能算
 		//	日志缺 group_ratio / 没渠道号 / 多渠道路由 → 不拦，补倍率也没用，
 		//	    它们在账单上如实报出「N 行未计入成本」
 		//
-		// 从前这里只看 `len(check.Missing) > 0`，而 Missing 只覆盖第一种情形，
-		// 于是另外三种情形既不拦、也不在结果里说清，用户只能对着账单上的
-		// 一句「未能核算」猜哪里出了问题。现在四种都在结果里分开报。
+		// 「在不在渠道清单里」**不参与这个判断**：倍率表以 channel_id 为主键，
+		// 清单里没有的渠道照样能填。从前把清单外的渠道归成"补不了"而不拦，
+		// 结果是一批新渠道永远算不出成本、页面上还没地方可填——
+		// 用户只看到账单上那句「392 行…」，却找不到任何入口。
 		if len(check.Missing) > 0 {
 			blocked = &check
 		}
@@ -244,11 +263,33 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	}
 
 	// 该客户手工维护的「分组 → 折扣」：线下谈定、new-api 里没及时更新的那些。
-	// 读失败**不能静默降级**——降级的表现是照常出一张按过期倍率算出来的账单，
-	// 金额是错的却不报错，比直接失败危险得多。这里让本次任务失败。
-	manualDiscounts, err := CustomerGroupDiscountMap(deps.PG, task.CustomerID)
-	if err != nil {
-		return nil, fmt.Errorf("读取客户手工折扣失败: %w", err)
+	//
+	// 只在勾了「使用自定义折扣」时才装载：不勾就该完全按机器算出来的折扣出账，
+	// 连读都不必读——读进来又不用，只会让人误以为它生效了。
+	manualDiscounts := map[string]float64{}
+	if task.UseManualDiscount {
+		var err error
+		manualDiscounts, err = CustomerGroupDiscountMap(deps.PG, task.CustomerID)
+		if err != nil {
+			// 读失败**不能静默降级**——降级的表现是照常出一张按过期倍率算出来的账单，
+			// 金额是错的却不报错，比直接失败危险得多。这里让本次任务失败。
+			return nil, fmt.Errorf("读取客户手工折扣失败: %w", err)
+		}
+
+		// ---- 3.6 线下折扣预检：勾了「使用自定义折扣」，日志里的分组就都得填过 ----
+		//
+		// 缺了照样拦下（不报错），让用户就地补：一半按线下折扣、一半按反推的账单
+		// 是最坏的结果——客户会拿着两个不同口径的折扣来问为什么。
+		headers, rows, rerr := loadForCheck()
+		if rerr != nil {
+			return nil, fmt.Errorf("读取已导出的日志失败: %w", rerr)
+		}
+		if missing := MissingGroupDiscounts(headers, rows, manualDiscounts); len(missing) > 0 {
+			return &TaskRunResult{
+				TaskID: task.ID, Task: task, Customer: customer,
+				ChannelCheck: &ChannelCheckResult{MissingDiscountGroups: missing},
+			}, nil
+		}
 	}
 
 	params := Params{

@@ -45,6 +45,9 @@ const planForm = ref({
   // generateCost 管「要不要那张独立的成本利润表」。简易模板没有那张表，
   // 但它的账单上有成本三列——所以简易模板下 generateCost 无意义、checkCost 照样有用。
   checkCost: true,
+  // 是否套用该客户手工维护的「分组 → 折扣」（线下谈定、没同步到 new-api 的）。
+  // 默认不勾：折扣直接决定收客户多少钱，不该在用户没表态时自动套用人工数值。
+  useManualDiscount: false,
   generateCost: true,
   // 出账模板：'' = 标准明细账单，'simple' = 简易汇总账单。
   // 存在计划上而不是全局设置里：同一个部署里两类客户都可能存在。
@@ -238,6 +241,7 @@ function resetPlanForm() {
     generateSanitized: planForm.value.generateSanitized,
     generateCost: planForm.value.generateCost,
     checkCost: planForm.value.checkCost,
+    useManualDiscount: planForm.value.useManualDiscount,
     billTemplate: planForm.value.billTemplate,
   }
 }
@@ -258,6 +262,10 @@ function startEditPlan(t) {
     generateCost: !!t.generateCost,
     // 老计划没有这个字段（库里的列是后加的，默认 true），undefined 时按勾选算。
     checkCost: t.checkCost === undefined || t.checkCost === null ? true : !!t.checkCost,
+    // 这个字段相反：老计划迁移时默认 true（保住既有口径），新建默认 false。
+    // 但后端已经把这个默认值落在库里了，页面只需原样反映，不再自己兜底——
+    // 兜底成 false 会让已在用线下折扣的老计划显示成未勾选，而实际出账仍生效。
+    useManualDiscount: !!t.useManualDiscount,
     billTemplate: t.billTemplate || '',
   }
   window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -291,6 +299,7 @@ async function savePlan() {
         generateSanitized: planForm.value.generateSanitized,
         generateCost: planForm.value.generateCost,
         checkCost: planForm.value.checkCost,
+        useManualDiscount: planForm.value.useManualDiscount,
         billTemplate: planForm.value.billTemplate,
       }),
     })
@@ -386,9 +395,11 @@ async function runSelected() {
 
   error.value = ''
   runResults.value = []
-  // 上一轮的补录草稿要清掉：换了批次之后，那些渠道可能根本不在这一批里，
-  // 留着会让「保存并继续执行」提交一批与当前结果无关的倍率。
+  // 上一轮的补录草稿要清掉：换了批次之后，那些渠道/分组可能根本不在这一批里，
+  // 留着会让「保存并继续执行」提交一批与当前结果无关的数值。
+  // 折扣草稿同样清掉——它比倍率更危险：提交上去就直接改了这个客户的报价。
   blockedRatioDraft.value = {}
+  blockedDiscountDraft.value = {}
   blockedError.value = ''
   blockedMsg.value = ''
   const ids = [...selectedTasks.value]
@@ -467,6 +478,61 @@ const savingBlockedRatios = ref(false)
 const blockedError = ref('')
 const blockedMsg = ref('')
 
+// 待补录的线下折扣草稿，键是分组名。
+// 与渠道倍率草稿一样是全局一份：同一批里两条任务可能共用同一个分组，
+// 那个分组只需要填一次。
+const blockedDiscountDraft = ref({})
+
+// blockedDiscountTask 取被拦任务的客户 ID 与分组，供保存折扣用。
+// 折扣是按「客户 + 分组」存的，所以必须带上客户 ID——不能只提交分组名。
+function blockedDiscountCustomers() {
+  const out = []
+  for (const r of runBlocked.value) {
+    const groups = r.channelCheck?.missingDiscountGroups || []
+    if (groups.length === 0) continue
+    const customerId = r.customerId || r.task?.customerId
+    if (!customerId) continue
+    out.push({ taskId: r.taskId, customerId, groups })
+  }
+  return out
+}
+
+// saveBlockedDiscounts 保存线下折扣。成功后返回 true。
+//
+// 走 /api/save-group-discounts 这个既有接口：它内部复用出账同一套 ParseDiscountText，
+// 前端不自己解析——两边解析规则一旦有差，会出现「页面显示 0.6、账单按 6 算」。
+async function saveBlockedDiscounts() {
+  for (const c of blockedDiscountCustomers()) {
+    const items = []
+    for (const g of c.groups) {
+      const raw = String(blockedDiscountDraft.value[g] ?? '').trim()
+      if (raw === '') continue
+      items.push({ groupKey: g, discount: raw, note: '' })
+    }
+    if (items.length === 0) continue
+    try {
+      const resp = await fetch('/api/save-group-discounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ customerId: c.customerId, items }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) {
+        if (resp.status === 401) emit('unauthorized')
+        blockedError.value = data.error || `保存折扣失败（${resp.status}）`
+        return false
+      }
+    } catch (err) {
+      blockedError.value = '保存折扣失败：' + err.message
+      return false
+    }
+  }
+  return true
+}
+
+// blockedHasDiscountWork 被拦任务里是否有待填的折扣分组。
+const blockedHasDiscountWork = computed(() => blockedDiscountGroups.value.length > 0)
+
 // blockedRatioItems 把草稿整理成接口要的形态，顺手校验。
 // 空串表示「这次不填」，跳过而不是报错——用户可能只想先补其中几个。
 function blockedRatioItems() {
@@ -484,6 +550,26 @@ function blockedRatioItems() {
   }
   return { items }
 }
+
+// blockedDiscountGroups 全部被拦任务里「缺线下折扣」的分组。
+//
+// 与「缺渠道倍率」是两件不同的事：这个要填的是**折扣**（客户侧，
+// 决定收多少钱），那个填的是**上游倍率**（成本侧，决定花多少钱）。
+// 两者都要「就地补录后继续」，但填进的是不同的表，所以分开渲染。
+const blockedDiscountGroups = computed(() => {
+  const out = []
+  for (const r of runBlocked.value) {
+    const groups = r.channelCheck?.missingDiscountGroups || []
+    if (groups.length === 0) continue
+    out.push({ taskId: r.taskId, taskName: r.taskName || r.task?.name || `任务 ${r.taskId}`, groups })
+  }
+  return out
+})
+
+// blockedMissingChannels 被拦任务里待补录的渠道（不含纯折扣拦截那类）。
+const blockedMissingChannels = computed(() =>
+  runBlocked.value.filter((r) => (r.channelCheck?.missing || []).length > 0)
+)
 
 // blockedGrouped 把待补录的渠道按**分组**归拢，供界面分节展示。
 //
@@ -545,9 +631,11 @@ const blockedMissGroupRatio = computed(() =>
 // 算不出成本的行数按原因分类（键见后端 CostSkipReason）。
 // 分开是必要的：缺倍率能补、缺渠道号只能查日志，混成一句「392 行未计入成本」
 // 用户不知道该干什么——那正是这次修的问题。
+// 键与后端 billing.CostSkipReason 一一对应。
+// 注意没有「渠道不在清单里」这一类：在不在清单里不影响能否补录，
+// 只影响页面上显示不显示得出渠道名（见 below 的 known 标记）。
 const SKIP_REASON_LABELS = {
   no_upstream_ratio: '渠道未维护上游倍率',
-  unknown_channel: '渠道不在本地清单里',
   no_channel: '日志里取不到渠道号',
   multi_channel: '一行经多个渠道无法分摊',
   no_group_ratio: '缺分组倍率（group_ratio）',
@@ -557,7 +645,6 @@ const SKIP_REASON_LABELS = {
 function skipReasonText(rowReasons) {
   const order = [
     'no_upstream_ratio',
-    'unknown_channel',
     'no_channel',
     'multi_channel',
     'no_group_ratio',
@@ -619,7 +706,25 @@ async function saveBlockedRatios() {
 // 「继续」只能是重跑整条链路。这是刻意的取舍——换来的是不需要一套跨请求的
 // 中间态机制。界面上必须说清楚，别让用户以为点了继续就完全不重来。
 async function continueAfterFix() {
-  if (!(await saveBlockedRatios())) return
+  blockedError.value = ''
+  blockedMsg.value = ''
+
+  // 两类补录都要处理，且**顺序无妨**（写的是两张不同的表）。
+  // 各自只提交填了值的那部分；一个都没填时要提示，而不是直接重跑——
+  // 重跑一定还会被同一批缺口拦下，白导一次日志。
+  const discountWork = blockedHasDiscountWork.value
+  const ratioWork = blockedMissingChannels.value.length > 0
+
+  if (discountWork) {
+    if (!(await saveBlockedDiscounts())) return
+  }
+  if (ratioWork) {
+    if (!(await saveBlockedRatios())) return
+  }
+  if (!discountWork && !ratioWork) {
+    blockedError.value = '没有需要保存的补录内容'
+    return
+  }
 
   const ids = runBlocked.value.map((r) => r.taskId)
   if (ids.length === 0) return
@@ -887,7 +992,18 @@ defineExpose({ loadAll })
           <input v-model="planForm.generateCost" type="checkbox" :disabled="!planForm.checkCost" />
           生成成本利润表
         </label>
+        <!-- 折扣与成本是两个方向：折扣决定**收客户多少钱**（客户侧），
+             上游倍率决定**我们花多少钱**（成本侧）。所以并排放在同一层，
+             而不是谁套谁——两者可以任意组合。 -->
+        <label>
+          <input v-model="planForm.useManualDiscount" type="checkbox" /> 使用自定义折扣（线下谈定）
+        </label>
       </div>
+      <p class="hint" v-if="planForm.useManualDiscount">
+        出账会用该客户在「客户折扣」页按分组维护的折扣，覆盖按倍率自动反推的值。
+        勾选后执行前会检查：这份日志里的分组若还有没维护线下折扣的，会先拦下，
+        可以在本页就地补录后继续。<strong>继续执行会重新导一次日志。</strong>
+      </p>
       <p class="hint" v-if="!planForm.checkCost">
         未开成本核算时不做上游倍率检查，账单里也不会出现成本与利润。
       </p>
@@ -943,11 +1059,21 @@ defineExpose({ loadAll })
          放在「执行失败」之后、「执行成功」之前：它比失败轻微（补一下就能跑），
          但比成功要紧（还没出账）。 -->
     <div v-if="runBlocked.length > 0" class="result-box warn-box">
-      <strong>需要先维护上游倍率（{{ runBlocked.length }} 条）</strong>
+      <strong>需要先补录（{{ runBlocked.length }} 条）</strong>
       <p class="hint">
-        下面这些计划**没有出账**：本时段日志用到的渠道里有还没维护上游倍率的，
-        成本算不出来。填好倍率保存后点「保存并继续执行」即可。
+        下面这些计划**没有出账**。原因有两类，缺什么就填什么，填完点「保存并继续执行」：
       </p>
+      <ul class="result-list">
+        <li v-if="blockedHasDiscountWork">
+          <span class="name">线下折扣没维护全</span>
+          <span class="reason">勾了「使用自定义折扣」，但日志里的分组还有没填的。
+            不填会变成一半按线下折扣、一半按反推，客户核对时会问为什么不一致。</span>
+        </li>
+        <li v-if="blockedMissingChannels.length > 0">
+          <span class="name">上游倍率没维护全</span>
+          <span class="reason">成本算不出来（不影响账单金额，只影响成本与利润）。</span>
+        </li>
+      </ul>
 
       <p class="error" v-if="blockedNoChannelInfo > 0">
         其中有 {{ blockedNoChannelInfo }} 条任务的日志里取不到渠道号（既没有 channel_id 列，
@@ -1005,6 +1131,40 @@ defineExpose({ loadAll })
                   <span v-else>未维护</span>
                   <!-- 影响行数：用户据此决定先补哪一个。 -->
                   <span v-if="ch.rowCount" class="hint inline">（影响 {{ ch.rowCount }} 行）</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 线下折扣：按「客户 + 分组」填。分组名取自本次日志实际出现的 group 列原值，
+           与「客户折扣」页维护的键完全一致，所以两边填的是同一份数据。 -->
+      <div v-for="b in blockedDiscountGroups" :key="'dsc-' + b.taskId" class="blocked-task">
+        <strong>{{ b.taskName }} — 线下折扣</strong>
+        <p class="hint">
+          这些分组还没维护线下折扣。可填 <code>6折</code>、<code>60%</code> 或 <code>0.6</code>。
+          维护后也会出现在「客户折扣」页，可随时二次修改。
+        </p>
+        <div class="blocked-group">
+          <div class="blocked-group-head">分组</div>
+          <table>
+            <thead>
+              <tr>
+                <th>分组</th>
+                <th>折扣</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="g in b.groups" :key="b.taskId + '-d-' + g">
+                <td class="left">{{ g }}</td>
+                <td>
+                  <input
+                    v-model="blockedDiscountDraft[g]"
+                    type="text"
+                    placeholder="如 6折 / 0.6"
+                    class="discount-input"
+                  />
                 </td>
               </tr>
             </tbody>
@@ -1311,6 +1471,12 @@ defineExpose({ loadAll })
 }
 .ratio-input {
   width: 90px;
+  padding: 2px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+.discount-input {
+  width: 110px;
   padding: 2px 6px;
   border: 1px solid #ccc;
   border-radius: 4px;

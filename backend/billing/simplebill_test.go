@@ -948,10 +948,13 @@ func TestSimpleBillPartialCostEndToEnd(t *testing.T) {
 	add("m3", "Codex", 7000000, `{"group_ratio":1.8}`, "849")
 	add("m4", "Codex", 6000000, `{"group_ratio":1.8}`, "849")
 	add("m5", "anti", 5000000, `{"group_ratio":1.8}`, "900")
-	// 392 行没有渠道号（channel_id 为 0，other 里也没有 use_channel）——
-	// 预检从前看不见它们，出账侧却把它们算作缺失。
+	// 392 行走的是**真实存在、但本地渠道清单里还没有**的渠道（现场是 1042/1065 这类）。
+	//
+	// 这是用户现场的准确形状：渠道号齐全、分组倍率齐全，只是渠道清单快照里没有这些渠道、
+	// 也就从来没填过倍率。从前它们被判成「不在清单里 → 补不了」而排除在待补录清单外，
+	// 于是预检不拦、页面不提示，成本却空着。
 	for i := 0; i < 392; i++ {
-		add("orphan", "AWSB opus5", 1000, `{"group_ratio":0.4}`, "0")
+		add("orphan", "AWSB opus5", 1000, `{"group_ratio":0.4}`, "1042")
 	}
 	require.NoError(t, f.SaveAs(logPath))
 	require.NoError(t, f.Close())
@@ -964,6 +967,7 @@ func TestSimpleBillPartialCostEndToEnd(t *testing.T) {
 		ChannelUpstreamRatios: map[int]float64{
 			1108: 0.4, 849: 0.4, 900: 0.4,
 		},
+		// 注意 1042 不在清单里——这正是要覆盖的情形。
 		ChannelKnownIDs: map[int]bool{1108: true, 849: true, 900: true},
 	})
 	require.NoError(t, err)
@@ -974,12 +978,37 @@ func TestSimpleBillPartialCostEndToEnd(t *testing.T) {
 	assert.NotContains(t, result.BillSummary, "成本：未能核算")
 	// 覆盖率与原因必须写清楚，否则读者会把利润当成整体毛利。
 	assert.Contains(t, result.BillSummary, "成本覆盖：5/397 行")
-	assert.Contains(t, result.BillSummary, "392 行日志里取不到渠道号")
+	assert.Contains(t, result.BillSummary, "392 行渠道未维护上游倍率")
 	// 金额不受影响：它是额度本身的折算，与渠道无关。
 	assert.Contains(t, result.BillSummary, "账单金额：¥")
 
 	// 汇总行数：5 个正常 + 1 个 orphan（392 行同模型同分组合成一行）。
 	assert.Contains(t, result.BillSummary, "汇总行：6 行")
+}
+
+// TestSimpleBillNoChannelRowsDistinctFromUnmaintained 真正取不到渠道号的行
+// 与「有渠道号但没维护倍率」是**两回事**，必须分开报。
+//
+// 前者是日志本身缺信息（补倍率没用，要去查导出方式）；后者填个倍率就好。
+// 混成一句会让人白费功夫。
+func TestSimpleBillNoChannelRowsDistinctFromUnmaintained(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		{"m1", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "101"},
+		{"m2", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "0"},
+	}
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+		CostColumns: true, UpstreamRatios: map[int]float64{101: 0.4},
+	})
+	require.NoError(t, err)
+
+	byModel := map[string]SimpleBillRow{}
+	for _, r := range got {
+		byModel[r.Model] = r
+	}
+	assert.Nil(t, byModel["m1"].SkipReasons, "有倍率的行不该有缺失原因")
+	assert.Equal(t, 1, byModel["m2"].SkipReasons[string(SkipNoChannel)],
+		"渠道号为 0 的行属于「取不到渠道号」，不是「没维护倍率」")
 }
 
 // TestPreCheckAndCostAgreeOnSkipReason 预检与出账必须按同一套判据分类。
@@ -1000,13 +1029,14 @@ func TestPreCheckAndCostAgreeOnSkipReason(t *testing.T) {
 	ratios := map[int]float64{101: 0.4}
 	known := map[int]bool{101: true, 202: true}
 
-	counts, missing, _ := CountRowCostReasons(headers, rows, ratios, known)
+	counts, missing, _ := CountRowCostReasons(headers, rows, ratios)
 	assert.Equal(t, 1, counts[SkipNoChannel])
-	assert.Equal(t, 1, counts[SkipUnknownChannel])
-	assert.Equal(t, 1, counts[SkipNoUpstreamRatio])
 	assert.Equal(t, 1, counts[SkipNone], "渠道 101 那行是能算的")
-	// 只有「清单里有、没填倍率」的才值得提示用户去补。
-	assert.Equal(t, []int{202}, missing, "渠道 999 补不了，不该出现在待补录清单里")
+	// 渠道 202（清单里有）与 999（清单里没有）都归为「没维护倍率」——
+	// **两者能做的事完全一样：填一个倍率**。从前把它们拆成两类，
+	// 结果 999 被排除在待补录清单之外，预检不拦、页面不提示（见 SkipNoUpstreamRatio 注释）。
+	assert.Equal(t, 2, counts[SkipNoUpstreamRatio])
+	assert.Equal(t, []int{202, 999}, missing, "清单外的渠道也要进待补录清单，否则无处可填")
 
 	// 出账侧对同一批行给出同样的分类。
 	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
@@ -1020,7 +1050,8 @@ func TestPreCheckAndCostAgreeOnSkipReason(t *testing.T) {
 	}
 	assert.Equal(t, 1, byModel["m2"].SkipReasons[string(SkipNoChannel)],
 		"出账侧与预检侧必须给出同一个原因")
-	assert.Equal(t, 1, byModel["m3"].SkipReasons[string(SkipUnknownChannel)])
+	assert.Equal(t, 1, byModel["m3"].SkipReasons[string(SkipNoUpstreamRatio)],
+		"清单外的渠道同样是「没维护倍率」")
 	assert.Equal(t, 1, byModel["m4"].SkipReasons[string(SkipNoUpstreamRatio)])
 	assert.Nil(t, byModel["m1"].SkipReasons, "算得出来的行不该有缺失原因")
 }
@@ -1035,7 +1066,7 @@ func TestRowCostReasonZeroDeltaNotCounted(t *testing.T) {
 		// 有 task_id（说明是任务调整行）但没有渠道号、额度也是 0。
 		{"m1", "Codex", "0", "0", "0", `{"task_id":7,"group_ratio":0.4}`, "6", "0"},
 	}
-	counts, _, _ := CountRowCostReasons(headers, rows, map[int]float64{}, map[int]bool{})
+	counts, _, _ := CountRowCostReasons(headers, rows, map[int]float64{})
 	assert.Equal(t, 1, counts[SkipZeroDelta])
 	assert.Zero(t, counts[SkipNoChannel], "零额度行不该报成缺渠道号")
 }
@@ -1049,11 +1080,54 @@ func TestRowCostReasonFirstUseNoChannelTable(t *testing.T) {
 	rows := [][]string{
 		{"m1", "Codex", "1", "1", "45000", `{"group_ratio":0.4}`, "2", "101"},
 	}
-	// known 为 nil = 还没拉过渠道清单。
-	counts, missing, _ := CountRowCostReasons(headers, rows, map[int]float64{}, nil)
+	// 还没拉过渠道清单。
+	counts, missing, _ := CountRowCostReasons(headers, rows, map[int]float64{})
 	assert.Equal(t, 1, counts[SkipNoUpstreamRatio])
-	assert.Zero(t, counts[SkipUnknownChannel])
 	assert.Equal(t, []int{101}, missing, "要能被提示去补录")
+}
+
+// TestLogGroupKeys 取日志里的原始分组名：去重、升序、跳过空值。
+//
+// 用手工折扣的键就是它（AggRow.KeyGroup），所以取值口径必须与出账一致——
+// 差一点（比如带上倍率后缀）就会变成「页面上填了、出账时认不出」。
+func TestLogGroupKeys(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		{"m1", "Codex", "1", "1", "1", `{}`, "2", "101"},
+		{"m2", "AZ", "1", "1", "1", `{}`, "2", "102"},
+		{"m3", "Codex", "1", "1", "1", `{}`, "2", "101"},
+		{"m4", "", "1", "1", "1", `{}`, "2", "101"},
+	}
+	assert.Equal(t, []string{"AZ", "Codex"}, LogGroupKeys(headers, rows),
+		"去重、升序、空分组名跳过")
+
+	// 没有 group 列时返回 nil，而不是报错——这份日志做不了折扣检查，
+	// 调用方据此提示，不必把它当异常。
+	assert.Nil(t, LogGroupKeys([]string{"model_name"}, rows))
+}
+
+// TestMissingGroupDiscounts 挑出还没维护线下折扣的分组。
+//
+// 这是「使用自定义折扣」预检的判据：非空就拦下让用户补，
+// 而不是出一张一半按线下、一半按反推的账单。
+func TestMissingGroupDiscounts(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		{"m1", "Codex", "1", "1", "1", `{}`, "2", "101"},
+		{"m2", "AZ", "1", "1", "1", `{}`, "2", "102"},
+		{"m3", "anti", "1", "1", "1", `{}`, "2", "103"},
+	}
+	manual := map[string]float64{"AZ": 0.6}
+
+	assert.Equal(t, []string{"Codex", "anti"}, MissingGroupDiscounts(headers, rows, manual))
+
+	// 全维护好了就不拦。
+	full := map[string]float64{"AZ": 0.6, "Codex": 0.45, "anti": 0.5}
+	assert.Empty(t, MissingGroupDiscounts(headers, rows, full))
+
+	// 一条折扣都没维护时，所有分组都是缺的。
+	assert.Equal(t, []string{"AZ", "Codex", "anti"},
+		MissingGroupDiscounts(headers, rows, map[string]float64{}))
 }
 
 // TestDescribeSkipReasonsOrderStable 原因文案的顺序固定。
@@ -1066,9 +1140,8 @@ func TestDescribeSkipReasonsOrderStable(t *testing.T) {
 		string(SkipNoUpstreamRatio): 2,
 		string(SkipNoChannel):       3,
 		string(SkipMultiChannel):    4,
-		string(SkipUnknownChannel):  5,
 	}
-	want := "2 行渠道未维护上游倍率、5 行渠道不在本地清单里、3 行日志里取不到渠道号、" +
+	want := "2 行渠道未维护上游倍率、3 行日志里取不到渠道号、" +
 		"4 行一行经多个渠道无法分摊、1 行缺分组倍率（group_ratio）"
 	for i := 0; i < 10; i++ {
 		assert.Equal(t, want, DescribeSkipReasons(reasons), "多跑几次确保不受 map 顺序影响")

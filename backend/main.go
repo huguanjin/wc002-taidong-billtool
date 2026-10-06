@@ -808,6 +808,11 @@ type taskInput struct {
 	// 而 false 是用户明确取消勾选。用值类型的话两者分不开，
 	// 新建出来的计划会默认关掉成本核算——与「默认勾选」正好相反。
 	CheckCost *bool `json:"checkCost"`
+	// UseManualDiscount 用指针：false 是**有效值**（明确不套用线下折扣），
+	// 所以「没传这个字段」与「传了 false」必须区分开。用值类型的话，
+	// 老版本前端编辑一次计划就会把用户勾上的线下折扣悄悄取消——
+	// 而折扣直接决定收客户多少钱。与 CheckCost 同一个理由。
+	UseManualDiscount *bool `json:"useManualDiscount"`
 	// BillTemplate 用指针：空串是**有效值**（= 标准模板），所以「没传这个字段」
 	// 与「传了空串」必须区分开。否则老版本前端编辑一次计划，就会把用户选的
 	// 简易模板重置成标准模板——而且不会有任何提示。
@@ -857,6 +862,11 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.CheckCost != nil {
 		task.CheckCost = *in.CheckCost
+	}
+	// 没传就默认**不套用**线下折扣（新建计划的默认值）。
+	// 手工折扣是人工维护的一套数值，直接决定收款金额，不该默认生效。
+	if in.UseManualDiscount != nil {
+		task.UseManualDiscount = *in.UseManualDiscount
 	}
 	if in.BillTemplate != nil {
 		task.BillTemplate = strings.TrimSpace(*in.BillTemplate)
@@ -910,13 +920,16 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 模板同理：没传就保留库里的值，别把用户选的简易模板悄悄重置成标准模板。
 	// 成本核算开关一起处理：没传时若走默认值 true，会把用户明确取消的勾选又打开。
-	if in.BillTemplate == nil || in.CheckCost == nil {
+	if in.BillTemplate == nil || in.CheckCost == nil || in.UseManualDiscount == nil {
 		if existing, err := billing.GetBillTask(*pgConfig, in.ID); err == nil {
 			if in.BillTemplate == nil {
 				task.BillTemplate = existing.BillTemplate
 			}
 			if in.CheckCost == nil {
 				task.CheckCost = existing.CheckCost
+			}
+			if in.UseManualDiscount == nil {
+				task.UseManualDiscount = existing.UseManualDiscount
 			}
 		}
 	}
@@ -1075,6 +1088,10 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 			one["ok"] = false
 			one["needsChannelRatios"] = true
 			one["channelCheck"] = res.channelCheck
+			// customerId 必须带上：就地补录线下折扣是按「客户 + 分组」存的，
+			// 页面没有客户 ID 就没法提交（见 saveBlockedDiscounts）。
+			one["customerId"] = res.task.CustomerID
+			one["customerName"] = res.task.CustomerName
 			results = append(results, one)
 			// 不计入 failCount：这不是失败，是等待用户输入。
 			continue
@@ -1479,7 +1496,7 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 	for _, c := range channelList {
 		knownIDs[c.ChannelID] = true
 	}
-	rowCounts, missingRatios, rowsPerChannel := billing.CountRowCostReasons(headers, rows, ratios, knownIDs)
+	rowCounts, missingRatios, rowsPerChannel := billing.CountRowCostReasons(headers, rows, ratios)
 	if rowCounts[billing.SkipNoUpstreamRatio] > 0 {
 		// 缺倍率的渠道要能在页面上就地补，所以补进 infoMap 供填写。
 		for _, id := range missingRatios {

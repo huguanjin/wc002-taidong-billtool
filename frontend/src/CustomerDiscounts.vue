@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 
 // 客户折扣维护：针对某个客户的某个分组，手工指定结算折扣。
 //
@@ -124,11 +124,39 @@ async function loadGroups() {
       return
     }
     saved.value = data.saved || []
-    groups.value = data.groups || []
-    syncDraft(groups.value)
-    if (!selectedLog.value && groups.value.length === 0) {
-      message.value = '该客户还没有维护任何手工折扣，选一份日志解析出分组后即可填写。'
+    const parsed = data.groups || []
+
+    // 没选日志时，把**已维护的折扣**直接摆出来供二次修改。
+    //
+    // 这一步是补一个真实的缺口：解析分组依赖一份日志，而日志是临时文件
+    // （dataDir 里的导出件会被清理）。日志没了，之前维护过的折扣在页面上
+    // 就完全看不见，也就无从修改——其实数据好好存在库里。
+    // 这类行的「自动折扣」「倍率」列留空（没有日志就算不出来），
+    // 所以模板里对它们只显示手工折扣与备注两列。
+    if (!selectedLog.value) {
+      groups.value = saved.value.map((r) => ({
+        groupKey: r.groupKey,
+        displayGroup: r.groupKey,
+        groupRatio: 0,
+        autoDiscount: null,
+        autoSource: '',
+        models: [],
+        rows: 0,
+        manualDiscount: r.discount,
+        note: r.note || '',
+        savedOnly: true,
+      }))
+      syncDraft(groups.value)
+      if (groups.value.length === 0) {
+        message.value = '该客户还没有维护任何手工折扣，选一份日志解析出分组后即可填写。'
+      } else {
+        message.value = `已维护 ${groups.value.length} 条手工折扣，可直接修改；选一份日志可同时看到自动折扣作对照。`
+      }
+      return
     }
+
+    groups.value = parsed
+    syncDraft(groups.value)
   } catch (err) {
     error.value = '解析失败：' + err.message
   } finally {
@@ -195,6 +223,12 @@ onMounted(() => {
   loadCustomers()
   loadLogFiles()
 })
+
+// 切换客户就拉一次已维护的折扣（不带日志）——用户打开页面第一件事通常是
+// 「看看这个客户现在填的是什么」，不该要求他先找一份日志。
+watch(selectedCustomer, (id) => {
+  if (id > 0) loadGroups()
+})
 </script>
 
 <template>
@@ -258,8 +292,12 @@ onMounted(() => {
         <tr v-for="g in groups" :key="g.groupKey" :class="{ 'row-maintained': hasManual(g), 'row-unsaved': isDirty(g) }">
           <td class="left">{{ g.displayGroup }}</td>
           <td>{{ g.groupRatio || '—' }}</td>
-          <td>{{ fmtDiscount(g.autoDiscount) }}</td>
-          <td class="left source">{{ g.autoSource }}</td>
+          <!-- savedOnly（没选日志、只是把库里已维护的摆出来）时自动折扣算不出来：
+               它依赖日志的分组倍率与金额。写明「选日志后可见」而不是显示一个 0 或 —，
+               否则会被读成「这个分组自动折扣是 0」。 -->
+          <td v-if="g.savedOnly" class="hint">选日志后可见</td>
+          <td v-else>{{ fmtDiscount(g.autoDiscount) }}</td>
+          <td class="left source">{{ g.savedOnly ? '—' : g.autoSource }}</td>
           <td>
             <input
               v-model="discountDraft[g.groupKey]"
@@ -269,7 +307,7 @@ onMounted(() => {
             />
           </td>
           <td><input v-model="noteDraft[g.groupKey]" type="text" placeholder="如 9月线下谈定" /></td>
-          <td class="left models">{{ g.models.join('、') }}</td>
+          <td class="left models">{{ g.savedOnly ? '—' : g.models.join('、') }}</td>
         </tr>
       </tbody>
     </table>
@@ -277,7 +315,10 @@ onMounted(() => {
       该日志里没有解析出分组，确认这份日志是否包含 group 列。
     </span>
     <span class="hint" v-else-if="!selectedCustomer">先选择一个客户。</span>
-    <span class="hint" v-else-if="!selectedLog">选择一份日志后点「解析分组」，即可看到该客户各分组的折扣现状。</span>
+    <span class="hint" v-else-if="!selectedLog">
+      上面是该客户**已维护的**手工折扣（直接读库，不需要日志，可直接改）。
+      选一份日志后点「解析分组」，还能看到各分组的自动反推折扣作对照。
+    </span>
   </div>
 </template>
 

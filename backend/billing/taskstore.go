@@ -47,6 +47,15 @@ type BillTask struct {
 	// 这个决定「要不要保证成本算得对」。有的客户不需要成本表，但出账的人仍然想知道
 	// 这一期的成本——那时只勾这个、不勾 GenerateCost。
 	CheckCost bool `json:"checkCost"`
+	// UseManualDiscount 是否应用该客户手工维护的「分组 → 折扣」。
+	//
+	// 手工折扣指线下谈定、没同步到 new-api 分组倍率里的那些（见 CustomerGroupDiscountMap）。
+	// 勾上后账单按线下折扣出，缺哪个分组就拦下让用户就地补。
+	//
+	// 默认**不勾**（新建计划时为 false）：折扣直接决定收客户多少钱，
+	// 不该在用户没明确表态时自动套用一套人工维护的数值。
+	// 但老计划迁移时默认 true——见 EnsureBillTaskSchema 里那条 ALTER 的说明。
+	UseManualDiscount bool `json:"useManualDiscount"`
 	// BillTemplate 出账模板（见 BillTemplateStandard / BillTemplateSimple）。
 	//
 	// 空串 = 标准模板，与加这个字段之前的行为一致。存在计划上而不是全局设置里，
@@ -174,6 +183,7 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 			generate_sanitized BOOLEAN NOT NULL DEFAULT true,
 			generate_cost BOOLEAN NOT NULL DEFAULT true,
 			check_cost BOOLEAN NOT NULL DEFAULT true,
+			use_manual_discount BOOLEAN NOT NULL DEFAULT false,
 			bill_template TEXT NOT NULL DEFAULT '',
 			settle_cny DOUBLE PRECISION,
 			list_cny DOUBLE PRECISION,
@@ -211,6 +221,16 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 		// 成本核算开关：默认 true（对应「默认勾选」）。老计划加列后自动变为勾选，
 		// 与 generate_cost 同样的默认值——两者都是「默认就该做成本核算」的语义。
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS check_cost BOOLEAN NOT NULL DEFAULT true`,
+		// 自定义折扣开关。**迁移默认值取 true，而新建时的默认值是 false**，两者刻意不同：
+		//
+		//   迁移（老计划）：加这列之前，手工折扣是无条件生效的（taskrun 每次都读）。
+		//     若这里也取 false，所有已维护过折扣的客户下次跑就悄悄换成按倍率反推的价，
+		//     金额变了却没有任何提示——那是比多算一笔更严重的事。
+		//   新建（新计划）：默认不勾，见 BillTask.UseManualDiscount 的说明。
+		//
+		// 迁移只在这一列**首次**加进来时生效，之后建的计划走 CREATE 的 DEFAULT false，
+		// 所以两者不会互相覆盖。
+		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS use_manual_discount BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS run_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ`,
 		// 未执行的计划还没有金额，这几列必须可空。
@@ -267,11 +287,13 @@ func CreateBillTask(cfg PGConfig, t BillTask) (BillTask, error) {
 	err = db.QueryRow(`
 		INSERT INTO bill_export_tasks
 			(customer_id, customer_name, name, period_year, period_month,
-			 start_time, end_time, generate_sanitized, generate_cost, check_cost, bill_template)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			 start_time, end_time, generate_sanitized, generate_cost, check_cost,
+			 use_manual_discount, bill_template)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		RETURNING id, generated_at
 	`, t.CustomerID, t.CustomerName, t.Name, t.PeriodYear, t.PeriodMonth,
-		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost, t.BillTemplate,
+		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost,
+		t.UseManualDiscount, t.BillTemplate,
 	).Scan(&t.ID, &t.GeneratedAt)
 	if err != nil {
 		return BillTask{}, fmt.Errorf("新建账单计划失败: %w", err)
@@ -307,10 +329,12 @@ func UpdateBillTask(cfg PGConfig, t BillTask) error {
 			generate_sanitized = $7,
 			generate_cost = $8,
 			check_cost = $9,
-			bill_template = $10
+			use_manual_discount = $10,
+			bill_template = $11
 		WHERE id = $1
 	`, t.ID, t.Name, t.PeriodYear, t.PeriodMonth,
-		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost, t.BillTemplate)
+		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost,
+		t.UseManualDiscount, t.BillTemplate)
 	if err != nil {
 		return fmt.Errorf("保存账单计划失败: %w", err)
 	}
@@ -376,7 +400,8 @@ func GetBillTask(cfg PGConfig, id int64) (BillTask, error) {
 // 列顺序必须与 scanBillTasks 的 Scan 一一对应。
 const billTaskColumns = `
 	id, customer_id, customer_name, name, period_year, period_month,
-	start_time, end_time, generate_sanitized, generate_cost, check_cost, bill_template,
+	start_time, end_time, generate_sanitized, generate_cost, check_cost,
+	use_manual_discount, bill_template,
 	settle_cny, list_cny, overall_discount,
 	costed_settle_cny, cost_cny, profit_cny, cost_complete,
 	priced_rows, total_cost_rows, row_count,
@@ -392,7 +417,8 @@ func scanBillTasks(rows *sql.Rows) ([]BillTask, error) {
 		var settle, list, discount, costedSettle, cost, profit sql.NullFloat64
 		if err := rows.Scan(
 			&t.ID, &t.CustomerID, &t.CustomerName, &t.Name, &t.PeriodYear, &t.PeriodMonth,
-			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.CheckCost, &t.BillTemplate,
+			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.CheckCost,
+			&t.UseManualDiscount, &t.BillTemplate,
 			&settle, &list, &discount,
 			&costedSettle, &cost, &profit, &t.CostComplete,
 			&t.PricedRows, &t.TotalCostRows, &t.RowCount,

@@ -181,9 +181,13 @@ const (
 	SkipNoChannel CostSkipReason = "no_channel"
 	// SkipMultiChannel 一行经多个渠道，额度怎么分摊不明，不猜。
 	SkipMultiChannel CostSkipReason = "multi_channel"
-	// SkipUnknownChannel 渠道号在本地清单里查不到（业务库多半已删，填不了倍率）。
-	SkipUnknownChannel CostSkipReason = "unknown_channel"
-	// SkipNoUpstreamRatio 渠道在清单里，但还没维护上游倍率——**唯一能靠补录解决的一种**。
+	// SkipNoUpstreamRatio 该渠道还没维护上游倍率——**唯一能靠补录解决的一种**。
+	//
+	// 渠道在不在本地清单里**不单列一类**：倍率表以 channel_id 为主键，与清单无关，
+	// 所以两者的处置完全相同（填一个倍率）。当初拆成两类是个错误设计，
+	// 直接后果是「清单里没有」的渠道被排除在待补录清单之外（CountRowCostReasons
+	// 只为 SkipNoUpstreamRatio 收集渠道号），预检因此永不拦下、页面永不提示。
+	// 渠道名缺失与否由 ChannelIssue.Known 表达，与"要不要补录"无关。
 	SkipNoUpstreamRatio CostSkipReason = "no_upstream_ratio"
 	// SkipZeroDelta 这一行不改动额度（补扣/退款但金额为 0），对成本没有影响。
 	//
@@ -197,7 +201,7 @@ const (
 //
 // 出账与检查共用它的判据（见 CostSkipReason 的说明）。
 func RowCostReason(row []string, idxChannel int, hasChannelCol bool,
-	idxOther int, hasOtherCol bool, ratios map[int]float64, known map[int]bool,
+	idxOther int, hasOtherCol bool, ratios map[int]float64,
 	delta float64) (CostSkipReason, []int) {
 
 	ids := rowChannelIDs(row, idxChannel, hasChannelCol, idxOther, hasOtherCol)
@@ -215,16 +219,11 @@ func RowCostReason(row []string, idxChannel int, hasChannelCol bool,
 	if r, ok := ratios[ids[0]]; ok && r >= 0 {
 		return SkipNone, ids
 	}
-	// 有渠道号但没倍率。两种可能，判据只能是**渠道清单**：
+	// 有渠道号但没倍率——就这一种，去补倍率即可。
 	//
-	//	清单里有 → 只是还没填，补一下就能算成本（这是这个功能存在的意义）
-	//	清单里没有 → 业务库已硬删除，填不了，只能在账单上如实说明
-	//
-	// 不能靠「known 为空就当成未知」来省事：首次使用时清单本来就是空的，
-	// 那会把「还没填倍率」全报成「渠道不存在」，引导用户去补一个根本补不了的渠道。
-	if known != nil && !known[ids[0]] {
-		return SkipUnknownChannel, ids
-	}
+	// **不看渠道清单**：清单里有没有这个渠道，都不影响「能不能填倍率」，
+	// 因为倍率表的主键就是 channel_id（见 UpsertChannelRatios，它不校验清单）。
+	// 清单只决定页面上显示不显示得出渠道名。
 	return SkipNoUpstreamRatio, ids
 }
 
@@ -232,8 +231,8 @@ func RowCostReason(row []string, idxChannel int, hasChannelCol bool,
 //
 // **按行统计而不是按渠道**：一个渠道可能只在大批行里出现在少数几行上，
 // 只报渠道会让用户以为补了倍率就万事大吉，实际还有别的行因别的原因算不出来。
-func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float64,
-	known map[int]bool) (counts map[CostSkipReason]int, missingChannels []int, rowsPerChannel map[int]int) {
+func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float64) (
+	counts map[CostSkipReason]int, missingChannels []int, rowsPerChannel map[int]int) {
 
 	col := map[string]int{}
 	for i, h := range headers {
@@ -284,7 +283,7 @@ func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float
 		}
 
 		reason, ids := RowCostReason(row, idxChannel, hasChannelCol,
-			idxOther, hasOtherCol, ratios, known, delta)
+			idxOther, hasOtherCol, ratios, delta)
 		if reason == SkipNoUpstreamRatio && len(ids) == 1 {
 			rowsPerChannel[ids[0]]++
 			if !missingByChannel[ids[0]] {
@@ -323,6 +322,49 @@ func GroupChannelMap(usage map[int]*ChannelUsage) map[string][]int {
 	for _, id := range UsedChannelIDs(usage) {
 		for _, g := range usage[id].Groups {
 			out[g] = append(out[g], id)
+		}
+	}
+	return out
+}
+
+// LogGroupKeys 取日志里出现过的原始分组名（group 列原值），去重升序。
+//
+// 与 AggRow.KeyGroup 同一个取值口径——手工折扣就是按 KeyGroup 维护的，
+// 所以出账前能拿它来判断「这个客户的哪些分组还没填线下折扣」。
+func LogGroupKeys(headers []string, rows [][]string) []string {
+	idx, ok := columnIndex(headers, "group")
+	if !ok {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		g := strings.TrimSpace(cellAt(row, idx))
+		if g == "" || seen[g] {
+			continue
+		}
+		seen[g] = true
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// MissingGroupDiscounts 挑出日志里出现、但该客户还没维护线下折扣的分组。
+//
+// 只在「使用自定义折扣」勾选时才有意义：不勾的话手工折扣根本不参与出账，
+// 缺不缺都无所谓（报了反而让人以为有问题）。
+//
+// 与待补录渠道同一套哲学：缺了就拦下让用户就地填，而不是一半按线下折扣、
+// 一半按反推——同一张账单里两种折扣口径混着，客户核对时一定会问。
+func MissingGroupDiscounts(headers []string, rows [][]string, manual map[string]float64) []string {
+	var out []string
+	for _, g := range LogGroupKeys(headers, rows) {
+		if _, ok := manual[g]; !ok {
+			out = append(out, g)
 		}
 	}
 	return out
@@ -375,6 +417,9 @@ type ChannelCheckResult struct {
 	UncostableRows map[string]int `json:"uncostableRows,omitempty"`
 	// UncostableTotal 上面那张表的总和（不含 zero_delta）。
 	UncostableTotal int `json:"uncostableTotal"`
+	// MissingDiscountGroups 日志里出现、但该客户还没维护线下折扣的分组。
+	// 只在勾了「使用自定义折扣」时才有值；非空表示本次被拦下。
+	MissingDiscountGroups []string `json:"missingDiscountGroups,omitempty"`
 	// TotalRows 日志数据行数，供页面显示「检查了多少行」。
 	TotalRows int `json:"totalRows"`
 	// NoChannelInfo 这份日志里一个渠道号都没有——渠道检查做不了。

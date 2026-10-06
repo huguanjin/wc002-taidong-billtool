@@ -534,9 +534,9 @@ func TestExportQueryEndIsInclusive(t *testing.T) {
 // 「结束于 09-29 00:00:00」会被标成 09-28，与实际导出内容不符。
 func TestExportFilenameUsesGivenDays(t *testing.T) {
 	cases := []struct {
-		name      string
-		start     string
-		end       string
+		name       string
+		start      string
+		end        string
 		wantPrefix string
 	}{
 		{"整段", "2026-09-01 00:00:00", "2026-09-30 23:59:59", "日志查询_2026-09-01_2026-09-30_"},
