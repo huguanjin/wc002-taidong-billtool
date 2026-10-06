@@ -71,6 +71,12 @@ func PreferPriceTableFor(source PriceSource) bool {
 // GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
 // dbPriceCachePath 是「拉取最新数据库价格」写出的本地 JSON 文件路径，出账时只读此文件，不连接数据库。
 func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, outputDir string, params Params) (*GenerateResult, error) {
+	// 简易账单在**读价表之前**分流：它完全不参与定价，价表缺失的部署也该能出这张表。
+	// 放到后面分流的话，一个没挂 price_table.xlsx 的环境会先在加载价表时失败。
+	if IsSimpleBillTemplate(params.BillTemplate) {
+		return generateSimpleBill(inputPath, outputDir, params)
+	}
+
 	book, exprSetting, err := loadBillingPriceBook(params, priceTablePath, dbPriceCachePath)
 	if err != nil {
 		return nil, err
@@ -178,6 +184,58 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 	}
 
 	return result, nil
+}
+
+// generateSimpleBill 简易账单（模板二）的出账路径。
+//
+// 与模板一的流程有本质区别：不读价表、不逐行定价、不反推折扣、不估成本，
+// 只把日志按 (分组, 模型) 汇总并把额度折算成金额。因此它也不产出成本利润表，
+// 且忽略 params.GenerateCost —— 那张表的前提是「每个渠道有上游倍率」，与本模板无关。
+func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateResult, error) {
+	headers, rows, err := LoadLogRows(inputPath, params.Sheet, params.Encoding)
+	if err != nil {
+		return nil, fmt.Errorf("读取日志失败: %w", err)
+	}
+
+	summaryRows, err := AggregateSimpleBill(rows, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	stem := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+	billPath := filepath.Join(outputDir, withCustomerSuffix(simpleOutputName(stem), params.CustomerName)+".xlsx")
+	if err := WriteSimpleBill(billPath, summaryRows, "简易账单"); err != nil {
+		return nil, fmt.Errorf("写出简易账单失败: %w", err)
+	}
+
+	// 汇总脱敏日志：与账单同一张表（客户已确认列一致）。走同一个写出函数，
+	// 两张表的内容天然一致——各写一份迟早会走偏。
+	var sanitizedPath string
+	if params.SanitizedLog {
+		sanitizedPath = filepath.Join(outputDir, withCustomerSuffix(simpleSanitizedName(stem), params.CustomerName)+".xlsx")
+		if err := WriteSimpleBill(sanitizedPath, summaryRows, "汇总明细"); err != nil {
+			return nil, fmt.Errorf("写出汇总脱敏日志失败: %w", err)
+		}
+	}
+
+	totals := SumSimpleBill(summaryRows)
+
+	// 摘要只填最小集：模板二没有刊例与折扣，前端结果区的「总金额」用它，
+	// 「综合折扣」留 0（模板二不打折，显示成 1.0 会让人以为真有个折扣）。
+	// 逐行明细刻意留空：这张表给的就是汇总，把汇总行塞进「明细」表反而让人以为
+	// 中间每一步的 token 都能在这里查到。
+	summary := Summary{
+		SettleCNYTotal:  totals.TotalCostCNY,
+		ListCNYTotal:    totals.TotalCostCNY,
+		OverallDiscount: 0,
+		RowCount:        len(summaryRows),
+	}
+
+	return &GenerateResult{
+		BillPath:      billPath,
+		SanitizedPath: sanitizedPath,
+		Summary:       summary,
+	}, nil
 }
 
 // generateCostTable 生成成本利润表。若有渠道还没维护倍率，**不报错中断**，而是返回
@@ -374,8 +432,32 @@ func sanitizedFormatInfo(format string) (ext string, delimiter rune, isDelimited
 	}
 }
 
-// attachLogSheet 把原始日志作为「日志查询」工作表附加到账单文件末尾。
-// 行数超过 ExcelMaxRowsPerSheet 时自动拆分到「日志查询_2」「日志查询_3」……多个 sheet。
+// simpleOutputName 简易账单的文件名：「日志查询_xxx」→「账单二_xxx」。
+//
+// 与模板一的「账单_xxx」刻意区分开：同一 job 目录里可能两种口径并存
+// （比如对比核查），同名会互相覆盖，而且覆盖后光看文件名分不出是哪一种。
+func simpleOutputName(stem string) string {
+	if strings.Contains(stem, "日志查询") {
+		return strings.Replace(stem, "日志查询", "账单二", 1)
+	}
+	if strings.Contains(stem, "日志") {
+		return strings.Replace(stem, "日志", "账单二", 1)
+	}
+	return stem + "_账单二"
+}
+
+// simpleSanitizedName 简易账单配套的汇总脱敏日志文件名。
+func simpleSanitizedName(stem string) string {
+	if strings.Contains(stem, "日志查询") {
+		return strings.Replace(stem, "日志查询", "脱敏日志二", 1)
+	}
+	if strings.Contains(stem, "日志") {
+		return strings.Replace(stem, "日志", "脱敏日志二", 1)
+	}
+	return stem + "_脱敏日志二"
+}
+
+// attachLogSheet 把原始日志作为「日志查询」工作表附加到账单文件末尾。// 行数超过 ExcelMaxRowsPerSheet 时自动拆分到「日志查询_2」「日志查询_3」……多个 sheet。
 func attachLogSheet(billPath string, headers []string, rows [][]string) error {
 	f, err := excelize.OpenFile(billPath)
 	if err != nil {

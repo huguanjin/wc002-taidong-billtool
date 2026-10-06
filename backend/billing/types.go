@@ -3,6 +3,7 @@ package billing
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -196,6 +197,18 @@ func NewPriceBook() *PriceBook {
 // PriceSource 模型单价来源：内置官方价 / 人工维护报价表(xlsx) / 业务数据库实时。
 type PriceSource string
 
+// 出账模板标识。
+const (
+	// BillTemplateStandard 模板一：29 列明细账单。空值等同于此。
+	BillTemplateStandard = "standard"
+	// BillTemplateSimple 模板二：按 (分组, 模型) 汇总的简易账单，金额 = 额度 / 500000。
+	BillTemplateSimple = "simple"
+)
+
+// IsSimpleBillTemplate 是否走简易账单模板。空值按标准模板处理。
+func IsSimpleBillTemplate(t string) bool {
+	return strings.TrimSpace(t) == BillTemplateSimple
+}
 const (
 	PriceSourceOfficial   PriceSource = "official"
 	PriceSourcePriceTable PriceSource = "price_table"
@@ -210,6 +223,14 @@ type ManualPriceInput struct {
 
 // Params 一次出账请求的参数，对应 log_to_bill.py 的命令行参数。
 type Params struct {
+	// BillTemplate 出账模板：空 / BillTemplateStandard = 模板一（29 列明细，
+	// 刊例 × 折扣、带脱敏日志与成本利润表）；BillTemplateSimple = 模板二
+	// （按分组+模型的汇总，金额直接取 quota 折算，不参与定价）。
+	//
+	// 留空即模板一是刻意的：老的计划任务与前端缓存里都没有这个字段，
+	// 默认值必须是「与改动前完全一致」的那一个。
+	BillTemplate string
+
 	Month             int     // 0 表示未指定，从日志推断
 	Year              int     // 0 表示未指定，从日志推断
 	Discount          *float64 // nil 表示不强制，按分组自动反推

@@ -804,6 +804,10 @@ type taskInput struct {
 	EndAt             string `json:"endAt"`
 	GenerateSanitized bool   `json:"generateSanitized"`
 	GenerateCost      bool   `json:"generateCost"`
+	// BillTemplate 用指针：空串是**有效值**（= 标准模板），所以「没传这个字段」
+	// 与「传了空串」必须区分开。否则老版本前端编辑一次计划，就会把用户选的
+	// 简易模板重置成标准模板——而且不会有任何提示。
+	BillTemplate *string `json:"billTemplate"`
 }
 
 // handleSaveBillTask 新建或编辑一条账单计划。
@@ -843,6 +847,9 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 		Name:              strings.TrimSpace(in.Name),
 		GenerateSanitized: in.GenerateSanitized,
 		GenerateCost:      in.GenerateCost,
+	}
+	if in.BillTemplate != nil {
+		task.BillTemplate = strings.TrimSpace(*in.BillTemplate)
 	}
 
 	if hasStart && hasEnd {
@@ -890,6 +897,12 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 		task.EndTime = existing.EndTime
 		task.PeriodYear = existing.PeriodYear
 		task.PeriodMonth = existing.PeriodMonth
+	}
+	// 模板同理：没传就保留库里的值，别把用户选的简易模板悄悄重置成标准模板。
+	if in.BillTemplate == nil {
+		if existing, err := billing.GetBillTask(*pgConfig, in.ID); err == nil {
+			task.BillTemplate = existing.BillTemplate
+		}
 	}
 	if err := billing.UpdateBillTask(*pgConfig, task); err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
@@ -1535,6 +1548,8 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 
 	form := r.MultipartForm.Value
 	params := billing.Params{ExchangeRate: billing.DefaultExchangeRate, SanitizedLog: true}
+	// 出账模板：空值等同标准模板，老前端不带这个字段时行为与改动前一致。
+	params.BillTemplate = formValue(form, "billTemplate")
 	if v := formValue(form, "month"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			params.Month = n
@@ -1581,7 +1596,12 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 	// 成本利润表：勾选时从本地 PG 装载渠道倍率与渠道名。
 	// 不在这里做「有没有未维护渠道」的判断——那件事需要先读日志里的渠道集合，
 	// 由 billing.GenerateBill 在解析完日志后统一检查，避免把日志读两遍。
-	params.GenerateCost = formValue(form, "generateCost") == "true"
+	//
+	// 简易账单（模板二）不产出成本利润表，这里直接不置位：它的金额来自站点额度，
+	// 与上游成本无关。不跳过的话，只是想出一张简易账单的用户会被要求先配 PostgreSQL，
+	// 而他根本用不到渠道倍率。
+	params.GenerateCost = !billing.IsSimpleBillTemplate(params.BillTemplate) &&
+		formValue(form, "generateCost") == "true"
 	if params.GenerateCost {
 		if pgConfig == nil {
 			httpError(w, http.StatusBadRequest, "生成成本利润表需要先配置 PostgreSQL（BILL_PG_*）并拉取渠道清单")

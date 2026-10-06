@@ -68,7 +68,10 @@ func validateOneTask(t BillTask, customers map[int64]Customer, channelRatios map
 	// 勾了成本利润表但没有维护任何渠道倍率：执行下去会被整表拦下，
 	// 白导一次日志。这里提前说清楚——但只在**一个都没维护**时才拦，
 	// 部分维护的情况照常执行（未维护的行会在成本表里留空并标注）。
-	if t.GenerateCost && len(channelRatios) == 0 {
+	//
+	// 简易账单不产成本利润表，这条校验对它不适用：它不读渠道倍率，
+	// 拦下来等于让一个本可执行的任务白等。taskrun 那边也是同样的条件。
+	if t.GenerateCost && !IsSimpleBillTemplate(t.BillTemplate) && len(channelRatios) == 0 {
 		return "勾选了生成成本利润表，但还没有维护任何渠道上游倍率；" +
 			"请先到「渠道成本倍率」页拉取渠道并维护倍率，或取消该勾选"
 	}

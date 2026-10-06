@@ -244,6 +244,9 @@ const form = ref({
   exchangeRate: 7,
   discount: '',
   priceSource: 'db',
+  // billTemplate：'' = 标准明细账单（29 列），'simple' = 简易汇总账单
+  // （按分组+模型汇总，金额直接取日志额度折算，不查价表）。
+  billTemplate: '',
   sanitizedLog: true,
   sanitizedFormat: 'tsv',
   includeBillingParams: false,
@@ -383,6 +386,11 @@ async function copyCostSummary() {
 function selectCostSummary() {
   selectElementText(costSummaryRef.value)
 }
+
+// isSimpleTemplate 选了简易汇总账单。简易模板不参与定价，所以与定价有关的
+// 表单项（折扣、单价来源、手工补价、渠道倍率、成本利润表、计费参数列）
+// 对它都没有意义 —— 藏着而不是禁用，避免用户对着一个永远不生效的选项发问。
+const isSimpleTemplate = computed(() => form.value.billTemplate === 'simple')
 
 const hasMissingPrice = computed(
   () => result.value && result.value.summary.missingPriceModels && result.value.summary.missingPriceModels.length > 0
@@ -821,6 +829,7 @@ async function handleSubmit() {
   if (form.value.exchangeRate !== '') fd.append('exchangeRate', String(form.value.exchangeRate))
   if (form.value.discount !== '') fd.append('discount', String(form.value.discount))
   fd.append('priceSource', form.value.priceSource)
+  fd.append('billTemplate', form.value.billTemplate)
   fd.append('sanitizedLog', String(form.value.sanitizedLog))
   fd.append('sanitizedFormat', form.value.sanitizedFormat)
   fd.append('includeBillingParams', String(form.value.includeBillingParams))
@@ -1233,6 +1242,18 @@ async function handleSubmit() {
         <span class="hint">相对路径基于服务器配置的浏览根目录（BILL_BROWSE_ROOT），也可填写该目录下的绝对路径</span>
       </div>
 
+      <div class="field">
+        <label>账单模板</label>
+        <select v-model="form.billTemplate">
+          <option value="">标准明细账单（按 token 明细出账，含单价、折扣与结算额）</option>
+          <option value="simple">简易汇总账单（按分组+模型汇总，金额取日志额度折算）</option>
+        </select>
+        <span class="hint" v-if="isSimpleTemplate">
+          简易账单不做定价：金额 = 日志额度 ÷ 500000，与站点实收一致。
+          因此上面的折扣、单价来源、计费参数列都不参与，也不会生成成本利润表。
+        </span>
+      </div>
+
       <div class="grid">
         <div class="field">
           <label>账期月份</label>
@@ -1246,13 +1267,13 @@ async function handleSubmit() {
           <label>汇率（美元→人民币）</label>
           <input v-model="form.exchangeRate" type="number" step="0.01" />
         </div>
-        <div class="field">
+        <div class="field" v-if="!isSimpleTemplate">
           <label>强制统一折扣（可选）</label>
           <input v-model="form.discount" type="number" step="0.001" placeholder="留空则按分组自动反推" />
         </div>
       </div>
 
-      <div class="field">
+      <div class="field" v-if="!isSimpleTemplate">
         <label>国产/站内定价标识（可选）</label>
         <span class="hint">
           勾选的分组不参与折扣反推，折扣改取站点实际计费倍率，并在账单备注里要求人工确认；
@@ -1281,7 +1302,7 @@ async function handleSubmit() {
           placeholder="补充：模型名前缀，多个用逗号分隔（如 doubao,ernie）"
         />
       </div>
-      <div class="field">
+      <div class="field" v-if="!isSimpleTemplate">
         <label>模型单价来源</label>
         <select v-model="form.priceSource">
           <option value="official">内置官方价（覆盖不到的模型自动回退报价表）</option>
@@ -1308,7 +1329,7 @@ async function handleSubmit() {
         </span>
       </div>
 
-      <div class="card" v-if="priceCheckDone && exprModels.length > 0">
+      <div class="card" v-if="!isSimpleTemplate && priceCheckDone && exprModels.length > 0">
         <h3>阶梯表达式定价的模型（{{ exprModels.length }}）</h3>
         <p class="hint">
           这些模型的价格由 option 表的 billing_expr 表达式算出，刊例价与单价均取自表达式，
@@ -1328,7 +1349,7 @@ async function handleSubmit() {
         </table>
       </div>
 
-      <div class="card" v-if="priceCheckDone && missingModels.length > 0">
+      <div class="card" v-if="!isSimpleTemplate && priceCheckDone && missingModels.length > 0">
         <h3>缺少定价的模型（{{ missingModels.length }} / {{ checkedModelCount }}）</h3>
         <p class="hint">可在下方手动填写单价（$/MTok）补全；留空的模型仍按现有规则处理（无价则总金额/结算美金为 0）。</p>
         <table>
@@ -1356,17 +1377,27 @@ async function handleSubmit() {
 
       <div class="field" v-if="form.sanitizedLog">
         <label>脱敏日志格式</label>
-        <select v-model="form.sanitizedFormat">
-          <option value="xlsx">xlsx（单表最多约 104 万行，超出会自动拆分多个 sheet）</option>
-          <option value="csv">csv（纯文本，无行数上限，适合超大日志）</option>
-          <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
-        </select>
-        <label><input v-model="form.includeBillingParams" type="checkbox" /> 附带计费参数列（模型/分组倍率等内部参数，默认不导出）</label>
-        <label><input v-model="form.generateCost" type="checkbox" /> 生成成本利润表（账单全部列 + 渠道/上游折扣/上游成本，需先维护渠道倍率）</label>
+        <!-- 简易账单的汇总日志固定 xlsx：它就是一张要和账单并排看的表，
+             纯文本格式（csv/tsv）在这里没有意义。 -->
+        <template v-if="isSimpleTemplate">
+          <span class="hint">
+            简易账单的脱敏日志与账单是同一张汇总表（xlsx），列含分组、模型、次数、
+            输入/输出 Token、额度与金额，可直接交给客户核对。
+          </span>
+        </template>
+        <template v-else>
+          <select v-model="form.sanitizedFormat">
+            <option value="xlsx">xlsx（单表最多约 104 万行，超出会自动拆分多个 sheet）</option>
+            <option value="csv">csv（纯文本，无行数上限，适合超大日志）</option>
+            <option value="tsv">tsv（纯文本，无行数上限，适合超大日志）</option>
+          </select>
+          <label><input v-model="form.includeBillingParams" type="checkbox" /> 附带计费参数列（模型/分组倍率等内部参数，默认不导出）</label>
+          <label><input v-model="form.generateCost" type="checkbox" /> 生成成本利润表（账单全部列 + 渠道/上游折扣/上游成本，需先维护渠道倍率）</label>
+        </template>
       </div>
 
       <!-- 出账前预检渠道倍率：避免生成完账单才发现有渠道没维护 -->
-      <div class="field">
+      <div class="field" v-if="!isSimpleTemplate">
         <label>渠道成本倍率</label>
         <span class="hint">
           勾选「生成成本利润表」后，建议先点检查：它会读一遍当前日志，列出里面用到的渠道，
@@ -1456,7 +1487,11 @@ async function handleSubmit() {
         含缓存行：{{ fmtNum(result.summary.cacheHitRows) }} ｜
         含 web_search 行：{{ fmtNum(result.summary.webSearchRows) }}
       </p>
-      <p>
+      <p v-if="isSimpleTemplate">
+        账单金额合计：¥{{ fmtMoney(result.summary.settleCnyTotal) }} ｜
+        汇总行数：{{ fmtNum(result.summary.rowCount) }}
+      </p>
+      <p v-else>
         结算人民币合计：¥{{ fmtMoney(result.summary.settleCnyTotal) }} ｜
         总金额人民币合计：¥{{ fmtMoney(result.summary.listCnyTotal) }} ｜
         综合折扣：{{ result.summary.overallDiscount.toFixed(3) }}
@@ -1508,7 +1543,9 @@ async function handleSubmit() {
           result.unknownChannelIds.join('，')
         }}）——这些渠道多半已在业务库被删除，无法维护倍率，成本利润表里对应的成本列会留空。
       </p>
-      <table>
+      <!-- 简易账单不展示逐行明细：它的产物本身就是汇总表，
+           这里再列一张空表只会让人以为明细丢了。 -->
+      <table v-if="!isSimpleTemplate">
         <thead>
           <tr>
             <th>模型</th>

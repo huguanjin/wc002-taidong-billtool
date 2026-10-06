@@ -168,6 +168,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		IncludeBillingParams: settings.IncludeBillingParams,
 		DomesticMarkers:      settings.DomesticMarkerList(),
 		GenerateCost:         task.GenerateCost,
+		BillTemplate:         task.BillTemplate,
 		SummaryHeader:        summaryHeader(customer, start, end),
 		// 产物文件名带上客户名：一个 job 目录里可能同时躺着好几个客户的表，
 		// 下载到本地后全叫「账单_xxx.xlsx」就分不清了。
@@ -175,7 +176,10 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	}
 
 	// 成本利润表需要渠道上游倍率；从本地 PG 读好传进去（billing 的算账逻辑不连 PG）。
-	if task.GenerateCost {
+	//
+	// 简易账单不产出成本利润表，直接不装载：白读两次 PG，而且一旦渠道表有问题
+	// （比如没拉过清单）会连一张本来不需要渠道数据的汇总账单都跑不出来。
+	if task.GenerateCost && !IsSimpleBillTemplate(task.BillTemplate) {
 		ratios, err := ChannelRatioMap(deps.PG)
 		if err != nil {
 			return nil, err

@@ -39,6 +39,9 @@ const planForm = ref({
   endAt: '',
   generateSanitized: true,
   generateCost: true,
+  // 出账模板：'' = 标准明细账单，'simple' = 简易汇总账单。
+  // 存在计划上而不是全局设置里：同一个部署里两类客户都可能存在。
+  billTemplate: '',
 })
 
 // 勾选与批量执行结果
@@ -224,6 +227,7 @@ function resetPlanForm() {
     endAt: '',
     generateSanitized: planForm.value.generateSanitized,
     generateCost: planForm.value.generateCost,
+    billTemplate: planForm.value.billTemplate,
   }
 }
 
@@ -241,6 +245,7 @@ function startEditPlan(t) {
     endAt: t.endAt || '',
     generateSanitized: !!t.generateSanitized,
     generateCost: !!t.generateCost,
+    billTemplate: t.billTemplate || '',
   }
   window.scrollTo({ top: 0, behavior: 'smooth' })
 }
@@ -272,6 +277,7 @@ async function savePlan() {
         endAt: planForm.value.endAt,
         generateSanitized: planForm.value.generateSanitized,
         generateCost: planForm.value.generateCost,
+        billTemplate: planForm.value.billTemplate,
       }),
     })
     const data = await resp.json()
@@ -632,9 +638,23 @@ defineExpose({ loadAll })
         <button type="button" class="btn-browse" @click="applyPreset('today')">今天</button>
       </div>
 
+      <div class="field">
+        <label>账单模板</label>
+        <select v-model="planForm.billTemplate">
+          <option value="">标准明细账单（按 token 明细出账，含单价、折扣与结算额）</option>
+          <option value="simple">简易汇总账单（按分组+模型汇总，金额取日志额度折算）</option>
+        </select>
+        <span class="hint" v-if="planForm.billTemplate === 'simple'">
+          简易账单不做定价：金额 = 日志额度 ÷ 500000。不生成成本利润表，
+          脱敏日志也是同一张汇总表。
+        </span>
+      </div>
+
       <div class="checkboxes">
         <label><input v-model="planForm.generateSanitized" type="checkbox" /> 生成脱敏日志</label>
-        <label><input v-model="planForm.generateCost" type="checkbox" /> 生成成本利润表</label>
+        <label v-if="planForm.billTemplate !== 'simple'">
+          <input v-model="planForm.generateCost" type="checkbox" /> 生成成本利润表
+        </label>
       </div>
 
       <div class="path-row">
@@ -730,6 +750,7 @@ defineExpose({ loadAll })
           </th>
           <th>计划</th>
           <th>客户</th>
+          <th>模板</th>
           <th>时段</th>
           <th>账期</th>
           <th>状态</th>
@@ -746,6 +767,7 @@ defineExpose({ loadAll })
           </td>
           <td class="name">{{ t.name || '（未命名）' }}</td>
           <td>{{ t.customerName }}</td>
+          <td>{{ t.billTemplate === 'simple' ? '简易汇总' : '标准明细' }}</td>
           <td>{{ rangeLabel(t) }}</td>
           <td>{{ periodLabel(t) }}</td>
           <td>
