@@ -777,8 +777,43 @@ async function continueAfterFix() {
 // 两种模板给的摘要不同：标准模板是成本利润摘要（要成本表算出来才有值），
 // 简易模板是账单摘要（金额来自站点实收额度）。空串表示这次没有可复制的内容——
 // 比如标准模板但成本表被渠道倍率拦下了，此时不显示复制框，而不是显示一个空框。
+//
+// 两处来源：刚执行完的读本次响应（billSummary / costSummary），
+// 历史任务读库里存的 task.summaryText（见后端 BillTask.SummaryText）。
+// 后者是关键——产物只有 6 小时寿命，而结算人员往往是事后才要这段文字，
+// 只认响应的话「关掉页面就再也拿不回来」。
 function summaryText(r) {
-  return r.billSummary || r.costSummary || ''
+  return r.billSummary || r.costSummary || r.summaryText || ''
+}
+
+// storedSummaries 已执行、且库里存了摘要的任务，按 taskId 索引，供计划列表展开显示。
+const storedSummaries = computed(() => {
+  const out = {}
+  for (const t of tasks.value) {
+    if (t.summaryText) out[t.id] = t.summaryText
+  }
+  return out
+})
+
+// expandedSummary 当前在计划列表里展开了摘要的任务 ID；0 表示都没展开。
+const expandedSummary = ref(0)
+
+function toggleSummary(t) {
+  expandedSummary.value = expandedSummary.value === t.id ? 0 : t.id
+}
+
+// 展开区里复制，与执行结果区共用同一套状态与降级逻辑。
+async function copyStored(t) {
+  const state = await copyText(storedSummaries.value[t.id] || '')
+  copyStates.value = { ...copyStates.value, [t.id]: state }
+  if (state === 'fail') {
+    selectElementText(summaryEls.get('stored-' + t.id))
+  }
+  setTimeout(() => {
+    const next = { ...copyStates.value }
+    delete next[t.id]
+    copyStates.value = next
+  }, 2000)
 }
 
 // 复制一条成功结果的摘要。
@@ -1294,6 +1329,31 @@ defineExpose({ loadAll })
             <button type="button" class="btn-link" @click="runOne(t)" :disabled="running">执行</button>
             <button type="button" class="btn-link" @click="startEditPlan(t)">编辑</button>
             <button type="button" class="btn-link danger" @click="deletePlan(t)">删除</button>
+            <!-- 摘要存在库里，所以事后（超过 6 小时、产物已清理）也能拿回来，
+                 这正是这个入口存在的理由。 -->
+            <button
+              type="button"
+              class="btn-link"
+              v-if="storedSummaries[t.id]"
+              @click="toggleSummary(t)"
+            >
+              {{ expandedSummary === t.id ? '收起摘要' : '查看摘要' }}
+            </button>
+          </td>
+        </tr>
+        <!-- 展开行：摘要文字 + 复制按钮。用 tr 包一层 td colspan 而不是塞进操作列，
+             否则多行的摘要会把那一列的宽度撑得没法看。 -->
+        <tr v-if="storedSummaries[t.id] && expandedSummary === t.id" :key="'stored-' + t.id">
+          <td colspan="12" class="stored-summary-cell">
+            <div class="cost-summary">
+              <div class="cost-summary-head">
+                <strong>{{ t.name || t.customerName }} 摘要</strong>
+                <button type="button" class="btn-browse" @click="copyStored(t)">
+                  {{ copyStates[t.id] === 'ok' ? '已复制 ✓' : copyStates[t.id] === 'fail' ? '复制失败，请手动选中' : '复制' }}
+                </button>
+              </div>
+              <pre :ref="(el) => setSummaryEl(el, 'stored-' + t.id)" class="cost-summary-text">{{ storedSummaries[t.id] }}</pre>
+            </div>
           </td>
         </tr>
       </tbody>
@@ -1491,6 +1551,10 @@ defineExpose({ loadAll })
   padding: 2px 6px;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+.stored-summary-cell {
+  padding: 8px 12px 12px;
+  background: #fafafa;
 }
 
 .path-row {

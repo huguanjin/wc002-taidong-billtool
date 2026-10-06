@@ -256,6 +256,12 @@ func buildLogExportQuery(table string, params LogExportParams, hasChannelID bool
 // 日期取起止时刻本身，不做任何偏移：区间是双闭的，EndTime 已经是最后一个
 // 算在内的时刻，减一秒会把「结束于某天 00:00:00」错标成前一天。
 //
+// **必须先 .In(cstLocation) 再格式化**。时刻从库里读回来时带的是 UTC
+// （timestamptz 经 pgx 出来就是 UTC），直接 Format 会按 UTC 的日历日取名：
+// 北京时间 9/1 00:00:00 是 UTC 8/31 16:00，于是「9月账单」的文件名写成
+// 2026-08-31_2026-09-30。结束日恰好不受影响（23:59:59 CST = 当天 15:59:59 UTC），
+// 所以这个 bug 的表现是**只有起始日往前差一天**，很容易被当成手误而不是时区问题。
+//
 // 末尾的账号指纹是必需的，不是装饰：同一时间段给不同客户导出时，
 // 只按日期命名会得到完全相同的文件名，而落盘走的是 os.Rename——
 // 后一次导出会**静默覆盖**前一次的文件，数据直接丢，且没有任何提示。
@@ -264,7 +270,8 @@ func buildLogExportQuery(table string, params LogExportParams, hasChannelID bool
 // 含「日志查询」字样，出账时 defaultOutputName 会据此把名字换成「账单」。
 func ExportLogFileName(params LogExportParams) string {
 	return fmt.Sprintf("日志查询_%s_%s_%s.tsv",
-		params.StartTime.Format("2006-01-02"), params.EndTime.Format("2006-01-02"),
+		params.StartTime.In(cstLocation).Format("2006-01-02"),
+		params.EndTime.In(cstLocation).Format("2006-01-02"),
 		exportFingerprint(params))
 }
 

@@ -3,6 +3,9 @@ package billing
 import (
 	"encoding/json"
 	"math"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +14,97 @@ import (
 )
 
 func fptr(v float64) *float64 { return &v }
+
+// TestBillTaskColumnsMatchSchema 列清单与建表语句必须一致。
+//
+// 为什么值得用源码级检查：加一个字段要同时改六处（CREATE、migrations、
+// billTaskColumns、scanBillTasks、CreateBillTask 的 INSERT、UpdateBillTask 的 UPDATE），
+// **漏一处不会编译报错**——INSERT 少一列只是位错位、scan 少一个目标会运行时报错，
+// 而列名写错则是查询期才炸。这类错误一旦上生产就是「保存了但读不出来」。
+//
+// 这里只查最容易漏的一半：billTaskColumns 里的每个列名都必须真的建出来了。
+// 扫不出 SQL 占位符的个数（那要解析语句），但列名对不上是最常见的那一种。
+func TestBillTaskColumnsMatchSchema(t *testing.T) {
+	src, err := os.ReadFile("taskstore.go")
+	require.NoError(t, err)
+	text := string(src)
+
+	// 取 billTaskColumns 常量里的列名。
+	colMatch := regexp.MustCompile(`(?s)billTaskColumns = ` + "`" + `(.*?)` + "`").FindStringSubmatch(text)
+	require.NotNil(t, colMatch, "没能从源码里取到 billTaskColumns")
+	var columns []string
+	for _, part := range strings.Split(colMatch[1], ",") {
+		if name := strings.TrimSpace(part); name != "" {
+			columns = append(columns, name)
+		}
+	}
+	require.NotEmpty(t, columns)
+
+	// 建表语句里的列名 + 迁移里 ADD COLUMN 补上的列名，
+	// 两者合起来才是这个表实际的列集合（migrations 是加列的唯一手段之一）。
+	inSchema := map[string]bool{}
+	createMatch := regexp.MustCompile(`(?s)CREATE TABLE IF NOT EXISTS bill_export_tasks \((.*?)\n\s*\)`).FindStringSubmatch(text)
+	require.NotNil(t, createMatch, "没能从源码里取到建表语句")
+	for _, line := range strings.Split(createMatch[1], "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "--") {
+			continue
+		}
+		// 形如 "id BIGSERIAL PRIMARY KEY," —— 第一个词就是列名。
+		fields := strings.Fields(line)
+		if len(fields) > 0 {
+			name := strings.TrimSuffix(fields[0], ",")
+			if regexp.MustCompile(`^[a-z_][a-z0-9_]*$`).MatchString(name) {
+				inSchema[name] = true
+			}
+		}
+	}
+	for _, m := range regexp.MustCompile(`ADD COLUMN IF NOT EXISTS ([a-z_][a-z0-9_]*)`).FindAllStringSubmatch(text, -1) {
+		inSchema[m[1]] = true
+	}
+
+	for _, c := range columns {
+		assert.True(t, inSchema[c],
+			"billTaskColumns 里的 %q 在建表语句或迁移里都不存在——查询会直接报错", c)
+	}
+
+	// 反向：建出来的列如果不在 billTaskColumns 里，通常是加了字段却忘了查它。
+	// 这条只做提示性的软检查（有列不在查询清单里是允许的，比如 customer_id 就在
+	// 查询里、但某些仅供写入的列可能故意不查），所以不作为失败。
+	var notQueried []string
+	for name := range inSchema {
+		found := false
+		for _, c := range columns {
+			if c == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			notQueried = append(notQueried, name)
+		}
+	}
+	if len(notQueried) > 0 {
+		t.Logf("提示：以下列未出现在 billTaskColumns 里（若确实不需要读出，可忽略）：%v", notQueried)
+	}
+}
+
+// TestBillTaskSummaryTextRoundTrip 摘要文字要能经 JSON 往返回前端。
+//
+// 这个字段是给人复制到邮件里的，含换行与中文；一旦被转义坏掉，
+// 复制出来的东西就没法直接用了。
+func TestBillTaskSummaryTextRoundTrip(t *testing.T) {
+	text := "客户：阿来lianglaiyang@163.com\n账期：2026-09\n上游成本：¥36.9743\n注：金额为站点实际扣费额度 ÷ 500000"
+	task := BillTask{ID: 1, SummaryText: text}
+
+	b, err := json.Marshal(task)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "summaryText", "字段名要对上前端读的键")
+
+	var back BillTask
+	require.NoError(t, json.Unmarshal(b, &back))
+	assert.Equal(t, text, back.SummaryText, "换行与中文必须原样往返")
+}
 
 // runAt 造一个「已执行过」的计划所需的时间戳。
 func runAt() *time.Time {

@@ -560,6 +560,31 @@ func TestExportFilenameUsesGivenDays(t *testing.T) {
 	}
 }
 
+// TestExportFileNameUsesBeijingDateNotUTC 起始日必须按北京时间取，不能按 UTC。
+//
+// 现场 bug：计划任务的时段是「2026-09-01 00:00:00 ~ 2026-09-30 23:59:59」，
+// 下载下来的账单文件名却是 2026-08-31_2026-09-30。
+//
+// 成因：计划上的时段从 PostgreSQL 读回来时带的是 UTC（timestamptz 经 pgx 出来就是 UTC）。
+// 北京时间 9/1 00:00:00 = UTC 8/31 16:00:00，裸 Format 就写成了 8/31。
+// 而结束时刻 23:59:59 CST = 当天 15:59:59 UTC，日期不变——所以症状是
+// **只有起始日往前差一天**，容易被当成手误而不是时区问题。
+//
+// 这里显式用 UTC Location 构造，模拟「从库里读回来」的那一刻。
+func TestExportFileNameUsesBeijingDateNotUTC(t *testing.T) {
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, cstLocation).UTC()
+	end := time.Date(2026, 9, 30, 23, 59, 59, 0, cstLocation).UTC()
+
+	require.Equal(t, "UTC", start.Location().String(), "这个用例的意义就在于 Location 是 UTC")
+
+	got := ExportLogFileName(LogExportParams{
+		Usernames: []string{"lianglaiyang@163.com"}, StartTime: start, EndTime: end,
+	})
+	assert.True(t, strings.HasPrefix(got, "日志查询_2026-09-01_2026-09-30_"),
+		"起始日要按北京时间取（09-01），实际 %q", got)
+	assert.NotContains(t, got, "2026-08-31", "不得出现 UTC 的 08-31")
+}
+
 // TestExportFileNameDistinguishesAccounts 同名覆盖回归。
 //
 // 修复前文件名只有日期段：同一时间段给不同客户导出会得到完全相同的名字，

@@ -83,9 +83,16 @@ type BillTask struct {
 	ProfitCNY *float64 `json:"profitCny"`
 	// CostComplete 为假表示有渠道没维护倍率，成本只覆盖了一部分行，
 	// 此时的利润**不是整体毛利**，页面必须说明。
-	CostComplete  bool `json:"costComplete"`
-	PricedRows    int  `json:"pricedRows"`
-	TotalCostRows int  `json:"totalCostRows"`
+	CostComplete bool `json:"costComplete"`
+	// SummaryText 最近一次执行生成的可复制文字（成本利润摘要或账单摘要）。
+	//
+	// 为什么必须落库：原先它只在本次 HTTP 响应里返回，而产物文件只有 6 小时寿命，
+	// 于是「关掉页面 / 过了 6 小时」这段文字就再也拿不回来了——而结算人员
+	// 恰恰是**事后**才要把它粘进邮件或聊天里发给客户的。数字早就在库里
+	// （结算额/成本/利润），没道理文字反而不存。
+	SummaryText   string `json:"summaryText"`
+	PricedRows    int    `json:"pricedRows"`
+	TotalCostRows int    `json:"totalCostRows"`
 
 	RowCount    int        `json:"rowCount"`  // 源日志行数
 	LogPath     string     `json:"logPath"`   // 源日志（在 dataDir，可见可手动清理）
@@ -192,6 +199,7 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 			cost_cny DOUBLE PRECISION,
 			profit_cny DOUBLE PRECISION,
 			cost_complete BOOLEAN NOT NULL DEFAULT false,
+		summary_text TEXT NOT NULL DEFAULT '',
 			priced_rows INTEGER NOT NULL DEFAULT 0,
 			total_cost_rows INTEGER NOT NULL DEFAULT 0,
 			row_count INTEGER NOT NULL DEFAULT 0,
@@ -231,6 +239,9 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 		// 迁移只在这一列**首次**加进来时生效，之后建的计划走 CREATE 的 DEFAULT false，
 		// 所以两者不会互相覆盖。
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS use_manual_discount BOOLEAN NOT NULL DEFAULT true`,
+		// 可复制摘要：加这列之前跑过的任务留空串，页面显示「重新执行后可生成」
+		// 而不是当作「这次没有摘要」——后者会让人以为账单本来就不带这段文字。
+		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS summary_text TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS run_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ`,
 		// 未执行的计划还没有金额，这几列必须可空。
@@ -403,7 +414,7 @@ const billTaskColumns = `
 	start_time, end_time, generate_sanitized, generate_cost, check_cost,
 	use_manual_discount, bill_template,
 	settle_cny, list_cny, overall_discount,
-	costed_settle_cny, cost_cny, profit_cny, cost_complete,
+	costed_settle_cny, cost_cny, profit_cny, cost_complete, summary_text,
 	priced_rows, total_cost_rows, row_count,
 	log_path, job_id, run_count, last_run_at, generated_at`
 
@@ -420,7 +431,7 @@ func scanBillTasks(rows *sql.Rows) ([]BillTask, error) {
 			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.CheckCost,
 			&t.UseManualDiscount, &t.BillTemplate,
 			&settle, &list, &discount,
-			&costedSettle, &cost, &profit, &t.CostComplete,
+			&costedSettle, &cost, &profit, &t.CostComplete, &t.SummaryText,
 			&t.PricedRows, &t.TotalCostRows, &t.RowCount,
 			&t.LogPath, &t.JobID, &t.RunCount, &lastRun, &t.GeneratedAt,
 		); err != nil {
@@ -480,17 +491,18 @@ func SaveBillTaskResult(cfg PGConfig, t BillTask) error {
 			cost_cny = $7,
 			profit_cny = $8,
 			cost_complete = $9,
-			priced_rows = $10,
-			total_cost_rows = $11,
-			row_count = $12,
-			log_path = $13,
-			job_id = $14,
+			summary_text = $10,
+			priced_rows = $11,
+			total_cost_rows = $12,
+			row_count = $13,
+			log_path = $14,
+			job_id = $15,
 			run_count = run_count + 1,
 			last_run_at = now()
 		WHERE id = $1
 	`, t.ID, t.CustomerName,
 		t.SettleCNY, t.ListCNY, t.OverallDiscount,
-		t.CostedSettleCNY, t.CostCNY, t.ProfitCNY, t.CostComplete,
+		t.CostedSettleCNY, t.CostCNY, t.ProfitCNY, t.CostComplete, t.SummaryText,
 		t.PricedRows, t.TotalCostRows, t.RowCount,
 		t.LogPath, t.JobID)
 	if err != nil {

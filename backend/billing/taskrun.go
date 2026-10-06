@@ -145,7 +145,8 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	// 而不是生成一张全是 0 的账单让他自己发现。
 	if exported.RowCount == 0 {
 		return nil, fmt.Errorf("客户「%s」在 %s ~ %s 没有消费记录（已按 %d 个账号查询）",
-			customer.Name, start.Format("2006-01-02"), end.Format("2006-01-02"), len(usernames))
+			customer.Name, start.In(cstLocation).Format("2006-01-02"),
+			end.In(cstLocation).Format("2006-01-02"), len(usernames))
 	}
 
 	// 两个预检都要读一遍日志，这里做一次惰性加载共享结果。
@@ -369,6 +370,15 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	task.RowCount = int(exported.RowCount)
 	task.LogPath = exported.Path
 	task.CustomerName = customer.Name // 刷新冗余快照，客户改过名的话跟上
+
+	// 可复制摘要一并落库：两种模板只会有一段，谁非空存谁。
+	//
+	// 不能存两列（成本摘要 + 账单摘要）：它们互斥，存两列就要在每个读取点
+	// 各判一次「该看哪个」，漏一处就显示成空白或显示成另一种口径的文字。
+	task.SummaryText = gen.BillSummary
+	if task.SummaryText == "" {
+		task.SummaryText = gen.CostSummary
+	}
 
 	// 只有成本利润表真的生成出来了，才有成本口径可落。
 	// 被拦下（渠道倍率没维护）时三个成本字段保持 nil，页面据此显示「未核算成本」——
