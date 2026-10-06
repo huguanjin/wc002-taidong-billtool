@@ -76,21 +76,32 @@ type SimpleBillRow struct {
 	SkipReasons map[string]int `json:"skipReasons,omitempty"`
 }
 
-// SimpleBillColumns 模板二的列名，账单与汇总脱敏日志共用同一套（客户已确认两者列一致）。
+// SimpleBillColumns 模板二**客户版**的列名：账单与脱敏日志都是这七列。
+//
+// 成本三列（官方刊例 / 上游成本 / 利润）不在其中，它们只出现在独立的成本表里
+// （见 SimpleBillCostColumns）。这是有意的边界：
+//
+//	客户拿到的任何文件里都不该有我们的采购价与单笔毛利。
+//
+// 起初这三列是加在账单上的，靠「发出去之前自己删列」来兜——但那要求人永远不忘、
+// 且逐列看清删对了，风险与收益不对等。挪进单独的成本表后，客户版文件里
+// **根本不存在**这些列，不需要靠自觉。
 var SimpleBillColumns = []string{
+	"分组", "模型", "次数", "输入Token", "输出Token", "额度", "金额（人民币）",
+}
+
+// SimpleBillCostColumns 成本表的列名：客户版的七列 + 成本三列。
+var SimpleBillCostColumns = []string{
 	"分组", "模型", "次数", "输入Token", "输出Token", "额度", "金额（人民币）",
 	"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）",
 }
 
-// SimpleBillCostColumns 成本三列的下标区间（0 基，闭区间）：官方刊例 / 上游成本 / 利润。
+// SimpleBillCostColFirst 成本三列在成本表里的起始下标（0 基）。
 //
-// 抽出来是因为「哪些列是成本列」在四处要用：表头样式、合计行、表末备注、
-// 前端摘要。写死成 7/8/9 散在各处，将来加一列就会漏改一两处，
+// 抽出来是因为「哪些列是成本列」在四处要用：表头、合计行、表末备注、列宽。
+// 写死成 7/8/9 散在各处，将来加一列就会漏改一两处，
 // 而漏改的表现是**金额串列**——最不容易一眼看出来的那种错。
-const (
-	SimpleBillCostColFirst = 7
-	SimpleBillCostColLast  = 9
-)
+const SimpleBillCostColFirst = 7
 
 // SimpleBillOptions 模板二的算法开关与运行时输入。
 //
@@ -501,14 +512,26 @@ func columnIndex(headers []string, name string) (int, bool) {
 	return 0, false
 }
 
+// SimpleBillWriteOptions 写出模板二时的开关。
+type SimpleBillWriteOptions struct {
+	// CostTable 写出成本表（客户版七列 + 成本三列）而不是客户版账表。
+	//
+	// **只有成本表为 true**：账单、脱敏日志都是 false，两者列完全相同。
+	// 成本三列是站点的内部数据（采购价与单笔毛利），客户拿到的任何文件里都不该有；
+	// 挪进单独的成本表后，客户版文件里根本不存在这些列，
+	// 不需要靠「发出去之前记得删列」来兜——那要求人永远不忘。
+	CostTable bool
+}
+
 // WriteSimpleBill 写出模板二的表。
 //
-// 账单与汇总脱敏日志共用这一个函数：两者的列完全相同（客户已确认），
+// 客户版账表（账单、脱敏日志）与成本表共用这一个函数，靠 opts 区分列集合：
 // 各写一份迟早会随时间走偏——那时同一笔账的两张表会对不上。
+// 列集合的差别见 SimpleBillWriteOptions.CostTable。
 //
-// 表头写在代码里而不是读模板文件：列是固定的七列，且没有任何一张现成的模板可复用；
+// 表头写在代码里而不是读模板文件：列是固定的，且没有任何一张现成的模板可复用；
 // 从零建表比让部署方多维护一个二进制模板文件可靠（漏挂文件的报错很难自解释）。
-func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error {
+func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts SimpleBillWriteOptions) error {
 	f := excelize.NewFile()
 	defer f.Close()
 
@@ -522,6 +545,14 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		return fmt.Errorf("设置工作表名失败: %w", err)
 	}
 	sheet := f.GetSheetName(0)
+
+	// 本次要写的列：成本表多三列，客户版账表就是七列。
+	columns := SimpleBillColumns
+	var costCols []int // 成本三列的 1 基列号，客户版为空
+	if opts.CostTable {
+		columns = SimpleBillCostColumns
+		costCols = []int{8, 9, 10}
+	}
 
 	styleHeader, err := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}})
 	if err != nil {
@@ -553,22 +584,19 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		return a
 	}
 
-	header := make([]interface{}, len(SimpleBillColumns))
-	for i, h := range SimpleBillColumns {
+	header := make([]interface{}, len(columns))
+	for i, h := range columns {
 		header[i] = h
 	}
 	if err := f.SetSheetRow(sheet, "A1", &header); err != nil {
 		return err
 	}
-	for i := range SimpleBillColumns {
+	for i := range columns {
 		if err := f.SetCellStyle(sheet, axis(i+1, 1), axis(i+1, 1), styleHeader); err != nil {
 			return err
 		}
 	}
 
-	// 成本三列的样式按单列分别设：列数固定十列，若用循环写区间，
-	// 将来插一列就会连样式一起串位。
-	costStyles := []int{styleMoney, styleMoney, styleMoney}
 	costPartial := false // 有任何一行没算出成本，就不写成本列的合计
 
 	// 数据从第 2 行开始：这张表没有模板里那种「第二行写说明」的约定，
@@ -577,16 +605,18 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 	for i, r := range rows {
 		row := firstDataRow + i
 		values := []interface{}{r.Group, r.Model, r.HitCount, r.TotalPrompt, r.TotalCompletion, r.TotalQuota, r.TotalCostCNY}
-		// 成本列**先补齐成空串**再逐格赋值：SetSheetRow 收的是一个定长切片，
-		// 少给几格会让后面的列整体左移。空串与「没写」在 Excel 里都是空单元格。
-		values = append(values, "", "", "")
-		if r.CostPartial || (r.TotalRows > 0 && r.CostRows == 0) {
-			costPartial = true
-		}
-		costVals := []*float64{r.OfficialListUSD, r.UpstreamCostCNY, r.ProfitCNY}
-		for j, v := range costVals {
-			if v != nil {
-				values[SimpleBillCostColFirst+j] = *v
+		if opts.CostTable {
+			if r.CostPartial || (r.TotalRows > 0 && r.CostRows == 0) {
+				costPartial = true
+			}
+			// 成本列**先补齐成空串**再逐格赋值：SetSheetRow 收的是一个定长切片，
+			// 少给几格会让后面的列整体左移。空串与「没写」在 Excel 里都是空单元格。
+			values = append(values, "", "", "")
+			costVals := []*float64{r.OfficialListUSD, r.UpstreamCostCNY, r.ProfitCNY}
+			for j, v := range costVals {
+				if v != nil {
+					values[SimpleBillCostColFirst+j] = *v
+				}
 			}
 		}
 		if err := f.SetSheetRow(sheet, axis(1, row), &values); err != nil {
@@ -600,9 +630,9 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		if err := f.SetCellStyle(sheet, axis(7, row), axis(7, row), styleMoney); err != nil {
 			return err
 		}
-		for j, st := range costStyles {
-			col := SimpleBillCostColFirst + j + 1 // 列号是 1 基
-			if err := f.SetCellStyle(sheet, axis(col, row), axis(col, row), st); err != nil {
+		// 成本三列的样式逐列指定（而不是写区间）：将来插一列不会连样式一起串位。
+		for _, col := range costCols {
+			if err := f.SetCellStyle(sheet, axis(col, row), axis(col, row), styleMoney); err != nil {
 				return err
 			}
 		}
@@ -633,13 +663,14 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 			{10, styleMoneyBold},     // 利润
 		}
 		for _, sc := range sumCols {
+			// 成本三列在客户版里根本不存在，自然不写合计。
+			isCostCol := sc.col > len(SimpleBillColumns)
+			if isCostCol && (!opts.CostTable || costPartial) {
+				continue
+			}
 			// 成本三列只要有行没算出来就不写合计：SUM 会**跳过空单元格**，
 			// 于是合计看起来是个正常数字，实际只加了有成本的那部分。
 			// 那比留空更糟——留空至少看得出来"没算"，一个偏小的合计看不出来。
-			isCostCol := sc.col >= SimpleBillCostColFirst+1 && sc.col <= SimpleBillCostColLast+1
-			if isCostCol && costPartial {
-				continue
-			}
 			letter, _ := excelize.ColumnNumberToName(sc.col)
 			formula := fmt.Sprintf("SUM(%s%d:%s%d)", letter, firstDataRow, letter, lastDataRow)
 			if err := f.SetCellFormula(sheet, axis(sc.col, totalRow), formula); err != nil {
@@ -653,7 +684,10 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 		// 成本算不全时在表末写一行说明。不写的话，收件人看到成本列是空的，
 		// 只会以为是漏填或程序出错；写清楚了才知道是"这几个渠道还没维护上游倍率"，
 		// 而且要去找谁补。这条说明与成本利润表末尾的处理一致。
-		if costPartial {
+		//
+		// 客户版不写这一行：它整张表都没有成本列，说明「哪些行没算成本」
+		// 既无对应列可看，又反过来透露了站内在算成本。
+		if costPartial && opts.CostTable {
 			noteRow := totalRow + 1
 			// 按原因分开写：只说"有 392 行没算"会让人去翻日志，
 			// 说清是渠道倍率还是分组倍率（或没有渠道号），用户直接知道去哪儿补。
@@ -681,7 +715,11 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string) error 
 
 	widths := map[string]float64{
 		"A": 20, "B": 28, "C": 10, "D": 16, "E": 16, "F": 16, "G": 16,
-		"H": 18, "I": 18, "J": 16,
+	}
+	if opts.CostTable {
+		widths["H"] = 18
+		widths["I"] = 18
+		widths["J"] = 16
 	}
 	for col, w := range widths {
 		if err := f.SetColWidth(sheet, col, col, w); err != nil {

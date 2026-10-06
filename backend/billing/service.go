@@ -227,18 +227,38 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 	}
 
 	stem := strings.TrimSuffix(filepath.Base(inputPath), filepath.Ext(inputPath))
+
+	// 三张表用的是**同一份 summaryRows**（行相同），差别只在列：
+	//
+	//	账单 / 脱敏日志	→ 客户版七列
+	//	成本表			→ 客户版七列 + 官方刊例 / 上游成本 / 利润
+	//
+	// 行共用是为了两张表天然对得上（各聚一次迟早走偏）；列分开是因为成本三列
+	// 是站点的采购价与单笔毛利，客户拿到的任何文件里都不该有。
+	// 起初这三列挂在账单上，靠「发之前自己删列」兜——那要求人永远不忘、还得逐列
+	// 看清删对了。挪进独立成本表后，客户版文件里**根本不存在**这些列。
 	billPath := filepath.Join(outputDir, withCustomerSuffix(simpleOutputName(stem), params.CustomerName)+".xlsx")
-	if err := WriteSimpleBill(billPath, summaryRows, "简易账单"); err != nil {
+	if err := WriteSimpleBill(billPath, summaryRows, "简易账单", SimpleBillWriteOptions{}); err != nil {
 		return nil, fmt.Errorf("写出简易账单失败: %w", err)
 	}
 
-	// 汇总脱敏日志：与账单同一张表（客户已确认列一致）。走同一个写出函数，
-	// 两张表的内容天然一致——各写一份迟早会走偏。
 	var sanitizedPath string
 	if params.SanitizedLog {
 		sanitizedPath = filepath.Join(outputDir, withCustomerSuffix(simpleSanitizedName(stem), params.CustomerName)+".xlsx")
-		if err := WriteSimpleBill(sanitizedPath, summaryRows, "汇总明细"); err != nil {
+		if err := WriteSimpleBill(sanitizedPath, summaryRows, "汇总明细", SimpleBillWriteOptions{}); err != nil {
 			return nil, fmt.Errorf("写出汇总脱敏日志失败: %w", err)
+		}
+	}
+
+	// 成本表：带成本三列，文件名由账单名推出（账单二_xxx → 成本二_xxx）。
+	//
+	// 只在勾了成本核算时出：没勾就没有成本口径，出一张成本列全空的表
+	// 比不出更让人困惑（看着像算错了）。
+	var costPath string
+	if params.CheckCost {
+		costPath = filepath.Join(outputDir, withCustomerSuffix(simpleCostName(stem), params.CustomerName)+".xlsx")
+		if err := WriteSimpleBill(costPath, summaryRows, "成本表", SimpleBillWriteOptions{CostTable: true}); err != nil {
+			return nil, fmt.Errorf("写出成本表失败: %w", err)
 		}
 	}
 
@@ -278,6 +298,7 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 	result := &GenerateResult{
 		BillPath:      billPath,
 		SanitizedPath: sanitizedPath,
+		CostPath:      costPath,
 		Summary:       summary,
 		BillSummary:   FormatSimpleBillSummary(summaryRows, totals, year, month, params.SummaryHeader),
 		// 成本覆盖情况一起交出去：摘要里要写「利润只覆盖了 N/M 行」，
@@ -628,6 +649,22 @@ func simpleOutputName(stem string) string {
 }
 
 // simpleSanitizedName 简易账单配套的汇总脱敏日志文件名。
+// simpleCostName 模板二成本表的文件名：账单二_xxx → 成本二_xxx。
+//
+// 沿用 simpleOutputName 那套「按前缀替换」的写法，而不是复用模板一的
+// costOutputPath（那是从「账单」推「成本利润」）。两者产物不同：
+// 模板一的成本表与账单同构（29 列 + 成本列），模板二的是汇总表（10 列）。
+// 名字上区分开，用户一眼能看出这是哪种成本表。
+func simpleCostName(stem string) string {
+	if strings.Contains(stem, "日志查询") {
+		return strings.Replace(stem, "日志查询", "成本二", 1)
+	}
+	if strings.Contains(stem, "日志") {
+		return strings.Replace(stem, "日志", "成本二", 1)
+	}
+	return stem + "_成本二"
+}
+
 func simpleSanitizedName(stem string) string {
 	if strings.Contains(stem, "日志查询") {
 		return strings.Replace(stem, "日志查询", "脱敏日志二", 1)

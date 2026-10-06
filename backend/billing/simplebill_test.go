@@ -199,7 +199,7 @@ func TestWriteSimpleBillLayout(t *testing.T) {
 		{Group: "Codex", Model: "gpt-5.5", HitCount: 3, TotalPrompt: 100, TotalCompletion: 10, TotalQuota: 45000, TotalCostCNY: 0.09},
 		{Group: "Codex", Model: "gpt-5.6", HitCount: 2, TotalPrompt: 200, TotalCompletion: 20, TotalQuota: 55000, TotalCostCNY: 0.11},
 	}
-	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
+	require.NoError(t, WriteSimpleBill(path, rows, "简易账单", SimpleBillWriteOptions{CostTable: true}))
 
 	f, err := excelize.OpenFile(path)
 	require.NoError(t, err)
@@ -241,7 +241,7 @@ func TestWriteSimpleBillLayout(t *testing.T) {
 func TestWriteSimpleBillEmptyNoTotalRow(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "空账单.xlsx")
-	require.NoError(t, WriteSimpleBill(path, nil, "简易账单"))
+	require.NoError(t, WriteSimpleBill(path, nil, "简易账单", SimpleBillWriteOptions{CostTable: true}))
 
 	f, err := excelize.OpenFile(path)
 	require.NoError(t, err)
@@ -853,6 +853,121 @@ func TestSimpleBillPartialCostTotalsCoveredAmount(t *testing.T) {
 		"覆盖不全时不得标成完整")
 }
 
+// TestSimpleBillHasNoCostColumns 客户版文件（账单 + 脱敏日志）都不得包含成本与利润。
+//
+// 这是个真实故障：模板二起初把成本三列直接加在账单上，账单与脱敏日志又共用
+// 同一个写出函数、同一份 summaryRows，于是客户下载到的任何一张表里都写着
+// 「上游成本」「利润」——那等于把我们的采购价和这一单赚多少一起交出去。
+//
+// 现在的口径：成本三列只出现在独立的成本表里（成本二_xxx.xlsx），
+// 账单与脱敏日志都是七列。这样客户版文件里**根本不存在**这些列，
+// 不需要靠「发之前记得删列」来兜——那要求人永远不忘、还得逐列看清删对了。
+//
+// 模板一从没有这个问题：它的脱敏日志由独立 writer 写出，从不含成本列
+// （见 excel_write.go 的 extras）。这里要求模板二对齐同一个口径。
+func TestSimpleBillHasNoCostColumns(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_aa.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	f := excelize.NewFile()
+	sh := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sh, "A1", &[]interface{}{
+		"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "other", "type", "channel_id", "created_at"}))
+	require.NoError(t, f.SetSheetRow(sh, "A2", &[]interface{}{
+		"m1", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	res, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate: BillTemplateSimple, CheckCost: true, SanitizedLog: true,
+		ChannelUpstreamRatios: map[int]float64{849: 0.4},
+		ChannelKnownIDs:       map[int]bool{849: true},
+		ExchangeRate:          7,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, res.SanitizedPath)
+
+	headerOf := func(p string) []string {
+		ff, err := excelize.OpenFile(p)
+		require.NoError(t, err)
+		defer ff.Close()
+		rows, err := ff.GetRows(ff.GetSheetName(0))
+		require.NoError(t, err)
+		require.NotEmpty(t, rows)
+		return rows[0]
+	}
+
+	// 账单：客户版七列，一个成本列都不许有。
+	billHeader := headerOf(res.BillPath)
+	assert.Equal(t, SimpleBillColumns, billHeader)
+	for _, banned := range []string{"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）"} {
+		assert.NotContains(t, billHeader, banned,
+			"客户版账单绝不能出现 %s —— 那是站内成本数据", banned)
+	}
+
+	// 脱敏日志：与账单完全同构。
+	sanitizedHeader := headerOf(res.SanitizedPath)
+	assert.Equal(t, billHeader, sanitizedHeader, "脱敏日志与账单列集合必须一致")
+
+	// 成本表：才是唯一带成本三列的地方，且行数与账单一致。
+	require.NotEmpty(t, res.CostPath, "勾了成本核算就要出成本表")
+	costHeader := headerOf(res.CostPath)
+	assert.Equal(t, SimpleBillCostColumns, costHeader, "成本表带成本三列")
+	assert.Contains(t, costHeader, "上游成本（人民币）")
+	assert.Contains(t, costHeader, "利润（人民币）")
+	assert.Contains(t, filepath.Base(res.CostPath), "成本二",
+		"成本表的文件名要与账单区分开，用户一眼能看出是哪种表")
+
+	// 三张表的行数应当一致（行相同、只是列不同）。
+	rowsOf := func(p string) int {
+		ff, err := excelize.OpenFile(p)
+		require.NoError(t, err)
+		defer ff.Close()
+		rows, err := ff.GetRows(ff.GetSheetName(0))
+		require.NoError(t, err)
+		return len(rows)
+	}
+	assert.Equal(t, rowsOf(res.BillPath), rowsOf(res.SanitizedPath),
+		"账单与脱敏日志的行应当一样，只是列不同")
+	assert.Equal(t, rowsOf(res.BillPath), rowsOf(res.CostPath),
+		"成本表也基于同一份汇总行")
+}
+
+// TestSimpleBillNoCostTableWhenUnchecked 没勾成本核算时不出成本表。
+//
+// 出一张成本列全空的表比不出更让人困惑——看着像算错了，用户还得去问。
+func TestSimpleBillNoCostTableWhenUnchecked(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_bb.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	f := excelize.NewFile()
+	sh := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sh, "A1", &[]interface{}{
+		"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "other", "type", "channel_id", "created_at"}))
+	require.NoError(t, f.SetSheetRow(sh, "A2", &[]interface{}{
+		"m1", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	res, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate: BillTemplateSimple,
+		CheckCost:    false, // 关掉成本核算
+		SanitizedLog: true,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, res.CostPath, "没开成本核算就不该出成本表")
+	// 账单照常出，只是没有成本口径。
+	assert.NotEmpty(t, res.BillPath)
+	_, statErr := os.Stat(res.BillPath)
+	assert.NoError(t, statErr)
+}
+
 // TestWriteSimpleBillCostColumns 成本三列写出来，合计行覆盖到利润列。
 func TestWriteSimpleBillCostColumns(t *testing.T) {
 	dir := t.TempDir()
@@ -864,17 +979,19 @@ func TestWriteSimpleBillCostColumns(t *testing.T) {
 			OfficialListUSD: &official, UpstreamCostCNY: &cost, ProfitCNY: &profit,
 			CostRows: 3, TotalRows: 3},
 	}
-	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
+	require.NoError(t, WriteSimpleBill(path, rows, "简易账单", SimpleBillWriteOptions{CostTable: true}))
 
 	f, err := excelize.OpenFile(path)
 	require.NoError(t, err)
 	defer f.Close()
 	sheet := f.GetSheetName(0)
 
-	assert.Equal(t, 10, len(SimpleBillColumns), "列数固定十列")
-	assert.Equal(t, "官方刊例（美金）", SimpleBillColumns[7])
-	assert.Equal(t, "上游成本（人民币）", SimpleBillColumns[8])
-	assert.Equal(t, "利润（人民币）", SimpleBillColumns[9])
+	// 成本表比客户版多三列；客户版**不含**这三列（见 TestSimpleBillHasNoCostColumns）。
+	assert.Equal(t, 7, len(SimpleBillColumns), "客户版固定七列")
+	assert.Equal(t, 10, len(SimpleBillCostColumns), "成本表十列")
+	assert.Equal(t, "官方刊例（美金）", SimpleBillCostColumns[7])
+	assert.Equal(t, "上游成本（人民币）", SimpleBillCostColumns[8])
+	assert.Equal(t, "利润（人民币）", SimpleBillCostColumns[9])
 
 	assert.InDelta(t, 1.8, ToFloat(simpleCell(t, f, sheet, 8, 2)), 1e-9)
 	assert.InDelta(t, 0.72, ToFloat(simpleCell(t, f, sheet, 9, 2)), 1e-9)
@@ -907,7 +1024,7 @@ func TestWriteSimpleBillCostPartialNoSum(t *testing.T) {
 			CostPartial: true, CostRows: 0, TotalRows: 2, SkippedQuota: 100000,
 			SkipReasons: map[string]int{string(SkipNoUpstreamRatio): 2}},
 	}
-	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
+	require.NoError(t, WriteSimpleBill(path, rows, "简易账单", SimpleBillWriteOptions{CostTable: true}))
 
 	f, err := excelize.OpenFile(path)
 	require.NoError(t, err)
@@ -946,7 +1063,7 @@ func TestWriteSimpleBillCostNoteDistinguishesReason(t *testing.T) {
 			CostPartial: true, CostRows: 0, TotalRows: 1,
 			SkipReasons: map[string]int{string(SkipNoGroupRatio): 1}},
 	}
-	require.NoError(t, WriteSimpleBill(path, rows, "简易账单"))
+	require.NoError(t, WriteSimpleBill(path, rows, "简易账单", SimpleBillWriteOptions{CostTable: true}))
 
 	f, err := excelize.OpenFile(path)
 	require.NoError(t, err)
