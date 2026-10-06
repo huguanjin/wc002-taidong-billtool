@@ -607,6 +607,18 @@ const blockedGrouped = computed(() => {
   return out
 })
 
+// blockedSkipNotices 每个被拦任务一条「还差什么、各多少行」的说明。
+//
+// 这里先把空说明滤掉，模板里就只用 v-for、不必再写 v-if。
+// **不能把 v-if 与 v-for 写在同一个元素上**（Vue 3 里 v-if 优先执行，
+// 此时循环变量还不存在，访问它会抛异常、整页卸载成白屏）——
+// 这个页面就因为这个白屏过一次，所以过滤一律放 computed 里做。
+const blockedSkipNotices = computed(() =>
+  blockedGrouped.value
+    .map((b) => ({ taskId: b.taskId, taskName: b.taskName, text: skipReasonText(b.channelCheck?.uncostableRows) }))
+    .filter((x) => x.text)
+)
+
 // blockedUnknownCount 全部被拦任务里「渠道清单里查不到」的渠道数。
 //
 // 这些渠道**照样能填倍率**（倍率表以 channel_id 为主键，与清单无关），
@@ -1082,9 +1094,8 @@ defineExpose({ loadAll })
       </p>
       <!-- 逐条列出「还差什么、各多少行」。只说总数会让人去翻日志，
            说清原因才知道是去补倍率还是去查导出方式。 -->
-      <p class="hint" v-for="b in blockedGrouped" :key="'why-' + b.taskId"
-         v-if="skipReasonText(b.channelCheck?.uncostableRows)">
-        {{ b.taskName }}：{{ skipReasonText(b.channelCheck?.uncostableRows) }}
+      <p class="hint" v-for="n in blockedSkipNotices" :key="'why-' + n.taskId">
+        {{ n.taskName }}：{{ n.text }}
       </p>
       <p class="hint" v-if="blockedUnknownCount > 0">
         有 {{ blockedUnknownCount }} 个渠道不在本地渠道清单里（多半是新加的，还没点过「拉取渠道清单」）。
