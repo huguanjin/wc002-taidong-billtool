@@ -1301,7 +1301,13 @@ defineExpose({ loadAll })
         </tr>
       </thead>
       <tbody>
-        <tr v-for="t in tasks" :key="t.id" :class="{ 'row-unrun': taskState(t) === 'unrun' }">
+        <!-- v-for 必须写在 <template> 上而不是那个 <tr> 上。
+             一个任务现在要渲染**两行**（数据行 + 可展开的摘要行），
+             若把 v-for 写在第一行上，第二行就是它的兄弟节点，
+             拿不到循环变量 t —— 访问 t.id 会在渲染期抛异常，整页白屏。
+             这也正是上一版的实际故障。 -->
+        <template v-for="t in tasks" :key="t.id">
+          <tr :class="{ 'row-unrun': taskState(t) === 'unrun' }">
           <td class="pick">
             <input type="checkbox" v-model="selectedTasks" :value="t.id" />
           </td>
@@ -1342,8 +1348,9 @@ defineExpose({ loadAll })
           </td>
         </tr>
         <!-- 展开行：摘要文字 + 复制按钮。用 tr 包一层 td colspan 而不是塞进操作列，
-             否则多行的摘要会把那一列的宽度撑得没法看。 -->
-        <tr v-if="storedSummaries[t.id] && expandedSummary === t.id" :key="'stored-' + t.id">
+             否则多行的摘要会把那一列的宽度撑得没法看。
+             它与上面那行同处一个 <template v-for> 里，所以 t 在作用域内。 -->
+        <tr v-if="storedSummaries[t.id] && expandedSummary === t.id">
           <td colspan="12" class="stored-summary-cell">
             <div class="cost-summary">
               <div class="cost-summary-head">
@@ -1356,6 +1363,7 @@ defineExpose({ loadAll })
             </div>
           </td>
         </tr>
+        </template>
       </tbody>
     </table>
     <span class="hint" v-else-if="!loading">
