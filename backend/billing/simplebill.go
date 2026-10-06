@@ -120,6 +120,11 @@ type SimpleBillOptions struct {
 	ExchangeRate float64
 }
 
+// Rate 取汇率，未设置时回退默认值。导出是因为调用方记录「本次实际用的汇率」
+// 时也要用同一个值（见 service.go 里写 CostTotals.RateCNYPerUSD），
+// 各算各的会出现「账单按 7 算、摘要里却写着 0」。
+func (o SimpleBillOptions) Rate() float64 { return o.rateOr() }
+
 // rateOr 取汇率，未设置时回退默认值。
 func (o SimpleBillOptions) rateOr() float64 {
 	if o.ExchangeRate > 0 {

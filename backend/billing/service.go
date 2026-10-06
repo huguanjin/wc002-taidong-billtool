@@ -214,13 +214,14 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 
 	// 成本列只在开了成本核算时才填（见 Params.CheckCost）。关掉时列还在、值为空——
 	// 列集合固定，否则同一份产物在两种开关下结构不同，下游脚本会莫名对不上。
-	summaryRows, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+	opts := SimpleBillOptions{
 		UpstreamRatios: params.ChannelUpstreamRatios,
 		KnownChannels:  params.ChannelKnownIDs,
 		CostColumns:    params.CheckCost,
 		// 汇率与模板一同一来源：两边的成本都经这一步换算，用不同的汇率会得出两个成本数。
 		ExchangeRate: params.ExchangeRate,
-	})
+	}
+	summaryRows, err := AggregateSimpleBill(rows, headers, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +275,7 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		RowCount:        len(summaryRows),
 	}
 
-	return &GenerateResult{
+	result := &GenerateResult{
 		BillPath:      billPath,
 		SanitizedPath: sanitizedPath,
 		Summary:       summary,
@@ -282,7 +283,49 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		// 成本覆盖情况一起交出去：摘要里要写「利润只覆盖了 N/M 行」，
 		// 而 totals 本身分不清「一行都没算」与「没开成本核算」。
 		SimpleCostStat: totals.Cost,
-	}, nil
+	}
+
+	// 成本合计也要挂进 CostTotals，否则计划列表里这两列永远显示「—」。
+	//
+	// 这是修一个真实故障：这个字段原先只有模板一那条路径会填（在
+	// generateCostTable 之后赋值），而模板二算出了成本与利润、摘要里也印出来了，
+	// 却因为落库那段代码是 `if gen.CostTotals != nil` 而被整个跳过——
+	// 结果是同一次执行，摘要写着「上游成本 ¥36.9743、利润 ¥22.479」，
+	// 计划列表却显示「未核算成本」，两处自相矛盾。
+	//
+	// 复用同一个结构体而不是给模板二另开一个落库分支：计划表的
+	// costed_settle_cny / cost_cny / profit_cny / cost_complete / priced_rows /
+	// total_rows 六列对两种模板是同一套语义，各自写一遍迟早会漂移。
+	if totals.UpstreamCostCNY != nil || totals.ProfitCNY != nil {
+		ct := CostTotals{
+			// 用 AmountCoveredCNY 而不是总金额：两者在有行没算成本时不相等，
+			// 而成本只覆盖了其中一部分，拿总金额去减会算出一个虚高的利润。
+			SettleCNY:    totals.AmountCoveredCNY,
+			CostCNY:      derefFloat(totals.UpstreamCostCNY),
+			ProfitCNY:    derefFloat(totals.ProfitCNY),
+			PricedRows:   totals.Cost.Rows,
+			TotalRows:    totals.Cost.TotalRows,
+			ChannelCount: 0, // 模板二不按渠道展开，这个数对它没有意义
+			// 用 opts.Rate() 而不是 params.ExchangeRate：后者可能是 0（未设置），
+			// 而实际算成本时用的是回退后的默认汇率。写 0 会让摘要里的美金换算失去依据。
+			RateCNYPerUSD: opts.Rate(),
+		}
+		result.CostTotals = &ct
+		// 与模板一同样挂进 Summary，让结果区与列表读同一份数。
+		result.Summary.CostTotals = &ct
+	}
+	return result, nil
+}
+
+// derefFloat 取指针的值，nil 当作 0。
+//
+// 只用在「已经确认过至少有一项非 nil」的地方（见上面的调用），
+// 所以不存在把「没有数据」误当成 0 的风险。
+func derefFloat(v *float64) float64 {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 // FormatSimpleBillSummary 生成简易账单那段可复制的文字。

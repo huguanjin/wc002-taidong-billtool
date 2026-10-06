@@ -751,6 +751,108 @@ func TestSimpleBillCostNoRowsNoTotal(t *testing.T) {
 	assert.Zero(t, totals.Cost.TotalRows)
 }
 
+// TestSimpleBillPersistsCostTotals 模板二必须把成本合计挂进 CostTotals。
+//
+// 这是修一个真实故障：CostTotals 原先只有模板一那条路径会填，
+// 而落库那段代码是 `if gen.CostTotals != nil`——于是同一次执行里，
+// 结果区摘要写着「上游成本 ¥36.9743、利润 ¥22.479」，计划列表却显示
+// 「未核算成本」，成本与利润两列永远是「—」，两处自相矛盾。
+//
+// 数字取自用户现场：阿来 9 月、12625 行、账单 ¥59.4533。
+func TestSimpleBillPersistsCostTotals(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_916ef38f.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	f := excelize.NewFile()
+	sheet := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sheet, "A1", &[]interface{}{
+		"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "other", "type", "channel_id", "created_at"}))
+	// 两个分组各一行，渠道都维护了倍率 → 成本算得出来。
+	// 刊例USD = quota / group_ratio / 500000，用整数 quota 让断言好读。
+	require.NoError(t, f.SetSheetRow(sheet, "A2", &[]interface{}{
+		"claude-opus-4-8", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SetSheetRow(sheet, "A3", &[]interface{}{
+		"claude-sonnet-5", "Codex", 1000, 100, 2000000, `{"group_ratio":0.4}`, 2, 1094, 1789430400}))
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	result, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate: BillTemplateSimple,
+		CheckCost:    true,
+		// 上游倍率都填 0.4，与汇率 7 相消，成本正好等于刊例 USD 的数值：
+		//   AZ    (9000000/1.8/5e5) × 7 × 0.4/7 = 10 × 0.4 = 4
+		//   Codex (2000000/0.4/5e5) × 7 × 0.4/7 = 10 × 0.4 = 4
+		ChannelUpstreamRatios: map[int]float64{849: 0.4, 1094: 0.4},
+		ChannelKnownIDs:       map[int]bool{849: true, 1094: true},
+		ExchangeRate:          7,
+	})
+	require.NoError(t, err)
+
+	require.NotNil(t, result.CostTotals,
+		"模板二算出了成本就必须挂 CostTotals，否则计划列表读不到、显示成「未核算成本」")
+
+	ct := result.CostTotals
+	// 账单金额 = (9000000+2000000)/500000 = 22
+	assert.InDelta(t, 22, ct.SettleCNY, 1e-6, "结算额 = 金额（模板二没有刊例×折扣这层）")
+	// 刊例USD 合计 = 10 + 10 = 20；成本 = 20 × 0.4 = 8
+	assert.InDelta(t, 8, ct.CostCNY, 1e-6)
+	assert.InDelta(t, 14, ct.ProfitCNY, 1e-6, "利润 = 结算额 − 成本")
+	assert.Equal(t, 2, ct.PricedRows)
+	assert.Equal(t, 2, ct.TotalRows)
+	assert.True(t, ct.PricedRows == ct.TotalRows, "全部行都算出来了，成本是完整的")
+	assert.InDelta(t, 7, ct.RateCNYPerUSD, 1e-9, "要记下本次实际用的汇率")
+
+	// 同一份数也要挂进 Summary，结果区与列表读的是同一个来源。
+	require.NotNil(t, result.Summary.CostTotals)
+	assert.InDelta(t, ct.CostCNY, result.Summary.CostTotals.CostCNY, 1e-9)
+}
+
+// TestSimpleBillPartialCostTotalsCoveredAmount 部分覆盖时，
+// CostTotals.SettleCNY 用「参与核算的金额」，不是账单总金额。
+//
+// 用总金额减去只覆盖一部分的成本，会算出一个虚高的利润——那正是
+// CostedSettleCNY 这个字段存在的理由。
+func TestSimpleBillPartialCostTotalsCoveredAmount(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "日志查询_2026-09-01_2026-09-30_aa11bb.xlsx")
+	outDir := filepath.Join(dir, "out")
+	require.NoError(t, os.MkdirAll(outDir, 0o755))
+
+	f := excelize.NewFile()
+	sheet := f.GetSheetName(0)
+	require.NoError(t, f.SetSheetRow(sheet, "A1", &[]interface{}{
+		"model_name", "group", "prompt_tokens", "completion_tokens",
+		"quota", "other", "type", "channel_id", "created_at"}))
+	// 渠道 849 有倍率；渠道 999 没有 → 后者的成本算不出来。
+	require.NoError(t, f.SetSheetRow(sheet, "A2", &[]interface{}{
+		"m1", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 849, 1789430400}))
+	require.NoError(t, f.SetSheetRow(sheet, "A3", &[]interface{}{
+		"m2", "AZ", 1000, 100, 9000000, `{"group_ratio":1.8}`, 2, 999, 1789430400}))
+	require.NoError(t, f.SaveAs(logPath))
+	require.NoError(t, f.Close())
+
+	result, err := GenerateBill(logPath, "", "", "", outDir, Params{
+		BillTemplate:          BillTemplateSimple,
+		CheckCost:             true,
+		ChannelUpstreamRatios: map[int]float64{849: 0.4},
+		ChannelKnownIDs:       map[int]bool{849: true, 999: true},
+		ExchangeRate:          7,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.CostTotals)
+
+	// 账单金额 = 2 × (9000000/500000) = 36；但有成本的只有一行 = 18。
+	assert.InDelta(t, 18, result.CostTotals.SettleCNY, 1e-6,
+		"结算额必须是参与核算的那部分，不能拿全部金额去减只覆盖一部分的成本")
+	assert.Equal(t, 1, result.CostTotals.PricedRows)
+	assert.Equal(t, 2, result.CostTotals.TotalRows)
+	assert.False(t, result.CostTotals.PricedRows == result.CostTotals.TotalRows,
+		"覆盖不全时不得标成完整")
+}
+
 // TestWriteSimpleBillCostColumns 成本三列写出来，合计行覆盖到利润列。
 func TestWriteSimpleBillCostColumns(t *testing.T) {
 	dir := t.TempDir()
