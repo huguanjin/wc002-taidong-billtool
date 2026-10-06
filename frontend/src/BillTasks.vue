@@ -38,6 +38,13 @@ const planForm = ref({
   startAt: '',
   endAt: '',
   generateSanitized: true,
+  // 成本核算：执行前检查本任务日志用到的渠道有没有维护上游倍率，
+  // 缺了就拦下让用户就地补录。默认勾选（与后端 CreateBillTask 的默认值一致）。
+  //
+  // 与 generateCost 是两件事：checkCost 管「成本要不要算得对」，
+  // generateCost 管「要不要那张独立的成本利润表」。简易模板没有那张表，
+  // 但它的账单上有成本三列——所以简易模板下 generateCost 无意义、checkCost 照样有用。
+  checkCost: true,
   generateCost: true,
   // 出账模板：'' = 标准明细账单，'simple' = 简易汇总账单。
   // 存在计划上而不是全局设置里：同一个部署里两类客户都可能存在。
@@ -49,8 +56,11 @@ const selectedTasks = ref([])
 const runResults = ref([])
 const validationResults = ref([])
 // runResults 里带下载链接的那几条，用于展示
-const runFailures = computed(() => runResults.value.filter((r) => !r.ok))
+const runFailures = computed(() => runResults.value.filter((r) => !r.ok && !r.needsChannelRatios))
 const runSuccesses = computed(() => runResults.value.filter((r) => r.ok))
+// 被成本核算预检拦下的那几条。**不是失败**：没有产物，但用户补录倍率后重跑即可，
+// 所以不能混进「执行失败」里——那会让用户以为任务坏了，去查根本不存在的 bug。
+const runBlocked = computed(() => runResults.value.filter((r) => r.needsChannelRatios))
 
 // 复制按钮的状态，按任务 ID 记（见 copySummary）。
 const copyStates = ref({})
@@ -227,6 +237,7 @@ function resetPlanForm() {
     endAt: '',
     generateSanitized: planForm.value.generateSanitized,
     generateCost: planForm.value.generateCost,
+    checkCost: planForm.value.checkCost,
     billTemplate: planForm.value.billTemplate,
   }
 }
@@ -245,6 +256,8 @@ function startEditPlan(t) {
     endAt: t.endAt || '',
     generateSanitized: !!t.generateSanitized,
     generateCost: !!t.generateCost,
+    // 老计划没有这个字段（库里的列是后加的，默认 true），undefined 时按勾选算。
+    checkCost: t.checkCost === undefined || t.checkCost === null ? true : !!t.checkCost,
     billTemplate: t.billTemplate || '',
   }
   window.scrollTo({ top: 0, behavior: 'smooth' })
@@ -277,6 +290,7 @@ async function savePlan() {
         endAt: planForm.value.endAt,
         generateSanitized: planForm.value.generateSanitized,
         generateCost: planForm.value.generateCost,
+        checkCost: planForm.value.checkCost,
         billTemplate: planForm.value.billTemplate,
       }),
     })
@@ -372,6 +386,11 @@ async function runSelected() {
 
   error.value = ''
   runResults.value = []
+  // 上一轮的补录草稿要清掉：换了批次之后，那些渠道可能根本不在这一批里，
+  // 留着会让「保存并继续执行」提交一批与当前结果无关的倍率。
+  blockedRatioDraft.value = {}
+  blockedError.value = ''
+  blockedMsg.value = ''
   const ids = [...selectedTasks.value]
   running.value = true
   try {
@@ -439,13 +458,181 @@ async function deleteSelected() {
   await loadTasks()
 }
 
-// 复制一条成功结果的成本利润摘要。
+// ---- 被预检拦下后就地补录上游倍率 ----
+
+// 待补录的倍率草稿，键是渠道 ID。按任务分不开：同一批执行里两条任务可能都缺
+// 同一个渠道的倍率，那个渠道只需要填一次，所以草稿是全局的一份而不是按任务一份。
+const blockedRatioDraft = ref({})
+const savingBlockedRatios = ref(false)
+const blockedError = ref('')
+const blockedMsg = ref('')
+
+// blockedRatioItems 把草稿整理成接口要的形态，顺手校验。
+// 空串表示「这次不填」，跳过而不是报错——用户可能只想先补其中几个。
+function blockedRatioItems() {
+  const items = []
+  for (const r of runBlocked.value) {
+    for (const ch of r.channelCheck?.missing || []) {
+      const raw = String(blockedRatioDraft.value[ch.channelId] ?? '').trim()
+      if (raw === '') continue
+      const num = Number(raw)
+      if (!Number.isFinite(num) || num < 0) {
+        return { error: `渠道 ${ch.channelId} 的倍率必须是非负数字` }
+      }
+      items.push({ channelId: ch.channelId, upstreamRatio: num, note: '' })
+    }
+  }
+  return { items }
+}
+
+// blockedGrouped 把待补录的渠道按**分组**归拢，供界面分节展示。
+//
+// 分组来自本次日志实际观测到的 group 列（后端算好随检查结果一起给），
+// 不是渠道表里那个「能服务哪些分组」的候选集合——后者可能整组对不上。
+// 一个渠道可能出现在多个分组下，所以它会在几节里都出现：
+// 这不是重复，而是事实——那个渠道确实同时服务这几个分组。
+const blockedGrouped = computed(() => {
+  const out = []
+  for (const r of runBlocked.value) {
+    const missing = r.channelCheck?.missing || []
+    const byGroup = {}
+    for (const ch of missing) {
+      const groups = ch.groups && ch.groups.length > 0 ? ch.groups : ['（日志未记录分组）']
+      for (const g of groups) {
+        if (!byGroup[g]) byGroup[g] = []
+        byGroup[g].push(ch)
+      }
+    }
+    const sections = Object.keys(byGroup)
+      .sort()
+      .map((g) => ({ group: g, channels: byGroup[g] }))
+    out.push({
+      taskId: r.taskId,
+      taskName: r.taskName || r.task?.name || `任务 ${r.taskId}`,
+      channelCheck: r.channelCheck,
+      sections,
+    })
+  }
+  return out
+})
+
+// blockedUnknownChannels 全部被拦任务里「渠道清单里查不到」的渠道号。
+// 这些补不了（业务库已删），只能如实报出——引导用户去补一个不存在的渠道
+// 只会让他徒劳地在清单里找。
+const blockedUnknownChannels = computed(() => {
+  const set = new Set()
+  for (const r of runBlocked.value) {
+    for (const id of r.channelCheck?.unknownChannelIds || []) set.add(id)
+  }
+  return [...set].sort((a, b) => a - b)
+})
+
+// blockedMissGroupRatio 全部被拦任务里 group_ratio 缺失的行数。
+const blockedMissGroupRatio = computed(() =>
+  runBlocked.value.reduce((sum, r) => sum + (r.channelCheck?.missingGroupRatioRows || 0), 0)
+)
+
+// blockedUnknownCount 全部被拦任务里取不到渠道号的任务数（noChannelInfo）。
+const blockedNoChannelInfo = computed(() =>
+  runBlocked.value.filter((r) => r.channelCheck?.noChannelInfo).length
+)
+
+// saveBlockedRatios 保存草稿里填好的倍率。保存成功返回 true。
+async function saveBlockedRatios() {
+  blockedError.value = ''
+  blockedMsg.value = ''
+  const { items, error } = blockedRatioItems()
+  if (error) {
+    blockedError.value = error
+    return false
+  }
+  if (items.length === 0) {
+    blockedError.value = '请先填写至少一个渠道的倍率'
+    return false
+  }
+
+  savingBlockedRatios.value = true
+  try {
+    const resp = await fetch('/api/channel-ratios', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      blockedError.value = data.error || `保存失败（${resp.status}）`
+      return false
+    }
+    blockedMsg.value = `已保存 ${data.saved} 个渠道的倍率`
+    blockedRatioDraft.value = {}
+    return true
+  } catch (err) {
+    blockedError.value = '保存失败：' + err.message
+    return false
+  } finally {
+    savingBlockedRatios.value = false
+  }
+}
+
+// continueAfterFix 保存倍率后重跑被拦下的那几条计划。
+//
+// **会重新导出日志**：渠道集合要导出后才知道，所以检查必然发生在导出之后，
+// 「继续」只能是重跑整条链路。这是刻意的取舍——换来的是不需要一套跨请求的
+// 中间态机制。界面上必须说清楚，别让用户以为点了继续就完全不重来。
+async function continueAfterFix() {
+  if (!(await saveBlockedRatios())) return
+
+  const ids = runBlocked.value.map((r) => r.taskId)
+  if (ids.length === 0) return
+
+  error.value = ''
+  running.value = true
+  try {
+    const resp = await fetch('/api/run-bill-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskIds: ids }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      error.value = data.error || `继续执行失败（${resp.status}）`
+      return
+    }
+    // 只替换这几条的结果，别动其它条：用户可能同时跑了别的计划，
+    // 整份覆盖会把它们的结果连下载链接一起抹掉。
+    const byId = new Map((data.results || []).map((r) => [r.taskId, r]))
+    const merged = runResults.value.map((r) => (byId.has(r.taskId) ? byId.get(r.taskId) : r))
+    // 不在原结果里的（理论上不会出现）补在后面，免得静默丢掉。
+    for (const [id, r] of byId) {
+      if (!runResults.value.some((x) => x.taskId === id)) merged.push(r)
+    }
+    runResults.value = merged
+    await loadTasks()
+  } catch (err) {
+    error.value = '继续执行失败：' + err.message
+  } finally {
+    running.value = false
+  }
+}
+
+// summaryText 取该条结果的可复制文字。
+//
+// 两种模板给的摘要不同：标准模板是成本利润摘要（要成本表算出来才有值），
+// 简易模板是账单摘要（金额来自站点实收额度）。空串表示这次没有可复制的内容——
+// 比如标准模板但成本表被渠道倍率拦下了，此时不显示复制框，而不是显示一个空框。
+function summaryText(r) {
+  return r.billSummary || r.costSummary || ''
+}
+
+// 复制一条成功结果的摘要。
 //
 // 状态按任务 ID 记：批量执行后页面上会有好几条摘要，用单个全局状态的话
 // 点其中一个，所有按钮会一起变成「已复制 ✓」——用户根本不知道复制了哪条。
 async function copySummary(r) {
   const id = r.taskId
-  const state = await copyText(r.costSummary)
+  const state = await copyText(summaryText(r))
   copyStates.value = { ...copyStates.value, [id]: state }
   if (state === 'fail') {
     // 连 execCommand 都不行（极老的浏览器）：把文字选中，让用户自己按 Ctrl+C。
@@ -652,10 +839,29 @@ defineExpose({ loadAll })
 
       <div class="checkboxes">
         <label><input v-model="planForm.generateSanitized" type="checkbox" /> 生成脱敏日志</label>
-        <label v-if="planForm.billTemplate !== 'simple'">
-          <input v-model="planForm.generateCost" type="checkbox" /> 生成成本利润表
+        <!-- 成本核算在前、生成成本利润表在后，并把后者作为它的子项：
+             用户的决策顺序就是「要不要核算成本」→「要不要那张表」。
+             两者排序反过来会让人以为先勾的是表，而那张表只是核算的产物之一。 -->
+        <label>
+          <input v-model="planForm.checkCost" type="checkbox" /> 成本核算（执行前检查上游倍率）
+        </label>
+        <label v-if="planForm.billTemplate !== 'simple'" :class="{ muted: !planForm.checkCost }">
+          <input v-model="planForm.generateCost" type="checkbox" :disabled="!planForm.checkCost" />
+          生成成本利润表
         </label>
       </div>
+      <p class="hint" v-if="!planForm.checkCost">
+        未开成本核算时不做上游倍率检查，账单里也不会出现成本与利润。
+      </p>
+      <p class="hint" v-else-if="planForm.billTemplate === 'simple'">
+        执行前会检查本时段日志用到的渠道是否都维护了上游倍率；缺了会先拦下，
+        可以在本页就地补录后继续。<strong>注意：继续执行会重新导一次日志</strong>
+        （只读查询，不影响业务库），因为渠道集合要导出后才知道。
+      </p>
+      <p class="hint" v-else>
+        执行前会检查本时段日志用到的渠道是否都维护了上游倍率；缺了会先拦下，
+        可以在本页就地补录后继续。
+      </p>
 
       <div class="path-row">
         <button type="button" class="btn-primary" @click="savePlan" :disabled="savingPlan">
@@ -695,6 +901,85 @@ defineExpose({ loadAll })
       <p class="hint">失败的计划保持原样，不会覆盖上次的结果。修正后重新勾选执行即可。</p>
     </div>
 
+    <!-- 被成本核算预检拦下：不是失败，而是等待用户补录上游倍率。
+         放在「执行失败」之后、「执行成功」之前：它比失败轻微（补一下就能跑），
+         但比成功要紧（还没出账）。 -->
+    <div v-if="runBlocked.length > 0" class="result-box warn-box">
+      <strong>需要先维护上游倍率（{{ runBlocked.length }} 条）</strong>
+      <p class="hint">
+        下面这些计划**没有出账**：本时段日志用到的渠道里有还没维护上游倍率的，
+        成本算不出来。填好倍率保存后点「保存并继续执行」即可。
+      </p>
+
+      <p class="error" v-if="blockedNoChannelInfo > 0">
+        其中有 {{ blockedNoChannelInfo }} 条任务的日志里取不到渠道号（既没有 channel_id 列，
+        other 里也没有 use_channel），这一份做不了检查。请用「导出日志明细」重新导出带
+        channel_id 的日志，或到「生成账单」页手动处理。
+      </p>
+      <p class="error" v-if="blockedMissGroupRatio > 0">
+        另有 {{ blockedMissGroupRatio }} 行缺少分组倍率（group_ratio），这些行的官方刊例
+        反推不出来，成本与利润会留空。
+      </p>
+      <p class="error" v-if="blockedUnknownChannels.length > 0">
+        渠道 {{ blockedUnknownChannels.join('、') }} 在本地渠道清单里查不到（业务库可能已删除），
+        无法补录倍率，它们的成本不入成本合计。
+      </p>
+
+      <div v-for="b in blockedGrouped" :key="'blk-' + b.taskId" class="blocked-task">
+        <strong>{{ b.taskName }}</strong>
+        <p class="hint" v-if="b.channelCheck?.noChannelInfo">
+          这份日志没有可用的渠道号，没法检查。请重新导出日志。
+        </p>
+        <div v-for="sec in b.sections" :key="b.taskId + '-' + sec.group" class="blocked-group">
+          <div class="blocked-group-head">分组 {{ sec.group }}</div>
+          <table>
+            <thead>
+              <tr>
+                <th>渠道 ID</th>
+                <th>渠道名称</th>
+                <th>上游倍率</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="ch in sec.channels" :key="b.taskId + '-' + ch.channelId">
+                <td>{{ ch.channelId }}</td>
+                <td>{{ ch.name }}</td>
+                <td>
+                  <input
+                    v-model="blockedRatioDraft[ch.channelId]"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="未维护"
+                    class="ratio-input"
+                  />
+                </td>
+                <td>
+                  <!-- 同一个渠道可能在多个分组下重复出现，所以状态读的是**草稿**：
+                       在一节里填了，另一节也会立刻显示已填，不会让人以为那边还没填。 -->
+                  <span v-if="String(blockedRatioDraft[ch.channelId] ?? '').trim() !== ''">待保存</span>
+                  <span v-else>未维护</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="path-row">
+        <button type="button" class="btn-primary" @click="continueAfterFix" :disabled="savingBlockedRatios || running">
+          {{ savingBlockedRatios ? '保存中…' : running ? '执行中…' : '保存并继续执行' }}
+        </button>
+        <span class="hint inline">
+          继续执行会<strong>重新导一次日志</strong>（只读查询，不影响业务库）——
+          渠道集合要导出后才知道，所以检查必然在导出之后。
+        </span>
+      </div>
+      <p class="error" v-if="blockedError">{{ blockedError }}</p>
+      <span class="hint" v-if="blockedMsg">{{ blockedMsg }}</span>
+    </div>
+
     <div v-if="runSuccesses.length > 0" class="result-box ok">
       <strong>执行成功 {{ runSuccesses.length }} 条</strong>
       <ul class="result-list">
@@ -711,14 +996,17 @@ defineExpose({ loadAll })
         文件只保留 {{ jobRetentionHours }} 小时，请及时下载。
       </p>
       <div v-for="r in runSuccesses" :key="'sum-' + r.taskId">
-        <div v-if="r.costSummary" class="cost-summary">
+        <!-- 两种摘要互斥：标准模板给成本利润摘要（要成本表算出来才有），
+             简易模板给账单摘要（金额是站点实收额度）。共用同一段 UI 与复制逻辑，
+             区别只在标题与取哪一段文字。 -->
+        <div v-if="summaryText(r)" class="cost-summary">
           <div class="cost-summary-head">
-            <strong>{{ r.taskName || ('任务 ' + r.taskId) }} 成本利润摘要</strong>
+            <strong>{{ r.taskName || ('任务 ' + r.taskId) }} {{ r.billSummary ? '账单' : '成本利润' }}摘要</strong>
             <button type="button" class="btn-browse" @click="copySummary(r)">
               {{ copyStates[r.taskId] === 'ok' ? '已复制 ✓' : copyStates[r.taskId] === 'fail' ? '复制失败，请手动选中' : '复制' }}
             </button>
           </div>
-          <pre :ref="(el) => setSummaryEl(el, r.taskId)" class="cost-summary-text">{{ r.costSummary }}</pre>
+          <pre :ref="(el) => setSummaryEl(el, r.taskId)" class="cost-summary-text">{{ summaryText(r) }}</pre>
         </div>
       </div>
     </div>
@@ -751,6 +1039,7 @@ defineExpose({ loadAll })
           <th>计划</th>
           <th>客户</th>
           <th>模板</th>
+          <th>成本核算</th>
           <th>时段</th>
           <th>账期</th>
           <th>状态</th>
@@ -768,6 +1057,10 @@ defineExpose({ loadAll })
           <td class="name">{{ t.name || '（未命名）' }}</td>
           <td>{{ t.customerName }}</td>
           <td>{{ t.billTemplate === 'simple' ? '简易汇总' : '标准明细' }}</td>
+          <td>
+            <span v-if="t.checkCost" class="ok">开</span>
+            <span v-else class="hint inline">关</span>
+          </td>
           <td>{{ rangeLabel(t) }}</td>
           <td>{{ periodLabel(t) }}</td>
           <td>
@@ -941,6 +1234,41 @@ defineExpose({ loadAll })
   display: flex;
   align-items: center;
   gap: 5px;
+}
+/* 子选项（生成成本利润表）在父开关关闭时淡下去：它还摆在那里，
+   但一眼能看出当前不受生效。禁用态本身由 disabled 提供，
+   这里只是把「为什么点不动」说得更明显一点。 */
+.checkboxes label.muted {
+  opacity: 0.5;
+}
+
+/* 被预检拦下的区块。用 warn 色而不是 error 红：这不是失败，
+   页面配色不该让人以为任务坏了。 */
+.warn-box {
+  border-color: #f0c36d;
+  background: #fffbf0;
+}
+.blocked-task {
+  margin: 10px 0;
+  padding: 8px 10px;
+  background: #fff;
+  border: 1px solid #f0c36d;
+  border-radius: 6px;
+}
+.blocked-group {
+  margin: 8px 0 4px;
+}
+.blocked-group-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: #8a6100;
+  margin-bottom: 4px;
+}
+.ratio-input {
+  width: 90px;
+  padding: 2px 6px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
 }
 
 .path-row {

@@ -27,7 +27,19 @@ type GenerateResult struct {
 	CostTotals *CostTotals
 	// CostSummary 结果区那段可复制的文字，由后端按与表内公式同源的口径生成。
 	CostSummary string
-	Summary     Summary
+	// BillSummary 简易账单（模板二）的可复制文字。
+	//
+	// 与 CostSummary 分开而不是复用同一个字段：两者的内容与口径完全不同
+	// （成本利润 vs 站点实收额度），合成一个字段后前端只凭「有没有值」判断该显示
+	// 哪种口径的说明，迟早会在一处显示错。模板二不产成本表，CostSummary 始终为空。
+	BillSummary string
+	// SimpleCostStat 简易账单的成本覆盖情况（参与核算的行数 / 全部行数）。
+	//
+	// 只有模板二会填。它与 CostTotals 不同：那是模板一那张独立成本利润表的合计，
+	// 这是同一张汇总账单里三列成本的覆盖面，前端据此决定要不要写那句
+	// 「利润只覆盖 N/M 行」——不写的话，一个偏小的成本会被读成整体毛利。
+	SimpleCostStat SimpleBillCostStat
+	Summary        Summary
 }
 
 // loadBillingPriceBook 按计价来源装载价表。
@@ -188,16 +200,26 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 
 // generateSimpleBill 简易账单（模板二）的出账路径。
 //
-// 与模板一的流程有本质区别：不读价表、不逐行定价、不反推折扣、不估成本，
-// 只把日志按 (分组, 模型) 汇总并把额度折算成金额。因此它也不产出成本利润表，
+// 与模板一的流程有本质区别：不读价表、不逐行定价、不反推折扣、不算阶梯表达式，
+// 只把日志按 (分组, 模型) 汇总并把额度折算成金额。因此它也不产出单独的**成本利润表**，
 // 且忽略 params.GenerateCost —— 那张表的前提是「每个渠道有上游倍率」，与本模板无关。
+//
+// 但成本三列**不依赖价表**：它们是从额度里反推的（见 AggregateSimpleBill）。
+// 所以这张表照样能给成本与利润，只是没有模板一那种逐渠道拆开的明细。
 func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateResult, error) {
 	headers, rows, err := LoadLogRows(inputPath, params.Sheet, params.Encoding)
 	if err != nil {
 		return nil, fmt.Errorf("读取日志失败: %w", err)
 	}
 
-	summaryRows, err := AggregateSimpleBill(rows, headers)
+	// 成本列只在开了成本核算时才填（见 Params.CheckCost）。关掉时列还在、值为空——
+	// 列集合固定，否则同一份产物在两种开关下结构不同，下游脚本会莫名对不上。
+	summaryRows, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+		UpstreamRatios: params.ChannelUpstreamRatios,
+		CostColumns:    params.CheckCost,
+		// 汇率与模板一同一来源：两边的成本都经这一步换算，用不同的汇率会得出两个成本数。
+		ExchangeRate: params.ExchangeRate,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -220,11 +242,31 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 
 	totals := SumSimpleBill(summaryRows)
 
+	// 账期与模板一同口径：参数指定优先，其次从文件名推断，最后从日志的 created_at 推断。
+	//
+	// 第三层不能省：从「导出日志明细」导出的文件叫
+	// 「日志查询_2026-09-01_2026-09-30_ab12cd.tsv」，不含「N月」字样，
+	// monthFromFilename 认不出来。模板一在这时会退回日志内容，模板二同样要。
+	// 三层都推不出来时留 0，前端显示为「—」而不是编一个当月糊上去。
+	year, month := params.Year, params.Month
+	if month == 0 {
+		if m, ok := monthFromFilename(stem); ok {
+			month = m
+		} else if y, m := SimpleBillPeriod(headers, rows); m > 0 {
+			year, month = y, m
+		}
+	}
+	if month < 1 || month > 12 {
+		month = 0
+	}
+
 	// 摘要只填最小集：模板二没有刊例与折扣，前端结果区的「总金额」用它，
 	// 「综合折扣」留 0（模板二不打折，显示成 1.0 会让人以为真有个折扣）。
 	// 逐行明细刻意留空：这张表给的就是汇总，把汇总行塞进「明细」表反而让人以为
 	// 中间每一步的 token 都能在这里查到。
 	summary := Summary{
+		Year:            year,
+		Month:           month,
 		SettleCNYTotal:  totals.TotalCostCNY,
 		ListCNYTotal:    totals.TotalCostCNY,
 		OverallDiscount: 0,
@@ -235,7 +277,83 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		BillPath:      billPath,
 		SanitizedPath: sanitizedPath,
 		Summary:       summary,
+		BillSummary:   FormatSimpleBillSummary(summaryRows, totals, year, month, params.SummaryHeader),
+		// 成本覆盖情况一起交出去：摘要里要写「利润只覆盖了 N/M 行」，
+		// 而 totals 本身分不清「一行都没算」与「没开成本核算」。
+		SimpleCostStat: totals.Cost,
 	}, nil
+}
+
+// FormatSimpleBillSummary 生成简易账单那段可复制的文字。
+//
+// 与成本利润摘要一样，它是给人粘到聊天/邮件里的，所以数字口径必须与 xlsx 同源
+// （都来自同一份 summaryRows），并且把「金额是站点实收额度折算」写在明处——
+// 收件人若拿它和模板一的账单比，会看到两个不同的数（刊例×折扣 vs 额度折算），
+// 不说清楚就会被当成算错了。
+func FormatSimpleBillSummary(rows []SimpleBillRow, totals SimpleBillTotals, year, month int, header []string) string {
+	var b strings.Builder
+	for _, line := range header {
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+
+	// 账期推断不出来时整行省略，而不是写「账期：0-0」。
+	if month >= 1 && month <= 12 && year > 0 {
+		fmt.Fprintf(&b, "账期：%d-%02d\n", year, month)
+	} else if month >= 1 && month <= 12 {
+		fmt.Fprintf(&b, "账期：%d月\n", month)
+	}
+
+	fmt.Fprintf(&b, "账单金额：¥%s\n", trimMoney(totals.TotalCostCNY))
+	fmt.Fprintf(&b, "请求次数：%d 次；汇总行：%d 行\n", totals.HitCount, len(rows))
+
+	// 成本三项只在算全了才写（见 SumSimpleBill）。写一个「只覆盖了一部分行」的成本，
+	// 收到这段文字的人会把它当成整体成本，进而把利润当成整体毛利——
+	// 那比不写成本危险得多，所以宁可缺、不可错。
+	if totals.UpstreamCostCNY != nil && totals.OfficialListUSD != nil && totals.ProfitCNY != nil {
+		fmt.Fprintf(&b, "官方刊例：$%s\n", trimFixed(*totals.OfficialListUSD, 2))
+		fmt.Fprintf(&b, "上游成本：¥%s\n", trimMoney(*totals.UpstreamCostCNY))
+		margin := 0.0
+		if totals.AmountCoveredCNY > 0 {
+			// 分母用 AmountCoveredCNY 而不是总金额：两者在有行没算成本时不相等，
+			// 用总金额会算出一个偏小的毛利率（成本只覆盖了一部分，金额却是全部的）。
+			margin = *totals.ProfitCNY / totals.AmountCoveredCNY * 100
+		}
+		// 毛利率单独用逗号收尾，不套括号——与 FormatCostSummary 同一写法。
+		fmt.Fprintf(&b, "利润：¥%s，毛利率 %s%%\n",
+			trimMoney(*totals.ProfitCNY), trimPercent(margin))
+	} else if totals.Cost.TotalRows > 0 && totals.Cost.MissingRatioRows+totals.Cost.MissingChannelRows > 0 {
+		// 开了成本核算但算不全：如实说一句「没算」，而不是静默省略——
+		// 省略会让人以为这张表本来就不含成本，于是拿另一份有成本的账单去对，越对越乱。
+		fmt.Fprintf(&b, "成本：未能核算（%d 行缺少渠道倍率或分组倍率）\n",
+			totals.Cost.MissingRatioRows+totals.Cost.MissingChannelRows)
+	}
+
+	// 按分组给小计：客户通常按分组核对，给一份分组合计比只给总额更省一轮沟通。
+	// 明细行数多时整段会很长，所以只列分组，不列到模型。
+	groupTotals := map[string]float64{}
+	var groupOrder []string
+	for _, r := range rows {
+		if _, seen := groupTotals[r.Group]; !seen {
+			groupOrder = append(groupOrder, r.Group)
+		}
+		groupTotals[r.Group] += r.TotalCostCNY
+	}
+	if len(groupOrder) == 1 {
+		// 只有一个分组时「分组小计」就是总额的复述，没有信息量。
+		fmt.Fprintf(&b, "分组：%s\n", groupOrder[0])
+	} else if len(groupOrder) > 1 {
+		parts := make([]string, 0, len(groupOrder))
+		for _, g := range groupOrder {
+			parts = append(parts, fmt.Sprintf("%s ¥%s", g, trimMoney(groupTotals[g])))
+		}
+		fmt.Fprintf(&b, "分组小计：%s\n", strings.Join(parts, "；"))
+	}
+
+	// 口径说明写在最后：它是给人复制的，收件人必须知道这个金额是什么。
+	// 与模板一的「刊例 × 折扣」是两个不同的数，不写清楚会被当成算错了。
+	b.WriteString("注：金额为站点实际扣费额度 ÷ 500000，已扣除任务退款")
+	return b.String()
 }
 
 // generateCostTable 生成成本利润表。若有渠道还没维护倍率，**不报错中断**，而是返回

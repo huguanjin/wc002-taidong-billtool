@@ -29,7 +29,7 @@ type AggRow struct {
 	Quota        float64
 	Rows         int
 	// 按请求累计的官方美金刊例（含阶梯价与 web_search）
-	OfficialUSD float64
+	OfficialUSD    float64
 	WebSearchCalls float64
 	// 图片按次计费的调用次数；按量图片模型此字段为 0
 	ImagePerCallCount float64
@@ -209,6 +209,7 @@ const (
 func IsSimpleBillTemplate(t string) bool {
 	return strings.TrimSpace(t) == BillTemplateSimple
 }
+
 const (
 	PriceSourceOfficial   PriceSource = "official"
 	PriceSourcePriceTable PriceSource = "price_table"
@@ -231,9 +232,9 @@ type Params struct {
 	// 默认值必须是「与改动前完全一致」的那一个。
 	BillTemplate string
 
-	Month             int     // 0 表示未指定，从日志推断
-	Year              int     // 0 表示未指定，从日志推断
-	Discount          *float64 // nil 表示不强制，按分组自动反推
+	Month    int      // 0 表示未指定，从日志推断
+	Year     int      // 0 表示未指定，从日志推断
+	Discount *float64 // nil 表示不强制，按分组自动反推
 	// ManualDiscounts 按「客户 + 分组」手工维护的折扣：键是日志里的原始分组名
 	// （AggRow.KeyGroup，如 Codex），值是该分组的结算折扣。
 	//
@@ -241,13 +242,13 @@ type Params struct {
 	// 与全局的 Discount 一起合成 DiscountOverrides。为空表示没有手工折扣，
 	// 一切照旧走反推——手动上传日志那条路径没有客户概念，就留空。
 	ManualDiscounts map[string]float64
-	ExchangeRate      float64
-	KeepLog           bool
-	SanitizedLog      bool
-	SanitizedFormat   string // "xlsx"（默认，为空时等同）| "csv" | "tsv"
-	PriceSource       PriceSource // 空值等同 PriceSourceOfficial
-	Sheet             string
-	Encoding          string
+	ExchangeRate    float64
+	KeepLog         bool
+	SanitizedLog    bool
+	SanitizedFormat string      // "xlsx"（默认，为空时等同）| "csv" | "tsv"
+	PriceSource     PriceSource // 空值等同 PriceSourceOfficial
+	Sheet           string
+	Encoding        string
 	// ManualPrices 缺失定价模型的手动补全价格，键为日志里的原始模型名，
 	// 生成账单时会合并进 PriceBook.ByModel（Source: "manual_override"）。
 	ManualPrices map[string]ManualPriceInput
@@ -256,7 +257,18 @@ type Params struct {
 	IncludeBillingParams bool
 	// GenerateCost 是否额外生成一张成本利润表（账单全部列 + 渠道/上游折扣/上游成本）。
 	// 需要日志含 channel_id 列，且日志用到的渠道都已维护上游倍率。
+	//
+	// 只对模板一有意义：模板二的账单本身就有成本三列，不需要另一张表。
 	GenerateCost bool
+	// CheckCost 成本核算开关：是否要求把成本算对。
+	//
+	// 与 GenerateCost 分开是刻意的：前者管「要不要那张成本利润表」，这个管
+	// 「成本要不要算得出来」。模板二用它决定成本三列填不填——
+	// 一个只要汇总账单的客户，出账的人照样想知道这一期的成本。
+	//
+	// 对模板一它只影响执行前的检查（见 taskrun.go），出账本身不看它：
+	// 模板一的成本口径由 GenerateCost 决定，多一层判断只会让两个开关打架。
+	CheckCost bool
 	// ChannelUpstreamRatios 渠道 ID → 上游倍率。由 handler 从本地 PG 读好传入，
 	// billing 包不直接连 PG——保持「读配置」与「算账」分离，也便于测试注入。
 	ChannelUpstreamRatios map[int]float64
@@ -324,16 +336,16 @@ type BillingDetails struct {
 
 // Summary 返回给前端展示的结果摘要。
 type Summary struct {
-	Year               int              `json:"year"`
-	Month              int              `json:"month"`
-	Rows               []RowSummary     `json:"rows"`
-	SettleCNYTotal     float64          `json:"settleCnyTotal"`
-	ListCNYTotal       float64          `json:"listCnyTotal"`
-	OverallDiscount    float64          `json:"overallDiscount"`
-	MissingPriceModels []string         `json:"missingPriceModels"`
-	RowCount           int              `json:"rowCount"`
-	CacheHitRows       int              `json:"cacheHitRows"`
-	WebSearchRows      int              `json:"webSearchRows"`
+	Year               int          `json:"year"`
+	Month              int          `json:"month"`
+	Rows               []RowSummary `json:"rows"`
+	SettleCNYTotal     float64      `json:"settleCnyTotal"`
+	ListCNYTotal       float64      `json:"listCnyTotal"`
+	OverallDiscount    float64      `json:"overallDiscount"`
+	MissingPriceModels []string     `json:"missingPriceModels"`
+	RowCount           int          `json:"rowCount"`
+	CacheHitRows       int          `json:"cacheHitRows"`
+	WebSearchRows      int          `json:"webSearchRows"`
 	// CostTotals 成本利润表的合计，仅当成本利润表**成功生成**时非 nil。
 	// 由后端算好而不是让前端去解析 xlsx：金额口径必须与表内公式（成本=AC×AF×汇率）
 	// 完全一致，两边各算一份必然随时间漂移。

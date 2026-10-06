@@ -623,7 +623,7 @@ func handleGroupDiscounts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"saved": saved,
+		"saved":  saved,
 		"groups": []billing.GroupDiscountPreview{},
 	}
 
@@ -804,6 +804,10 @@ type taskInput struct {
 	EndAt             string `json:"endAt"`
 	GenerateSanitized bool   `json:"generateSanitized"`
 	GenerateCost      bool   `json:"generateCost"`
+	// CheckCost 用指针：新建时「没传」应当取默认值 true（对应页面上的默认勾选），
+	// 而 false 是用户明确取消勾选。用值类型的话两者分不开，
+	// 新建出来的计划会默认关掉成本核算——与「默认勾选」正好相反。
+	CheckCost *bool `json:"checkCost"`
 	// BillTemplate 用指针：空串是**有效值**（= 标准模板），所以「没传这个字段」
 	// 与「传了空串」必须区分开。否则老版本前端编辑一次计划，就会把用户选的
 	// 简易模板重置成标准模板——而且不会有任何提示。
@@ -847,6 +851,12 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 		Name:              strings.TrimSpace(in.Name),
 		GenerateSanitized: in.GenerateSanitized,
 		GenerateCost:      in.GenerateCost,
+		// 没传就默认开启成本核算。这是「默认勾选」的实现点：
+		// 前端的勾选框初值是 true，但老版本前端不带这个字段，这里兜底。
+		CheckCost: true,
+	}
+	if in.CheckCost != nil {
+		task.CheckCost = *in.CheckCost
 	}
 	if in.BillTemplate != nil {
 		task.BillTemplate = strings.TrimSpace(*in.BillTemplate)
@@ -899,9 +909,15 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 		task.PeriodMonth = existing.PeriodMonth
 	}
 	// 模板同理：没传就保留库里的值，别把用户选的简易模板悄悄重置成标准模板。
-	if in.BillTemplate == nil {
+	// 成本核算开关一起处理：没传时若走默认值 true，会把用户明确取消的勾选又打开。
+	if in.BillTemplate == nil || in.CheckCost == nil {
 		if existing, err := billing.GetBillTask(*pgConfig, in.ID); err == nil {
-			task.BillTemplate = existing.BillTemplate
+			if in.BillTemplate == nil {
+				task.BillTemplate = existing.BillTemplate
+			}
+			if in.CheckCost == nil {
+				task.CheckCost = existing.CheckCost
+			}
 		}
 	}
 	if err := billing.UpdateBillTask(*pgConfig, task); err != nil {
@@ -1052,9 +1068,21 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// 成本核算预检拦下：没有产物，但**也不是失败**——用户补录倍率后重跑即可。
+		// 单独一个 ok=false + needsChannelRatios 的形态，前端据此渲染补录界面，
+		// 而不是混进「执行失败」里让用户以为任务坏了。
+		if res.channelCheck != nil {
+			one["ok"] = false
+			one["needsChannelRatios"] = true
+			one["channelCheck"] = res.channelCheck
+			results = append(results, one)
+			// 不计入 failCount：这不是失败，是等待用户输入。
+			continue
+		}
+
 		one["ok"] = true
-		one["jobId"] = res.jobID
 		one["task"] = res.task
+		one["jobId"] = res.jobID
 		one["billFileName"] = res.billFileName
 		one["billUrl"] = "/api/download/" + res.jobID + "/bill"
 		one["logPath"] = res.logPath
@@ -1069,6 +1097,10 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 			one["costFileName"] = res.costFileName
 			one["costUrl"] = "/api/download/" + res.jobID + "/cost"
 			one["costSummary"] = res.costSummary
+		}
+		// 简易账单的可复制文字，与成本摘要互斥（见 handleGenerateBill 的说明）。
+		if res.billSummary != "" {
+			one["billSummary"] = res.billSummary
 		}
 		if res.costBlocked {
 			one["costBlocked"] = true
@@ -1096,6 +1128,8 @@ type taskRunOutcome struct {
 	sanitizedFileName string
 	costFileName      string
 	costSummary       string
+	billSummary       string
+	channelCheck      *billing.ChannelCheckResult
 	logPath           string
 	logRowCount       int64
 	summary           billing.Summary
@@ -1130,6 +1164,17 @@ func runOneBillTask(taskID int64) (*taskRunOutcome, error) {
 		return nil, err
 	}
 
+	// 成本核算预检拦下：**没有出账**，只是一个可继续的中间态。
+	// 这里既不登记下载（没有产物）、也不落库（结果字段全是零值，
+	// 落库会把上一次跑出来的金额覆盖成空），直接把检查结果交回页面补录。
+	if result.ChannelCheck != nil {
+		_ = os.RemoveAll(jobPath)
+		return &taskRunOutcome{
+			task:         result.Task,
+			channelCheck: result.ChannelCheck,
+		}, nil
+	}
+
 	// 登记下载。产物在 jobDir 里，6 小时后由 cleanupOldJobs 连同记录一起清掉——
 	// 这正是「没下载就要重新执行」的语义。
 	jobsMu.Lock()
@@ -1156,6 +1201,7 @@ func runOneBillTask(taskID int64) (*taskRunOutcome, error) {
 		task:              task,
 		billFileName:      filepath.Base(result.BillPath),
 		costSummary:       result.CostSummary,
+		billSummary:       result.BillSummary,
 		logPath:           result.LogPath,
 		logRowCount:       result.LogRowCount,
 		summary:           result.Summary,
@@ -1376,16 +1422,29 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channelIDs, err := billing.ExtractChannelIDs(headers, rows)
-	if err != nil {
-		// 日志没有 channel_id 列：这不是「检查失败」，而是这份日志做不了成本估算。
+	// 用 ExtractChannelUsage 而不是 ExtractChannelIDs：后者的渠道号只能来自
+	// channel_id 列，而手工用 SQL 导出的日志没有那一列，渠道号藏在
+	// other.admin_info.use_channel 里。走前者两条来源都能认，页面少一次「重新导出」。
+	usage, hasChannelInfo := billing.ExtractChannelUsage(headers, rows)
+	if !hasChannelInfo {
+		// 两处都取不到渠道号：这不是「检查失败」，而是这份日志做不了成本估算。
 		// 明确说清原因与下一步动作，页面才好引导用户重新导出。
+		// noChannelInfo 与 hasChannelColumn 分开报：前者是「这份日志没渠道号」，
+		// 后者是「连 channel_id 列都没有」——页面据此选提示语。
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"hasChannelColumn": false,
-			"message":          err.Error(),
+			"hasChannelColumn":      false,
+			"noChannelInfo":         true,
+			"missingGroupRatioRows": billing.CountMissingGroupRatioRows(headers, rows),
+			"totalRows":             len(rows),
+			"message": "这份日志里取不到渠道号（既没有 channel_id 列，other 里也没有" +
+				"use_channel）：无法检查上游倍率。请用「导出日志明细」重新导出一份带 channel_id 的日志。",
 		})
 		return
 	}
+
+	channelIDs := billing.UsedChannelIDs(usage)
+
+	groupChannels := billing.GroupChannelMap(usage)
 
 	ratios, err := billing.ChannelRatioMap(*pgConfig)
 	if err != nil {
@@ -1434,6 +1493,12 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		"missingChannels":   status.Missing,
 		"unknownChannelIds": status.UnknownChannelIDs,
 		"channelTableEmpty": len(channelList) == 0,
+		// 按分组归类的渠道（页面分节展示用，见上面的 groupChannels）。
+		"groupChannels": groupChannels,
+		// group_ratio 缺失的行数：这些行的官方刊例反推不出来，成本列会留空。
+		// 与「渠道没维护倍率」是两件事（一个补倍率、一个查日志），所以分开报。
+		"missingGroupRatioRows": billing.CountMissingGroupRatioRows(headers, rows),
+		"totalRows":             len(rows),
 	})
 }
 
@@ -1659,6 +1724,12 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 		// 前端只负责渲染与复制，不再自己拼金额。
 		resp["costSummary"] = result.CostSummary
 		resp["costTotals"] = result.CostTotals
+	}
+	// 简易账单的可复制文字。它与成本利润摘要分开两个键：内容口径不同
+	// （站点实收额度 vs 刊例×折扣），前端按「哪个键有值」决定显示哪种说明。
+	// 简易账单不产成本利润表，所以这两个键不会同时有值。
+	if result.BillSummary != "" {
+		resp["billSummary"] = result.BillSummary
 	}
 	// 被拦下的情形**不是错误**：账单已经生成并登记好了，只是成本利润表没出，
 	// 把待补录的渠道清单交给页面，用户补完倍率再勾一次即可。

@@ -387,6 +387,23 @@ function selectCostSummary() {
   selectElementText(costSummaryRef.value)
 }
 
+// 简易账单摘要的复制，与成本利润摘要同一套逻辑。
+// 状态单独一个 ref：两段文字可能同页出现（不同次出账的结果），
+// 共用一个状态会让点一个、另一个按钮也跟着变。
+const billSummaryRef = ref(null)
+const billCopyState = ref('')
+
+async function copyBillSummary() {
+  const text = result.value && result.value.billSummary
+  if (!text) return
+  const state = await copyText(text)
+  if (state === 'fail') selectElementText(billSummaryRef.value)
+  billCopyState.value = state
+  setTimeout(() => {
+    billCopyState.value = ''
+  }, 2000)
+}
+
 // isSimpleTemplate 选了简易汇总账单。简易模板不参与定价，所以与定价有关的
 // 表单项（折扣、单价来源、手工补价、渠道倍率、成本利润表、计费参数列）
 // 对它都没有意义 —— 藏着而不是禁用，避免用户对着一个永远不生效的选项发问。
@@ -462,6 +479,24 @@ const checkChannelsMsg = ref('')
 // 日志里用到的渠道 + 各自填写的倍率，可就地补录。
 const usedChannels = ref([])
 const usedRatioDraft = ref({})
+// 分组名 → 该分组下用到的渠道号。同一份日志里一个渠道可能出现在多个分组下，
+// 所以是「分组 → 渠道」而不是反查；展示时按分组分节，与用户认知一致。
+const usedGroupChannels = ref({})
+// 日志里 group_ratio 缺失的行数。这些行反推不出官方刊例，成本列会留空——
+// 与「渠道没维护倍率」是两回事（一个查日志、一个补倍率），所以分开报。
+const checkChannelsMissGroupRatio = ref(0)
+
+// usedGroupsOf 取某个渠道出现在哪些分组，供表格里按分组归组显示。
+// 没有分组信息（老接口、或日志没有 group 列）时返回空数组，
+// 模板那边会退化成「不显示分组」而不是显示一个空标签。
+function usedGroupsOf(channelId) {
+  const map = usedGroupChannels.value || {}
+  const out = []
+  for (const [group, ids] of Object.entries(map)) {
+    if (Array.isArray(ids) && ids.includes(channelId)) out.push(group)
+  }
+  return out
+}
 const savingUsedRatios = ref(false)
 
 // usedMissingCount 数的是**服务端真的没维护**的渠道，用来提示还要补几个。
@@ -499,6 +534,8 @@ async function checkChannels() {
   checkChannelsDone.value = false
   usedChannels.value = []
   usedRatioDraft.value = {}
+  usedGroupChannels.value = {}
+  checkChannelsMissGroupRatio.value = 0
 
   const fd = new FormData()
   if (!appendSourceFields(fd, checkChannelsError)) return
@@ -521,6 +558,8 @@ async function checkChannels() {
     }
 
     usedChannels.value = data.usedChannels || []
+    usedGroupChannels.value = data.groupChannels || {}
+    checkChannelsMissGroupRatio.value = data.missingGroupRatioRows || 0
     const draft = {}
     for (const c of usedChannels.value) {
       draft[c.channelId] = c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
@@ -1418,6 +1457,12 @@ async function handleSubmit() {
           </button>
         </div>
         <p class="error" v-if="checkChannelsError">{{ checkChannelsError }}</p>
+        <!-- group_ratio 缺失与「渠道没维护倍率」是两件事：一个查日志、一个补倍率。
+             分开说，用户才知道该去哪儿。 -->
+        <p class="error" v-if="checkChannelsMissGroupRatio > 0">
+          日志里有 {{ checkChannelsMissGroupRatio }} 行缺少分组倍率（group_ratio），
+          这些行的官方刊例反推不出来，成本与利润会留空。请检查日志来源是否完整。
+        </p>
         <span class="hint" v-if="checkChannelsMsg">{{ checkChannelsMsg }}</span>
 
         <div v-if="checkChannelsDone && usedChannels.length > 0">
@@ -1437,6 +1482,7 @@ async function handleSubmit() {
               <tr>
                 <th>渠道 ID</th>
                 <th>渠道名称</th>
+                <th>分组</th>
                 <th>上游倍率</th>
                 <th>状态</th>
               </tr>
@@ -1452,6 +1498,18 @@ async function handleSubmit() {
               >
                 <td>{{ c.channelId }}</td>
                 <td>{{ c.name }}</td>
+                <!-- 分组是**日志里实际出现过的**分组名，取自本次日志的 group 列，
+                     不是渠道表里那个「能服务哪些分组」的候选集合。用户按分组认知业务，
+                     倍率却锚在渠道上，这一列就是两者的对应关系。 -->
+                <td>
+                  <span v-if="usedGroupsOf(c.channelId).length === 0" class="hint inline">—</span>
+                  <span
+                    v-for="g in usedGroupsOf(c.channelId)"
+                    :key="g"
+                    class="tag"
+                    style="margin-right: 4px"
+                  >{{ g }}</span>
+                </td>
                 <td>
                   <input
                     v-model="usedRatioDraft[c.channelId]"
@@ -1517,6 +1575,17 @@ async function handleSubmit() {
           </button>
         </div>
         <pre ref="costSummaryRef" class="cost-summary-text" @click="selectCostSummary">{{ result.costSummary }}</pre>
+      </div>
+
+      <!-- 简易账单摘要：与成本利润摘要互斥（模板二不产成本表），复用同一套复制逻辑。 -->
+      <div v-if="result.billSummary" class="cost-summary">
+        <div class="cost-summary-head">
+          <strong>账单摘要</strong>
+          <button type="button" class="btn-browse" @click="copyBillSummary">
+            {{ billCopyState === 'ok' ? '已复制 ✓' : billCopyState === 'fail' ? '复制失败，请手动选中' : '复制' }}
+          </button>
+        </div>
+        <pre ref="billSummaryRef" class="cost-summary-text" @click="selectBillSummary">{{ result.billSummary }}</pre>
       </div>
 
       <!-- 成本利润表被拦下：账单已生成，只是有渠道没维护倍率。不是错误，给出补录入口。 -->

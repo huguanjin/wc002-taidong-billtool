@@ -40,6 +40,13 @@ type BillTask struct {
 	// 否则每次执行都要重选，「先建好计划、之后批量执行」就没意义了。
 	GenerateSanitized bool `json:"generateSanitized"`
 	GenerateCost      bool `json:"generateCost"`
+	// CheckCost 成本核算开关：执行前检查本任务日志用到的渠道是否都维护了上游倍率，
+	// 缺了就拦下让用户就地补录。默认 true。
+	//
+	// 与 GenerateCost 分开：GenerateCost 决定「要不要那张成本利润表」，
+	// 这个决定「要不要保证成本算得对」。有的客户不需要成本表，但出账的人仍然想知道
+	// 这一期的成本——那时只勾这个、不勾 GenerateCost。
+	CheckCost bool `json:"checkCost"`
 	// BillTemplate 出账模板（见 BillTemplateStandard / BillTemplateSimple）。
 	//
 	// 空串 = 标准模板，与加这个字段之前的行为一致。存在计划上而不是全局设置里，
@@ -166,6 +173,7 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 			end_time TIMESTAMPTZ,
 			generate_sanitized BOOLEAN NOT NULL DEFAULT true,
 			generate_cost BOOLEAN NOT NULL DEFAULT true,
+			check_cost BOOLEAN NOT NULL DEFAULT true,
 			bill_template TEXT NOT NULL DEFAULT '',
 			settle_cny DOUBLE PRECISION,
 			list_cny DOUBLE PRECISION,
@@ -200,6 +208,9 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS generate_cost BOOLEAN NOT NULL DEFAULT true`,
 		// 出账模板：空串 = 标准模板（与加这列之前的行为一致），'simple' = 简易汇总。
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS bill_template TEXT NOT NULL DEFAULT ''`,
+		// 成本核算开关：默认 true（对应「默认勾选」）。老计划加列后自动变为勾选，
+		// 与 generate_cost 同样的默认值——两者都是「默认就该做成本核算」的语义。
+		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS check_cost BOOLEAN NOT NULL DEFAULT true`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS run_count INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS last_run_at TIMESTAMPTZ`,
 		// 未执行的计划还没有金额，这几列必须可空。
@@ -256,11 +267,11 @@ func CreateBillTask(cfg PGConfig, t BillTask) (BillTask, error) {
 	err = db.QueryRow(`
 		INSERT INTO bill_export_tasks
 			(customer_id, customer_name, name, period_year, period_month,
-			 start_time, end_time, generate_sanitized, generate_cost, bill_template)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 start_time, end_time, generate_sanitized, generate_cost, check_cost, bill_template)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		RETURNING id, generated_at
 	`, t.CustomerID, t.CustomerName, t.Name, t.PeriodYear, t.PeriodMonth,
-		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.BillTemplate,
+		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost, t.BillTemplate,
 	).Scan(&t.ID, &t.GeneratedAt)
 	if err != nil {
 		return BillTask{}, fmt.Errorf("新建账单计划失败: %w", err)
@@ -295,10 +306,11 @@ func UpdateBillTask(cfg PGConfig, t BillTask) error {
 			end_time = $6,
 			generate_sanitized = $7,
 			generate_cost = $8,
-			bill_template = $9
+			check_cost = $9,
+			bill_template = $10
 		WHERE id = $1
 	`, t.ID, t.Name, t.PeriodYear, t.PeriodMonth,
-		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.BillTemplate)
+		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost, t.BillTemplate)
 	if err != nil {
 		return fmt.Errorf("保存账单计划失败: %w", err)
 	}
@@ -364,7 +376,7 @@ func GetBillTask(cfg PGConfig, id int64) (BillTask, error) {
 // 列顺序必须与 scanBillTasks 的 Scan 一一对应。
 const billTaskColumns = `
 	id, customer_id, customer_name, name, period_year, period_month,
-	start_time, end_time, generate_sanitized, generate_cost, bill_template,
+	start_time, end_time, generate_sanitized, generate_cost, check_cost, bill_template,
 	settle_cny, list_cny, overall_discount,
 	costed_settle_cny, cost_cny, profit_cny, cost_complete,
 	priced_rows, total_cost_rows, row_count,
@@ -380,7 +392,7 @@ func scanBillTasks(rows *sql.Rows) ([]BillTask, error) {
 		var settle, list, discount, costedSettle, cost, profit sql.NullFloat64
 		if err := rows.Scan(
 			&t.ID, &t.CustomerID, &t.CustomerName, &t.Name, &t.PeriodYear, &t.PeriodMonth,
-			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.BillTemplate,
+			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.CheckCost, &t.BillTemplate,
 			&settle, &list, &discount,
 			&costedSettle, &cost, &profit, &t.CostComplete,
 			&t.PricedRows, &t.TotalCostRows, &t.RowCount,

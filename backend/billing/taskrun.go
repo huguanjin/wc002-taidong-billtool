@@ -80,9 +80,19 @@ type TaskRunResult struct {
 	MissingChannelInfos []ChannelInfo
 	UnknownChannelIDs   []int
 	CostSummary         string // 可复制的成本利润摘要，为空表示无成本数据
-	Summary             Summary
-	LogPath             string // 导出的源日志
-	LogRowCount         int64
+	// BillSummary 简易账单（模板二）的可复制文字，为空表示本次用的是标准模板。
+	// 与 CostSummary 互斥：简易账单不产成本利润表，标准模板不产账单摘要。
+	BillSummary string
+	// ChannelCheck 非 nil 表示本次执行**没出账**，而是被成本核算预检拦下了：
+	// 日志里有渠道没维护上游倍率，需要用户就地补录后重跑。
+	//
+	// 它不是错误（所以没有走 error 返回）：调用方应把它当作一个可继续的中间态，
+	// 去渲染补录界面，而不是报失败。此时 Task 里的结果字段全是零值，
+	// **不能落库**——否则会把上一次跑出来的好数字覆盖成空。
+	ChannelCheck *ChannelCheckResult
+	Summary      Summary
+	LogPath      string // 导出的源日志
+	LogRowCount  int64
 }
 
 // RunBillExportTask 执行一条计划。
@@ -138,6 +148,59 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			customer.Name, start.Format("2006-01-02"), end.Format("2006-01-02"), len(usernames))
 	}
 
+	// ---- 3.5 成本核算预检：日志用到的渠道是否都维护了上游倍率 ----
+	//
+	// 放在这里（导出之后、出账之前）是唯一可选的时点：要判断缺哪些倍率，
+	// 必须先知道这份日志用到哪些渠道，而渠道集合只有导出后才知道。
+	//
+	// 缺倍率时**不是错误**，而是返回一个可继续的中间态（同 CostBlocked 的哲学）：
+	// 用户已经填好计划参数，硬报错会让他白填一遍。页面拿到 blocked 结果后就地补录，
+	// 保存后重新执行即可。
+	var blocked *ChannelCheckResult
+	if task.CheckCost || task.GenerateCost {
+		headers, rows, rerr := LoadLogRows(exported.Path, "", "")
+		if rerr != nil {
+			return nil, fmt.Errorf("读取已导出的日志失败: %w", rerr)
+		}
+
+		ratios, cerr := ChannelRatioMap(deps.PG)
+		if cerr != nil {
+			return nil, cerr
+		}
+		channelList, cerr := ListChannels(deps.PG)
+		if cerr != nil {
+			return nil, cerr
+		}
+		infoMap := make(map[int]ChannelInfo, len(channelList))
+		for _, c := range channelList {
+			infoMap[c.ChannelID] = c.ChannelInfo
+		}
+
+		usage, hasChannelInfo := ExtractChannelUsage(headers, rows)
+		if !hasChannelInfo {
+			// 这份日志里一个渠道号都没有（既没有 channel_id 列，other 里也没有
+			// use_channel）——做不了渠道检查。如实报出，而不是当成「无需检查」：
+			// 后者会让用户以为已经检查过了。
+			blocked = &ChannelCheckResult{
+				UsedChannels:          []UsedChannel{},
+				Missing:               []ChannelIssue{},
+				MissingGroupRatioRows: CountMissingGroupRatioRows(headers, rows),
+				TotalRows:             len(rows),
+			}
+			blocked.NoChannelInfo = true
+		} else {
+			check := CheckChannelRatios(usage, ratios, infoMap)
+			check.MissingGroupRatioRows = CountMissingGroupRatioRows(headers, rows)
+			check.TotalRows = len(rows)
+			if len(check.Missing) > 0 {
+				blocked = &check
+			}
+		}
+		if blocked != nil {
+			return &TaskRunResult{TaskID: task.ID, Task: task, Customer: customer, ChannelCheck: blocked}, nil
+		}
+	}
+
 	// ---- 4. 装载默认出账参数 ----
 	settings, err := GetSettings(deps.PG)
 	if err != nil {
@@ -168,6 +231,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		IncludeBillingParams: settings.IncludeBillingParams,
 		DomesticMarkers:      settings.DomesticMarkerList(),
 		GenerateCost:         task.GenerateCost,
+		CheckCost:            task.CheckCost,
 		BillTemplate:         task.BillTemplate,
 		SummaryHeader:        summaryHeader(customer, start, end),
 		// 产物文件名带上客户名：一个 job 目录里可能同时躺着好几个客户的表，
@@ -175,25 +239,33 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		CustomerName: customer.Name,
 	}
 
-	// 成本利润表需要渠道上游倍率；从本地 PG 读好传进去（billing 的算账逻辑不连 PG）。
+	// 渠道上游倍率：两条模板路径都要，但用途不同——
 	//
-	// 简易账单不产出成本利润表，直接不装载：白读两次 PG，而且一旦渠道表有问题
-	// （比如没拉过清单）会连一张本来不需要渠道数据的汇总账单都跑不出来。
-	if task.GenerateCost && !IsSimpleBillTemplate(task.BillTemplate) {
+	//	模板一：GenerateCost 时用来算那张独立的成本利润表
+	//	模板二：CheckCost 时用来填账单上的成本三列（见 AggregateSimpleBill）
+	//
+	// 两者的门槛写在一起，是为了让「成本列什么时候有值」与「预检什么时候跑」
+	// 保持同一个条件。分开写迟早会漂移，表现是账单上的成本列全空而预检明明跑过了。
+	if (task.GenerateCost && !IsSimpleBillTemplate(task.BillTemplate)) ||
+		(task.CheckCost && IsSimpleBillTemplate(task.BillTemplate)) {
 		ratios, err := ChannelRatioMap(deps.PG)
 		if err != nil {
 			return nil, err
 		}
-		channels, err := ListChannels(deps.PG)
-		if err != nil {
-			return nil, err
-		}
 		params.ChannelUpstreamRatios = ratios
-		params.ChannelNames = make(map[int]string, len(channels))
-		params.ChannelInfos = make(map[int]ChannelInfo, len(channels))
-		for _, c := range channels {
-			params.ChannelNames[c.ChannelID] = c.Name
-			params.ChannelInfos[c.ChannelID] = c.ChannelInfo
+		// 渠道名与渠道信息只有模板一写成本利润表时才用得上。模板二不需要它们，
+		// 就不读渠道清单了——少一次全表扫描，也少一个「清单读不到就整单跑不出来」的失败点。
+		if !IsSimpleBillTemplate(task.BillTemplate) {
+			channels, err := ListChannels(deps.PG)
+			if err != nil {
+				return nil, err
+			}
+			params.ChannelNames = make(map[int]string, len(channels))
+			params.ChannelInfos = make(map[int]ChannelInfo, len(channels))
+			for _, c := range channels {
+				params.ChannelNames[c.ChannelID] = c.Name
+				params.ChannelInfos[c.ChannelID] = c.ChannelInfo
+			}
 		}
 	}
 
@@ -241,6 +313,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		MissingChannelInfos: gen.MissingChannelInfos,
 		UnknownChannelIDs:   gen.UnknownChannelIDs,
 		CostSummary:         gen.CostSummary,
+		BillSummary:         gen.BillSummary,
 		Summary:             gen.Summary,
 		LogPath:             exported.Path,
 		LogRowCount:         exported.RowCount,
