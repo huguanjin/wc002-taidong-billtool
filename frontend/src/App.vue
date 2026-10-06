@@ -3,6 +3,7 @@ import { ref, computed, nextTick, onMounted } from 'vue'
 import ChannelRatios from './ChannelRatios.vue'
 import Customers from './Customers.vue'
 import BillTasks from './BillTasks.vue'
+import CustomerDiscounts from './CustomerDiscounts.vue'
 import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
@@ -11,6 +12,7 @@ import { copyText, selectElementText } from './clipboard'
 const activePage = ref('bill')
 const channelRatiosRef = ref(null)
 const customersRef = ref(null)
+const customerDiscountsRef = ref(null)
 const billTasksRef = ref(null)
 
 const authChecked = ref(false)
@@ -910,6 +912,11 @@ async function handleSubmit() {
         :class="{ active: activePage === 'channels' }"
         @click="activePage = 'channels'"
       >渠道成本倍率</button>
+      <button
+        type="button"
+        :class="{ active: activePage === 'discounts' }"
+        @click="activePage = 'discounts'"
+      >客户折扣</button>
     </div>
 
     <!-- 账单导出任务：独立页面 -->
@@ -930,6 +937,13 @@ async function handleSubmit() {
     <ChannelRatios
       v-if="activePage === 'channels'"
       ref="channelRatiosRef"
+      @unauthorized="authenticated = false"
+    />
+
+    <!-- 客户折扣：独立页面 -->
+    <CustomerDiscounts
+      v-if="activePage === 'discounts'"
+      ref="customerDiscountsRef"
       @unauthorized="authenticated = false"
     />
 

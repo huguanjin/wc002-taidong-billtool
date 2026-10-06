@@ -30,17 +30,16 @@ type GenerateResult struct {
 	Summary     Summary
 }
 
-// GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
-// dbPriceCachePath 是「拉取最新数据库价格」写出的本地 JSON 文件路径，出账时只读此文件，不连接数据库。
-func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, outputDir string, params Params) (*GenerateResult, error) {
-	var book *PriceBook
-	var exprSetting *BillingExprSetting
-	var err error
+// loadBillingPriceBook 按计价来源装载价表。
+//
+// 抽出来是因为「预览分组折扣」也要读同一份价表——两处各写一遍的话，
+// 页面上显示的折扣会与实际出账时用的不一致，而那正是这个功能要消灭的问题。
+func loadBillingPriceBook(params Params, priceTablePath, dbPriceCachePath string) (*PriceBook, *BillingExprSetting, error) {
 	switch params.PriceSource {
 	case PriceSourceDB:
-		book, exprSetting, _, err = LoadDBPriceCache(dbPriceCachePath)
+		book, exprSetting, _, err := LoadDBPriceCache(dbPriceCachePath)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// LoadDBPriceCache 只读数据库实时价格，不含 price_table.xlsx 人工维护的厂商家族
 		// 折扣 sheet（如「国产模型」sheet 里 DeepSeek=6折）；不补上的话这些分组会整组掉进
@@ -54,14 +53,30 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 				}
 			}
 		}
+		return book, exprSetting, nil
 	default:
-		book, err = LoadPriceBook(priceTablePath)
+		book, err := LoadPriceBook(priceTablePath)
 		if err != nil {
-			return nil, fmt.Errorf("加载报价表失败: %w", err)
+			return nil, nil, fmt.Errorf("加载报价表失败: %w", err)
 		}
+		return book, nil, nil
+	}
+}
+
+// PreferPriceTableFor 该计价来源下是否优先用报价表里的价格。
+func PreferPriceTableFor(source PriceSource) bool {
+	return source == PriceSourcePriceTable || source == PriceSourceDB
+}
+
+// GenerateBill 对应 log_to_bill.py 的 main()：读日志→提取缓存→聚合定价→写账单模板→（可选）写脱敏日志。
+// dbPriceCachePath 是「拉取最新数据库价格」写出的本地 JSON 文件路径，出账时只读此文件，不连接数据库。
+func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, outputDir string, params Params) (*GenerateResult, error) {
+	book, exprSetting, err := loadBillingPriceBook(params, priceTablePath, dbPriceCachePath)
+	if err != nil {
+		return nil, err
 	}
 	// official 模式下内置官方价优先；price_table/db 模式下报价表/数据库价格优先。
-	preferPriceTable := params.PriceSource == PriceSourcePriceTable || params.PriceSource == PriceSourceDB
+	preferPriceTable := PreferPriceTableFor(params.PriceSource)
 	mergeManualPrices(book, params.ManualPrices)
 
 	headers, rows, err := LoadLogRows(inputPath, params.Sheet, params.Encoding)
@@ -123,7 +138,11 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		year = agg.Year
 	}
 
-	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers)
+	// 折扣覆盖只在这里拼装一次，再往下传给账单、成本利润表与前端摘要三处。
+	// 三处各拼各的话，迟早出现「账单用了手工折扣、页面摘要没用」这种不一致。
+	ov := DiscountOverrides{Forced: params.Discount, Manual: params.ManualDiscounts}
+
+	missingPrices, err := WriteBillFromTemplate(templatePath, billPath, agg.Rows, year, month, book, ov, exchangeRate, preferPriceTable, params.DomesticMarkers)
 	if err != nil {
 		return nil, fmt.Errorf("写出账单失败: %w", err)
 	}
@@ -134,14 +153,14 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 		}
 	}
 
-	summary := buildSummary(agg, book, exchangeRate, preferPriceTable, missingPrices, params.DomesticMarkers)
+	summary := buildSummary(agg, book, exchangeRate, ov, missingPrices, params.DomesticMarkers)
 
 	result := &GenerateResult{BillPath: billPath, SanitizedPath: sanitizedPath, Summary: summary}
 
 	// 成本利润表是增量产物：不生成时账单与改动前逐格一致，不影响既有客户。
 	if params.GenerateCost {
 		costPath, totals, summaryText, blocked, missing, unknown, cerr := generateCostTable(
-			inputPath, templatePath, billPath, rows, headers, book, params, exchangeRate, preferPriceTable, year, month)
+			inputPath, templatePath, billPath, rows, headers, book, params, ov, exchangeRate, preferPriceTable, year, month)
 		if cerr != nil {
 			return nil, cerr
 		}
@@ -166,7 +185,7 @@ func GenerateBill(inputPath, templatePath, priceTablePath, dbPriceCachePath, out
 //
 // 返回 (成本利润表路径, 合计, 可复制文字, 是否被拦下, 未维护渠道, 未知渠道号, 错误)。
 func generateCostTable(inputPath, templatePath, billPath string, rows [][]string, headers []string,
-	book *PriceBook, params Params, exchangeRate float64, preferPriceTable bool, year, month int) (
+	book *PriceBook, params Params, ov DiscountOverrides, exchangeRate float64, preferPriceTable bool, year, month int) (
 	string, *CostTotals, string, bool, []ChannelInfo, []int, error) {
 
 	channelIDs, err := ExtractChannelIDs(headers, rows)
@@ -189,12 +208,12 @@ func generateCostTable(inputPath, templatePath, billPath string, rows [][]string
 
 	outPath := costOutputPath(billPath)
 	if err := WriteCostFromTemplate(templatePath, outPath, costRows, year, month, book,
-		params.Discount, exchangeRate, preferPriceTable, params.DomesticMarkers); err != nil {
+		ov, exchangeRate, preferPriceTable, params.DomesticMarkers); err != nil {
 		return "", nil, "", false, nil, nil, fmt.Errorf("写出成本利润表失败: %w", err)
 	}
 	// 合计与文字用与表内公式同源的口径算，避免结果区报的数与 xlsx 里的 SUM 对不上。
-	totals, text := SummarizeCost(costRows, book, params.Discount, exchangeRate,
-		preferPriceTable, params.DomesticMarkers, year, month, params.SummaryHeader)
+	totals, text := SummarizeCost(costRows, book, ov, exchangeRate,
+		params.DomesticMarkers, year, month, params.SummaryHeader)
 	// 未知渠道不拦生成，但必须如实报出：成本利润表里它们的成本列是空的，
 	// 用户得知道是哪几个渠道号——否则会以为成本利润表已经算全了。
 	return outPath, &totals, text, false, nil, status.UnknownChannelIDs, nil
@@ -211,10 +230,15 @@ func mergeManualPrices(book *PriceBook, manual map[string]ManualPriceInput) {
 	}
 }
 
-func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, preferPriceTable bool, missingPrices []string, manualMarkers []string) Summary {
+// buildSummary 生成给前端展示的逐行摘要。
+//
+// ov 必须与写账单时传的是同一份：这里算的是「结算额 = 刊例 × 结算系数」，
+// 与账单 V 列同一公式。若两处用不同的折扣（比如这里固定不传覆盖），
+// 页面上的折扣与金额会和刚下载的账单对不上——同一笔账两个数，比不显示更糟。
+func buildSummary(agg *AggregateResult, book *PriceBook, exchangeRate float64, ov DiscountOverrides, missingPrices []string, manualMarkers []string) Summary {
 	rowSummaries := make([]RowSummary, 0, len(agg.Rows))
 	settleTotal, listTotal := 0.0, 0.0
-	discountResult := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, nil, preferPriceTable, manualMarkers)
+	discountResult := ComputeGroupDiscounts(agg.Rows, book, exchangeRate, ov, manualMarkers)
 
 	for _, a := range agg.Rows {
 		list := 0.0

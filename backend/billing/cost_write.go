@@ -24,7 +24,7 @@ const (
 //
 // 渠道信息一律放追加列，不动 C 列的分组标识——那样会破坏与账单的行对应关系。
 func WriteCostFromTemplate(templatePath, outputPath string, rows []*CostRow, year, month int,
-	book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) error {
+	book *PriceBook, ov DiscountOverrides, exchangeRate float64, preferPriceTable bool, manualMarkers []string) error {
 
 	extras := []extraColumn{
 		{
@@ -105,7 +105,7 @@ func WriteCostFromTemplate(templatePath, outputPath string, rows []*CostRow, yea
 
 	// 未维护倍率的渠道在备注里说明，且其成本不参与合计（公式里 AF 为空，SUM 自动跳过）。
 	if _, err := writeTemplateSheet(templatePath, outputPath, aggs, extras, year, month,
-		book, discount, exchangeRate, preferPriceTable, manualMarkers); err != nil {
+		book, ov, exchangeRate, preferPriceTable, manualMarkers); err != nil {
 		return err
 	}
 	return nil
@@ -117,11 +117,11 @@ func WriteCostFromTemplate(templatePath, outputPath string, rows []*CostRow, yea
 // 成本 = Σ(官方刊例人民币 × 上游折扣)（AG 列），利润 = 结算额 − 成本（AH 列）。
 // 未维护倍率的行两边都跳过：成本不计入，结算额也不计入——否则会出现
 // 「利润 = 全量结算 − 部分成本」这种把毛利算虚高的组合。
-func SummarizeCost(rows []*CostRow, book *PriceBook, discount *float64, exchangeRate float64,
-	preferPriceTable bool, manualMarkers []string, year, month int, header []string) (CostTotals, string) {
+func SummarizeCost(rows []*CostRow, book *PriceBook, ov DiscountOverrides, exchangeRate float64,
+	manualMarkers []string, year, month int, header []string) (CostTotals, string) {
 
 	// 结算系数按 Group 取，与写出时同一套 ComputeGroupDiscounts。
-	discountResult := ComputeGroupDiscounts(aggRowsOf(rows), book, exchangeRate, discount, preferPriceTable, manualMarkers)
+	discountResult := ComputeGroupDiscounts(aggRowsOf(rows), book, exchangeRate, ov, manualMarkers)
 
 	var totals CostTotals
 	channelSeen := map[int]bool{}
@@ -144,6 +144,7 @@ func SummarizeCost(rows []*CostRow, book *PriceBook, discount *float64, exchange
 	totals.SettleCNY = round(totals.SettleCNY, MoneyDecimals)
 	totals.ProfitCNY = round(totals.SettleCNY-totals.CostCNY, MoneyDecimals)
 	totals.ChannelCount = len(channelSeen)
+	totals.RateCNYPerUSD = exchangeRate
 
 	return totals, FormatCostSummary(totals, year, month, header)
 }
@@ -169,10 +170,18 @@ func FormatCostSummary(t CostTotals, year, month int, header []string) string {
 		b.WriteByte('\n')
 	}
 	fmt.Fprintf(&b, "账期：%s\n", period)
-	fmt.Fprintf(&b, "结算金额：¥%s\n", trimMoney(t.SettleCNY))
-	fmt.Fprintf(&b, "上游成本：¥%s\n", trimMoney(t.CostCNY))
-	fmt.Fprintf(&b, "利润：¥%s（毛利率 %s%%）\n", trimMoney(t.ProfitCNY), trimPercent(margin))
+	fmt.Fprintf(&b, "结算金额：%s\n", moneyPair(t.SettleCNY, t.RateCNYPerUSD, 2))
+	fmt.Fprintf(&b, "上游成本：%s\n", moneyPair(t.CostCNY, t.RateCNYPerUSD, 2))
+	// 毛利率单独用逗号收尾，不套括号：美金金额已经占了一对括号，
+	// 再套一层会变成「（$878.09）（毛利率 40.58%）」这种连着的双括号，很难读。
+	fmt.Fprintf(&b, "利润：%s，毛利率 %s%%\n",
+		moneyPair(t.ProfitCNY, t.RateCNYPerUSD, 2), trimPercent(margin))
 	fmt.Fprintf(&b, "覆盖渠道：%d 个；明细行：%d 行", t.ChannelCount, t.PricedRows)
+	// 汇率写在金额之后、注解之前：看到美金数字的人马上能核对口径，
+	// 而不是回头问「这是按几算的」。没汇率就不写，不编一个默认值糊上去。
+	if t.RateCNYPerUSD > 0 {
+		fmt.Fprintf(&b, "\n汇率：%s（人民币/美金）", trimFixed(t.RateCNYPerUSD, 4))
+	}
 
 	// 有行没参与合计时必须说出来。否则这段文字会被读成「整体利润」，
 	// 而它实际上只覆盖了已维护倍率的那些渠道。
@@ -183,10 +192,32 @@ func FormatCostSummary(t CostTotals, year, month int, header []string) string {
 	return b.String()
 }
 
+// moneyPair 把一个人民币金额同时写成人币与美金，形如「¥15146.6056（$2163.81）」。
+//
+// 为什么要一起给：有的客户按美金结算，他们拿到账单要先换算才知道自己该付多少。
+// 换算必须用**同一笔账的汇率**——等额的人民币在不同汇率下是两个美金数，
+// 所以这里直接取合计里记着的那次出账汇率，不去读全局默认值。
+// 汇率缺失（<=0）时只写人民币，宁可少给也不给一个按未知汇率算出来的数。
+//
+// 美金固定两位小数：它是对外报价用的金额，四位小数没有意义，反而显得不可信。
+func moneyPair(cny, exchangeRate float64, usdDecimals int) string {
+	if exchangeRate <= 0 {
+		return "¥" + trimMoney(cny)
+	}
+	usd := cny / exchangeRate
+	return fmt.Sprintf("¥%s（$%s）", trimMoney(cny),
+		trimFixed(usd, usdDecimals))
+}
+
 // trimMoney 金额去掉多余的尾零：对外文案里「¥15146.6056」比「¥15146.605600」好读，
 // 而「¥100」也不该写成「¥100.0000」。
 func trimMoney(v float64) string {
-	s := strconv.FormatFloat(round(v, MoneyDecimals), 'f', MoneyDecimals, 64)
+	return trimFixed(v, MoneyDecimals)
+}
+
+// trimFixed 四舍五入到指定小数位，再去掉多余的尾零。
+func trimFixed(v float64, decimals int) string {
+	s := strconv.FormatFloat(round(v, decimals), 'f', decimals, 64)
 	s = strings.TrimRight(s, "0")
 	return strings.TrimSuffix(s, ".")
 }

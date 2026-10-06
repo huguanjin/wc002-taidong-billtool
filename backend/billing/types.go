@@ -64,6 +64,21 @@ type AggRow struct {
 	// 且 AC 列公式（单价×用量）会连带把总金额放大约汇率倍。
 	// 聚合口径（OfficialUSD 已折算成美金、×汇率还原人民币）与它无关。
 	ExprUnitCurrency string
+	// QuotaDelta 本桶内**额度调整行**的净额，单位与 Quota 相同（quota 计数）。
+	//
+	// 额度调整行指异步任务的结算与退款日志（other 里带 task_id）：任务提交时按预扣
+	// 全额记一条消费日志，完成或失败后再补一条差额/退款日志。这些行**不是**新的消费，
+	// 只是把预扣的额度调回真实值，所以：
+	//   - 正数表示站点退还给用户（type=6 退款），净结算要减掉它；
+	//   - 负数表示补扣（type=2 的 delta>0 结算行），净结算要加上它。
+	//
+	// 它们绝不能累加进 Quota / OfficialUSD / 各 token 列：刊例代表「这次请求本来就
+	// 值多少钱」，退款不改变这个事实，改变的是最终结算了多少。混进刊例会连带污染
+	// 折扣反推的分母（见 HasRatioDiscount 的说明）。
+	QuotaDelta float64
+	// HasQuotaAdjustment 本桶是否含额度调整行。
+	// 含退款时 HasRatioDiscount 的恒等式不成立，该桶必须退出「按精确倍率结算」那条路。
+	HasQuotaAdjustment bool
 }
 
 // ExprUnitDivisor 表达式单价列落成「美金/百万token」要除的数：
@@ -88,7 +103,15 @@ func (a *AggRow) ExprUnitDivisor(exchangeRate float64) float64 {
 //
 // 外部对标价的行（官网价/价表/ratio 快照）不满足这个关系：它们的 GroupRatio
 // 与「对标价」之间没有这种推导关系，硬套会把金额算错，所以返回 false 交回原逻辑。
+//
+// 桶内含额度调整（任务退款/补扣）时同样返回 false：那个恒等式的两边一边用 quota、
+// 一边用 OfficialUSD，退款只会动 quota（净额变了而刊例没变），等式立刻不成立。
+// 硬按倍率结算会让这一桶少收/多收恰好等于退款额的钱，而且看起来一切正常。
+// 交回反推路径后，结算系数会由「净结算 / 刊例人民币」算出，账实重新相符。
 func (a *AggRow) HasRatioDiscount() bool {
+	if a.HasQuotaAdjustment {
+		return false
+	}
 	return a.GroupRatio > 0 && a.BillingMode == BillingModeTieredExpr && a.BillingExpr != ""
 }
 
@@ -149,9 +172,15 @@ func mergesListOrigin(current, incoming ListOrigin) ListOrigin {
 	return ListOriginMixed
 }
 
-// SiteCNY 站点人民币 = quota / 500000。
+// SiteCNY 站点人民币净结算额。
+//
+// 站点实收 = Σ(消费行 quota) − Σ(退款) + Σ(补扣)，见 QuotaDelta 的符号约定。
+// 没有额度调整行时就是 Quota / 500000，与改动前逐位一致。
+//
+// 刻意不加 Max(0, ...)：某期退款多于消费时净额就是负的，夹到 0 会把差异藏起来，
+// 而「账面上看起来正常、实际少了钱」正是这次要消灭的失败模式。
 func (a *AggRow) SiteCNY() float64 {
-	return a.Quota / QuotaPerCNY
+	return (a.Quota - a.QuotaDelta) / QuotaPerCNY
 }
 
 // PriceBook 报价表加载结果。
@@ -184,6 +213,13 @@ type Params struct {
 	Month             int     // 0 表示未指定，从日志推断
 	Year              int     // 0 表示未指定，从日志推断
 	Discount          *float64 // nil 表示不强制，按分组自动反推
+	// ManualDiscounts 按「客户 + 分组」手工维护的折扣：键是日志里的原始分组名
+	// （AggRow.KeyGroup，如 Codex），值是该分组的结算折扣。
+	//
+	// 由调用方在出账前从本地 PG 读好传入（见 CustomerGroupDiscountMap），
+	// 与全局的 Discount 一起合成 DiscountOverrides。为空表示没有手工折扣，
+	// 一切照旧走反推——手动上传日志那条路径没有客户概念，就留空。
+	ManualDiscounts map[string]float64
 	ExchangeRate      float64
 	KeepLog           bool
 	SanitizedLog      bool
@@ -300,6 +336,14 @@ type CostTotals struct {
 	TotalRows  int `json:"totalRows"`
 	// ChannelCount 成本利润表里覆盖到的渠道数（去重）。
 	ChannelCount int `json:"channelCount"`
+	// RateCNYPerUSD 算出上列人民币金额时用的汇率（人民币/美金）。
+	//
+	// 有的客户按美金结算，摘要要同时给出美金金额；而换算用的汇率必须跟着一起写出来——
+	// 单给一个美金数字，收件人无法判断它是对着 7.0 还是 7.3 算的，对账时就会吵架。
+	//
+	// 字段名不叫 exchangeRate：设置里那个 exchangeRate 是**当前默认值**，
+	// 这个是**本次出账实际用的值**（历史任务用的是当时的设置，两者会不一样）。
+	RateCNYPerUSD float64 `json:"rateCnyPerUsd"`
 }
 
 // RowSummary 单个 (模型, 分组) 汇总行，供前端表格展示。

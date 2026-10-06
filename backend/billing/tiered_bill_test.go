@@ -147,7 +147,7 @@ func writeTieredBillMarked(t *testing.T, rows []*AggRow, discount *float64, book
 	outPath := filepath.Join(dir, "bill.xlsx")
 	buildBillFixtureTemplate(t, templatePath)
 
-	_, err := WriteBillFromTemplate(templatePath, outPath, rows, 2026, 9, book, discount, 7.0, true, markers)
+	_, err := WriteBillFromTemplate(templatePath, outPath, rows, 2026, 9, book, DiscountOverrides{Forced: discount}, 7.0, true, markers)
 	require.NoError(t, err, "写出账单失败")
 	return readBill(t, outPath)
 }
@@ -289,7 +289,7 @@ func TestGroupDiscountPrefersPriceTable(t *testing.T) {
 	}
 
 	book := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{"DeepSeek": 0.6}}
-	result := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, nil, true, nil)
+	result := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, DiscountOverrides{}, nil)
 
 	assert.Equal(t, 0.6, result.Discounts["国产A"], "价表里有 DeepSeek 家族折扣，必须直接采用")
 	assert.False(t, result.Derived["国产A"], "走了价表就不算反推值")
@@ -297,14 +297,14 @@ func TestGroupDiscountPrefersPriceTable(t *testing.T) {
 	// 价表里没有该家族时不再硬推：表达式行的刊例是站内公式自算的，没有外部对标价，
 	// 反推出来的只是式子里的 group_ratio。折扣退到该行实际计费倍率，并记入 Underivable。
 	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
-	result2 := ComputeGroupDiscounts([]*AggRow{row}, empty, 7.0, nil, true, nil)
+	result2 := ComputeGroupDiscounts([]*AggRow{row}, empty, 7.0, DiscountOverrides{}, nil)
 	assert.False(t, result2.Derived["国产A"], "站内表达式行不可反推")
 	assert.Equal(t, 0.5, result2.Discounts["国产A"], "应退回站点实际计费倍率（3.5/(1×7)）")
 	assert.Contains(t, result2.Underivable["国产A"], "无法反推折扣", "必须写明不可反推的原因")
 
 	// 强制折扣优先级最高，且不算反推，也不留 Underivable 备注。
 	forced := 0.42
-	result3 := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, &forced, true, nil)
+	result3 := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, DiscountOverrides{Forced: &forced}, nil)
 	assert.Equal(t, 0.42, result3.Discounts["国产A"])
 	assert.False(t, result3.Derived["国产A"])
 	assert.Empty(t, result3.Underivable)
@@ -315,7 +315,7 @@ func TestGroupDiscountNoDivisionByZero(t *testing.T) {
 	agg := exprTieredAgg(t, "gpt-6-astra", "空分组", testExprAstra, nil, [5]float64{})
 	book := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
 
-	result := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, nil, true, nil)
+	result := ComputeGroupDiscounts([]*AggRow{agg}, book, 7.0, DiscountOverrides{}, nil)
 	got := result.Discounts["空分组"]
 	assert.False(t, math.IsNaN(got), "零用量时折扣不能是 NaN")
 	assert.Equal(t, 0.0, got, "零用量行的站点倍率折算是 0")
@@ -594,7 +594,7 @@ func TestAutoVendorFamilyDoesNotSuppressDerivation(t *testing.T) {
 	assert.False(t, IsDomesticMarked(agg.Model, agg.Group, nil), "自动识别不产生人工标记")
 
 	empty := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}}
-	result := ComputeGroupDiscounts([]*AggRow{agg}, empty, 7.0, nil, true, nil)
+	result := ComputeGroupDiscounts([]*AggRow{agg}, empty, 7.0, DiscountOverrides{}, nil)
 	assert.True(t, result.Derived["deepseek组"], "有外部对标价的国产模型仍可反推")
 	assert.Empty(t, result.Underivable)
 }
@@ -707,4 +707,108 @@ func TestBillFormulasReconcileAcrossRows(t *testing.T) {
 func colName(col int) string {
 	name, _ := excelize.ColumnNumberToName(col)
 	return name
+}
+
+// TestManualGroupDiscountOverridesDerived 手工折扣覆盖反推，且按 KeyGroup 命中。
+//
+// 这个功能的由来：客户的折扣是线下谈的，new-api 里的分组倍率没及时更新，
+// 反推出来的折扣与实际报给客户的不是一回事。结算人员在「客户折扣」页填上真值，
+// 出账就必须用它。
+func TestManualGroupDiscountOverridesDerived(t *testing.T) {
+	// 两行同分组、倍率不同（0.4 与 0.9），会被拆成两个桶：Codex|0.4 与 Codex|0.9。
+	// 真实场景里这些倍率来自同一份过期配置，商务上谈的是同一个折扣。
+	mk := func(ratio float64) *AggRow {
+		return &AggRow{
+			Model: "gpt-5.5", Group: "Codex|" + trimRatio(ratio), KeyGroup: "Codex",
+			GroupRatio: ratio, Uncached: 1_000_000, Rows: 1,
+			OfficialUSD: 12.0, Quota: 12.0 * ratio * QuotaPerCNY,
+			BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra, ListOrigin: ListOriginExpr,
+		}
+	}
+	rows := []*AggRow{mk(0.4), mk(0.9)}
+
+	// 没有手工折扣时，两个桶各自按自己的倍率结算，折扣互不相同。
+	base := ComputeGroupDiscounts(rows, NewPriceBook(), 7.0, DiscountOverrides{}, nil)
+	assert.NotEqual(t, base.Discounts["Codex|0.4"], base.Discounts["Codex|0.9"],
+		"前提：不同倍率桶的自动折扣本就不同")
+
+	// 填了手工折扣后，两个桶都必须拿到同一个值——键是 KeyGroup，不带倍率。
+	ov := DiscountOverrides{Manual: map[string]float64{"Codex": 0.45}}
+	got := ComputeGroupDiscounts(rows, NewPriceBook(), 7.0, ov, nil)
+
+	assert.Equal(t, 0.45, got.Discounts["Codex|0.4"], "手工折扣必须覆盖反推/倍率")
+	assert.Equal(t, 0.45, got.Discounts["Codex|0.9"], "同一分组的另一个倍率桶也要覆盖")
+	// 结算系数与展示折扣相等：手工值是商务谈定的真数，没有隐藏精度。
+	assert.Equal(t, 0.45, got.SettleFactor("Codex|0.4"))
+	assert.Equal(t, 0.45, got.SettleFactor("Codex|0.9"))
+	assert.True(t, got.Manual["Codex|0.4"], "要标记来源，账单备注据此写「手工维护值」")
+	assert.True(t, got.Manual["Codex|0.9"])
+	assert.False(t, got.Derived["Codex|0.4"], "用了手工值就不该再说是反推值")
+}
+
+// TestManualGroupDiscountDoesNotLeakToOtherGroups 没命中的分组行为完全不变。
+//
+// 漏出去比不生效更危险：另一个客户的账单会跟着变金额，而没人会想到去查这个页面的配置。
+func TestManualGroupDiscountDoesNotLeakToOtherGroups(t *testing.T) {
+	other := exprTieredAgg(t, "deepseek-v3", "Claude", testExprAstra, nil, [5]float64{})
+
+	ov := DiscountOverrides{Manual: map[string]float64{"Codex": 0.45}}
+	withManual := ComputeGroupDiscounts([]*AggRow{other}, NewPriceBook(), 7.0, ov, nil)
+	without := ComputeGroupDiscounts([]*AggRow{other}, NewPriceBook(), 7.0, DiscountOverrides{}, nil)
+
+	assert.Equal(t, without.Discounts["Claude"], withManual.Discounts["Claude"],
+		"没命中手工折扣的分组，折扣必须与不配置时逐位相同")
+	assert.False(t, withManual.Manual["Claude"])
+}
+
+// TestManualGroupDiscountBeatsPriceTable 手工折扣要压过价表折扣。
+//
+// 顺序反了的话，价表里配了厂商家族折扣的分组永远取不到手工值，
+// 而那条配置在页面上看起来是生效的——不报错、不提示，最难查的一类问题。
+func TestManualGroupDiscountBeatsPriceTable(t *testing.T) {
+	row := &AggRow{
+		Model: "deepseek-v3", Group: "国产A", KeyGroup: "国产A",
+		Uncached: 1_000_000, Output: 100_000, Rows: 1,
+		OfficialUSD: 1.0, Quota: 1_750_000,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra, ListOrigin: ListOriginExpr,
+	}
+	book := &PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{"DeepSeek": 0.6}}
+
+	ov := DiscountOverrides{Manual: map[string]float64{"国产A": 0.35}}
+	got := ComputeGroupDiscounts([]*AggRow{row}, book, 7.0, ov, nil)
+
+	assert.Equal(t, 0.35, got.Discounts["国产A"], "手工折扣优先于价表折扣")
+	assert.True(t, got.Manual["国产A"])
+}
+
+// TestForcedDiscountBeatsManual 全局强制折扣仍然最高，包括压过手工值。
+//
+// 全局折扣是用户在本次出账里显式填的数，意图比一条长期配置更具体。
+func TestForcedDiscountBeatsManual(t *testing.T) {
+	row := exprTieredAgg(t, "gpt-5.5", "Codex", testExprAstra, nil, [5]float64{})
+	forced := 0.9
+	ov := DiscountOverrides{Forced: &forced, Manual: map[string]float64{"Codex": 0.45}}
+
+	got := ComputeGroupDiscounts([]*AggRow{row}, NewPriceBook(), 7.0, ov, nil)
+
+	// 该 fixture 没有倍率，桶键就是分组名本身（不带 |倍率 后缀）。
+	assert.Equal(t, 0.9, got.Discounts["Codex"])
+	assert.False(t, got.Manual["Codex"], "强制折扣路径下不该标成手工维护值")
+}
+
+// TestManualGroupDiscountValueNotRounded 手工折扣按 DiscountDecimals 取整，
+// 但展示值与结算系数必须一致——结算额 = 刊例 × 折，客户拿计算器一按就能对上。
+func TestManualGroupDiscountValueNotRounded(t *testing.T) {
+	row := &AggRow{
+		Model: "gpt-5.5", Group: "Codex", KeyGroup: "Codex",
+		Uncached: 1_000_000, Rows: 1, OfficialUSD: 10, Quota: 5_000_000,
+		BillingMode: BillingModeTieredExpr, BillingExpr: testExprAstra, ListOrigin: ListOriginExpr,
+	}
+	ov := DiscountOverrides{Manual: map[string]float64{"Codex": 0.4555}}
+
+	got := ComputeGroupDiscounts([]*AggRow{row}, NewPriceBook(), 7.0, ov, nil)
+
+	assert.Equal(t, got.Discounts["Codex"], got.SettleFactor("Codex"),
+		"手工折扣的展示值与结算系数必须相等")
+	assert.Equal(t, 0.456, got.Discounts["Codex"], "按 DiscountDecimals(3) 取整")
 }

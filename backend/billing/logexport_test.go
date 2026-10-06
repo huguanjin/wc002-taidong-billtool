@@ -359,7 +359,11 @@ func TestBuildLogExportQueryParameterized(t *testing.T) {
 			StartTime: start, EndTime: end,
 		}, true)
 		assert.Contains(t, q, "username IN (?,?)")
-		assert.Contains(t, q, "type = 2", "type 必须写死为消费日志")
+		// 必须同时导出消费（2）与退款（6）：只导消费行的话，异步任务失败已退的额度
+		// 在账单里仍按预扣全额计费，金额系统性偏高。这条断言原先写死的是 "type = 2"，
+		// 它守的假设本身就是错的。
+		assert.Contains(t, q, "type IN (2, 6)", "消费与退款都要导，否则退款无法冲抵")
+		assert.NotContains(t, q, "type = 2 ", "不能只导消费日志")
 		assert.Contains(t, q, "created_at >= ? AND created_at < ?", "半开区间")
 		assert.Contains(t, q, "ORDER BY created_at, id", "刻意排序，保证结果可复现")
 		assert.NotContains(t, q, "a37836323", "账号不能出现在 SQL 文本里")

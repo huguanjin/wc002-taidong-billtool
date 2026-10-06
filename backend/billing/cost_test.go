@@ -173,7 +173,7 @@ func TestGenerateCostTableUnknownChannelDoesNotBlock(t *testing.T) {
 	costPath, totals, summaryText, blocked, missing, unknown, err := generateCostTable(
 		"", templatePath, billPath, rows, headers,
 		&PriceBook{ByModel: map[string]ModelPrice{}, Discounts: map[string]float64{}},
-		params, 7.0, false, 2026, 9)
+		params, DiscountOverrides{}, 7.0, false, 2026, 9)
 	require.NoError(t, err)
 
 	assert.False(t, blocked, "只有未知渠道时不该拦下成本利润表")
@@ -210,7 +210,7 @@ func TestWriteCostProfitColumn(t *testing.T) {
 	}
 
 	require.NoError(t, WriteCostFromTemplate(templatePath, outPath, rows, 2026, 9,
-		nil, nil, rate, false, nil))
+		nil, DiscountOverrides{}, rate, false, nil))
 
 	file, err := excelize.OpenFile(outPath)
 	require.NoError(t, err)
@@ -260,7 +260,7 @@ func TestSummarizeCostSkipsUnpricedRows(t *testing.T) {
 	priced := mk(101, f(0.4))
 	unpriced := mk(102, nil)
 
-	totals, text := SummarizeCost([]*CostRow{priced, unpriced}, NewPriceBook(), nil, rate, false, nil, 2026, 9, nil)
+	totals, text := SummarizeCost([]*CostRow{priced, unpriced}, NewPriceBook(), DiscountOverrides{}, rate, nil, 2026, 9, nil)
 
 	assert.Equal(t, 2, totals.TotalRows)
 	assert.Equal(t, 1, totals.PricedRows, "只有一行参与合计")
@@ -286,17 +286,18 @@ func TestSummarizeCostSkipsUnpricedRows(t *testing.T) {
 func TestFormatCostSummaryFullCoverage(t *testing.T) {
 	totals := CostTotals{
 		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
-		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3, RateCNYPerUSD: 7,
 	}
 	text := FormatCostSummary(totals, 2026, 9, nil)
 
 	assert.NotContains(t, text, "未计入", "全覆盖时不该有保留说明")
 	assert.Contains(t, text, "账期：2026-09")
-	assert.Contains(t, text, "结算金额：¥15146.6056")
-	assert.Contains(t, text, "上游成本：¥9000")
-	assert.Contains(t, text, "利润：¥6146.6056")
-	assert.Contains(t, text, "毛利率 40.58%", "毛利率 = 利润/结算额，保留两位")
+	// 有汇率时美金金额跟在人民币后面，且按同一汇率换算：15146.6056/7 = 2163.80。
+	assert.Contains(t, text, "结算金额：¥15146.6056（$2163.8）")
+	assert.Contains(t, text, "上游成本：¥9000（$1285.71）")
+	assert.Contains(t, text, "利润：¥6146.6056（$878.09），毛利率 40.58%")
 	assert.Contains(t, text, "覆盖渠道：3 个")
+	assert.Contains(t, text, "汇率：7（人民币/美金）")
 
 	// header 为 nil 时必须与加头之前逐字节一致：手动上传日志那条路径没有客户与时段，
 	// 凭空多出「客户：」这种空行会让人以为漏传了参数。
@@ -306,6 +307,37 @@ func TestFormatCostSummaryFullCoverage(t *testing.T) {
 	assert.True(t, strings.HasPrefix(text, "账期：2026-09"), "无头时账期仍应是第一行")
 }
 
+// TestFormatCostSummaryWithoutExchangeRate 没有汇率时不写美金，也不编一个汇率。
+//
+// 按未知汇率换出来的美金数字，比不写更危险：收件人会当成真实账面对待。
+func TestFormatCostSummaryWithoutExchangeRate(t *testing.T) {
+	totals := CostTotals{
+		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
+	}
+	text := FormatCostSummary(totals, 2026, 9, nil)
+
+	assert.NotContains(t, text, "$", "没汇率就不该出现美金金额")
+	assert.NotContains(t, text, "汇率：")
+	assert.Contains(t, text, "结算金额：¥15146.6056")
+}
+
+// TestFormatCostSummaryUSDUsesOwnRateSummary 摘要里的美金必须用**这次出账**的汇率。
+//
+// 回归点：汇率 7.3 是用户改过的设置。如果换算处去读全局默认的 7.0，
+// 报出去的结算金额会比真实应收少一截，而数字看起来很合理，没人会怀疑。
+func TestFormatCostSummaryUSDUsesOwnRateSummary(t *testing.T) {
+	totals := CostTotals{
+		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3, RateCNYPerUSD: 7.3,
+	}
+	text := FormatCostSummary(totals, 2026, 9, nil)
+
+	assert.Contains(t, text, "$2074.88", "15146.6056 / 7.3")
+	assert.NotContains(t, text, "$2163.8", "不能按默认汇率 7.0 算")
+	assert.Contains(t, text, "汇率：7.3（人民币/美金）")
+}
+
 // TestFormatCostSummaryWithHeader 有定位行时，客户/账号/时段必须写在账期之前。
 //
 // 顺序和位置都要钉住：这几行是给收件人确认「这段话覆盖的是谁、哪一段」用的，
@@ -313,7 +345,7 @@ func TestFormatCostSummaryFullCoverage(t *testing.T) {
 func TestFormatCostSummaryWithHeader(t *testing.T) {
 	totals := CostTotals{
 		SettleCNY: 15146.6056, CostCNY: 9000, ProfitCNY: 6146.6056,
-		PricedRows: 12, TotalRows: 12, ChannelCount: 3,
+		PricedRows: 12, TotalRows: 12, ChannelCount: 3, RateCNYPerUSD: 7,
 	}
 	header := []string{"客户：钛动", "账号：tecdc3.0、tecdc3.1", "时段：2026-09-01 00:00:00 ~ 2026-09-30 23:59:59"}
 
@@ -324,10 +356,11 @@ func TestFormatCostSummaryWithHeader(t *testing.T) {
 账号：tecdc3.0、tecdc3.1
 时段：2026-09-01 00:00:00 ~ 2026-09-30 23:59:59
 账期：2026-09
-结算金额：¥15146.6056
-上游成本：¥9000
-利润：¥6146.6056（毛利率 40.58%）
-覆盖渠道：3 个；明细行：12 行`
+结算金额：¥15146.6056（$2163.8）
+上游成本：¥9000（$1285.71）
+利润：¥6146.6056（$878.09），毛利率 40.58%
+覆盖渠道：3 个；明细行：12 行
+汇率：7（人民币/美金）`
 	assert.Equal(t, want, text)
 }
 
@@ -509,7 +542,7 @@ func TestWriteCostFromTemplateLayout(t *testing.T) {
 	}
 
 	require.NoError(t, WriteCostFromTemplate(templatePath, outPath, rows, 2026, 9,
-		nil, nil, rate, false, nil))
+		nil, DiscountOverrides{}, rate, false, nil))
 
 	file, err := excelize.OpenFile(outPath)
 	require.NoError(t, err)

@@ -84,6 +84,7 @@ func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, 
 	idxCreated, hasCreated := col["created_at"]
 	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
 	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
+	idxType, hasType := col["type"]
 
 	type costKey struct {
 		model, group, ratio string
@@ -114,6 +115,50 @@ func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, 
 		}
 		groupRatio, _ := GroupRatioFromOther(other)
 
+		ratioBucket := ""
+		if groupRatio > 0 {
+			ratioBucket = strconv.FormatFloat(round(groupRatio, 4), 'f', -1, 64)
+		}
+
+		// 异步任务的结算/退款行：与主账单一样只冲额度、不计成本。
+		//
+		// 成本侧同样不能计价：任务提交那条消费行已经算过一次上游成本了，
+		// 再按退款的 model_price 算一遍会把成本重复计入（或按 0 成本拉高毛利）。
+		// 额度调整要落到与主账单同一个桶键上，账单与成本表才能对上。
+		if IsTaskQuotaAdjustment(other) {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			if delta, ok := QuotaAdjustmentDelta(logType, quota); ok {
+				k := costKey{model: model, group: group, ratio: ratioBucket, channel: channelID}
+				cr, exists := buckets[k]
+				if !exists {
+					groupKey := group
+					if ratioBucket != "" {
+						groupKey = group + "|" + ratioBucket
+					}
+					cr = &CostRow{AggRow: &AggRow{
+						Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
+					}, ChannelID: channelID}
+					// 渠道名与上游倍率照常带上：退款行仍属于那个渠道，
+					// 只是它不产生成本，成本列会算成 0。
+					cr.ChannelName = channelNames[channelID]
+					if cr.ChannelName == "" {
+						cr.ChannelName = fmt.Sprintf("渠道 %d", channelID)
+					}
+					if v, ok := quotas[channelID]; ok {
+						ratio := v
+						cr.UpstreamRatio = &ratio
+					}
+					buckets[k] = cr
+					order = append(order, k)
+				}
+				cr.QuotaDelta += delta
+				cr.HasQuotaAdjustment = true
+			}
+			continue
+		}
 		var cacheRead, cacheWrite5m, cacheWrite1h float64
 		if hasCacheTokens && hasCacheCreation {
 			cacheReadCol := ToFloat(cellAt(row, idxCacheTokens))
@@ -141,11 +186,6 @@ func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, 
 		pr := priceRow(model, other, prompt, completion,
 			cacheRead, cacheWrite5m, cacheWrite1h, quota,
 			book, exchangeRate, preferPriceTable, exprSetting, at)
-
-		ratioBucket := ""
-		if groupRatio > 0 {
-			ratioBucket = strconv.FormatFloat(round(groupRatio, 4), 'f', -1, 64)
-		}
 
 		k := costKey{model: model, group: group, ratio: ratioBucket, channel: channelID}
 		cr, exists := buckets[k]

@@ -117,7 +117,7 @@ func TestGroupRatioSplitsBucketsAndReconciles(t *testing.T) {
 	require.Contains(t, byRatio, 0.4)
 	require.Contains(t, byRatio, 1.0)
 
-	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, nil, false, nil)
+	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, DiscountOverrides{}, nil)
 
 	// 每桶折扣 = 倍率 / 7（精确值），且金额与 quota 严格相符。
 	for _, ratio := range []float64{0.4, 1.0} {
@@ -156,7 +156,7 @@ func TestSingleRatioGroupUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, agg.Rows, 1)
 
-	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, nil, false, nil)
+	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, DiscountOverrides{}, nil)
 	a := agg.Rows[0]
 	assert.InDelta(t, gr/7.0, disc.SettleFactor(a.Group), 1e-12)
 	assert.InDelta(t, a.Quota/QuotaPerCNY, OfficialListCNY(a, 7.0)*disc.SettleFactor(a.Group), 1e-9)
@@ -242,7 +242,7 @@ func TestSettleFactorNotRounded(t *testing.T) {
 
 	agg, err := AggregateFromRows(rows, headers, nil, 7.0, false, nil, false, nil)
 	require.NoError(t, err)
-	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, nil, false, nil)
+	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, DiscountOverrides{}, nil)
 	a := agg.Rows[0]
 
 	exact := disc.SettleFactor(a.Group)
@@ -334,7 +334,7 @@ func TestRowRatioBranchCountsCacheCreation(t *testing.T) {
 	// 容差 1e-5 而非 1e-9：日志里的 quota 是整数，写进日志时已经量化过一次
 	// （真实数据同样如此）。剩下的差额只来自这一次整数化，量级 ~1e-6 元，
 	// 再收紧就是在要求测试数据比生产数据更精确。
-	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, nil, false, nil)
+	disc := ComputeGroupDiscounts(agg.Rows, nil, 7.0, DiscountOverrides{}, nil)
 	settle := OfficialListCNY(a, 7.0) * disc.SettleFactor(a.Group)
 	assert.InDelta(t, a.Quota/QuotaPerCNY, settle, 1e-5,
 		"补齐缓存创建后，结算额应与站内实收一致")

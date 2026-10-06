@@ -144,14 +144,14 @@ type extraColumn struct {
 }
 
 // WriteBillFromTemplate 按账单模板列写出账单，返回缺少定价的 (model/group) 列表。
-func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
+func WriteBillFromTemplate(templatePath, outputPath string, rows []*AggRow, year, month int, book *PriceBook, ov DiscountOverrides, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
 	return writeTemplateSheet(templatePath, outputPath, rows, nil, year, month, book,
-		discount, exchangeRate, preferPriceTable, manualMarkers)
+		ov, exchangeRate, preferPriceTable, manualMarkers)
 }
 
 // writeTemplateSheet 是账单与成本利润表共用的写出核心：前 29 列语义完全一致，
 // extras 为空即账单，非空则在 AC 之后追加各列（成本利润表用）。
-func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras []extraColumn, year, month int, book *PriceBook, discount *float64, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
+func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras []extraColumn, year, month int, book *PriceBook, ov DiscountOverrides, exchangeRate float64, preferPriceTable bool, manualMarkers []string) ([]string, error) {
 	if _, err := os.Stat(templatePath); err != nil {
 		return nil, fmt.Errorf("账单模板不存在: %s", templatePath)
 	}
@@ -214,7 +214,7 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 	}
 
 	firstDataRow := 3
-	discountResult := ComputeGroupDiscounts(rows, book, exchangeRate, discount, preferPriceTable, manualMarkers)
+	discountResult := ComputeGroupDiscounts(rows, book, exchangeRate, ov, manualMarkers)
 	derivedDiscounts := discountResult.Derived
 	underivable := discountResult.Underivable
 	periodDate := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
@@ -282,7 +282,11 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		// （如 base / tier_2）。跨档行没有单一单价能还原金额，此时不写「单价×用量」。
 		hasExpr := agg.BillingMode == BillingModeTieredExpr && agg.BillingExpr != ""
 		_, isTiered := TieredModelPrices[agg.Model]
-		useTokenFormula := price != nil && price.Source != "per_call" && !isTiered && !hasExpr
+		// 按次计费的行刊例是「单次价 × 张数」，不是「单价 × 用量」，两者对不上是正常的，
+		// 所以不能按单价还原。判据用聚合出来的调用次数，不再看 price.Source——
+		// 按次与否现在只由日志的 model_price 决定（见 priceRow），查价结果里已经没有这个来源了。
+		isPerCall := agg.ImagePerCallCount > 0
+		useTokenFormula := price != nil && !isPerCall && !isTiered && !hasExpr
 
 		// 表达式行的等效单价只在「该行只命中一个档位、且单价加总恰好还原官方刊例」
 		// 时才有意义，判定统一走 ExprRowReconcile，与 X 列判据同源。
@@ -322,7 +326,9 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		case !HasKnownListPrice(agg):
 			missingPrices = append(missingPrices, agg.Model+"/"+agg.Group)
 			setStr(24, r, "否")
-		case price != nil && price.Source == "per_call":
+		case isPerCall:
+			// 按次计费：刊例 = 单次价 × 张数，AC 列已经落了真实的刊例金额
+			// （不再是 0），这里 X 写「否」只表示「单价 × 用量」这个式子不成立。
 			setStr(24, r, "否")
 		default:
 			display := ModelPrice{}
@@ -417,8 +423,24 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		}
 		// 折扣来源必须可追：价表/合同里查到的折扣是商务谈定值，
 		// 反推值只能保证账面对得上，不等于谈定的折扣。
-		// 按本次请求倍率结算的行说明白，客户拿到表能自己复核这一行为什么金额刚好等于实收。
-		if agg.HasRatioDiscount() {
+		//
+		// 含任务退款的桶最先说明：它的折扣是拿「净结算 ÷ 刊例」算出来的，
+		// 退款只减结算不减刊例，所以这个折扣会比真实商务折扣低，
+		// 不写明的话客户会以为折扣被谈错了，反而来质疑整张账单。
+		if agg.HasQuotaAdjustment {
+			netCNY := agg.SiteCNY()
+			notes = appendNote(notes, fmt.Sprintf(
+				"本行包含任务退款冲抵，金额为净额（预扣 %s 元 − 退还 %s 元 = %s 元）；"+
+					"折扣按净额 ÷ 刊例计算，低于名义折扣属正常",
+				trimMoney(agg.Quota/QuotaPerCNY), trimMoney(agg.QuotaDelta/QuotaPerCNY), trimMoney(netCNY)))
+			if netCNY < 0 {
+				notes = appendNote(notes, "本期退款多于消费，本行金额为负")
+			}
+		}
+		if discountResult.Manual[agg.Group] {
+			notes = appendNote(notes, "折扣为手工维护值（客户+分组维度，见「客户折扣」页）")
+		} else if agg.HasRatioDiscount() {
+			// 按本次请求倍率结算的行说明白，客户拿到表能自己复核这一行为什么金额刚好等于实收。
 			notes = appendNote(notes, fmt.Sprintf(
 				"折扣按本次请求实际使用的分组倍率结算（倍率 %s ÷ %s = %s），金额与站内实收一致",
 				trimRatio(agg.GroupRatio), trimRatio(DiscountBaseFactor),
@@ -427,9 +449,13 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		if reason, bad := underivable[agg.Group]; bad {
 			notes = appendNote(notes, reason+"；本行折扣取站点实际计费倍率，请人工确认合同折扣")
 		}
-		if derivedDiscounts[agg.Group] {
+		// derived / 手工 / 价表三选一，互斥。手工值不必再说「反推」，
+		// 那正是它要取代的东西。
+		if discountResult.Manual[agg.Group] {
+			// 上面已写明来源，这里不重复。
+		} else if derivedDiscounts[agg.Group] {
 			notes = appendNote(notes, "折扣为反推值（价表无该分组折扣，按 Σ结算/Σ总金额倒算）")
-		} else if discount != nil {
+		} else if ov.Forced != nil {
 			notes = appendNote(notes, "折扣为手工指定值")
 		} else if _, bad := underivable[agg.Group]; !bad && !agg.HasRatioDiscount() {
 			notes = appendNote(notes, "折扣取自价表")

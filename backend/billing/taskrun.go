@@ -144,6 +144,14 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		return nil, err
 	}
 
+	// 该客户手工维护的「分组 → 折扣」：线下谈定、new-api 里没及时更新的那些。
+	// 读失败**不能静默降级**——降级的表现是照常出一张按过期倍率算出来的账单，
+	// 金额是错的却不报错，比直接失败危险得多。这里让本次任务失败。
+	manualDiscounts, err := CustomerGroupDiscountMap(deps.PG, task.CustomerID)
+	if err != nil {
+		return nil, fmt.Errorf("读取客户手工折扣失败: %w", err)
+	}
+
 	params := Params{
 		// 账期用计划上存的**归属账期**，不靠推断：
 		// 导出的日志文件名是「日志查询_<起>_<止>_<指纹>.tsv」，不含「N月」字样，
@@ -152,6 +160,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		Year:                 task.PeriodYear,
 		Month:                task.PeriodMonth,
 		Discount:             settings.Discount,
+		ManualDiscounts:      manualDiscounts,
 		ExchangeRate:         settings.ExchangeRate,
 		PriceSource:          PriceSource(settings.PriceSource),
 		SanitizedLog:         task.GenerateSanitized,

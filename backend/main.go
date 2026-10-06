@@ -79,6 +79,10 @@ func main() {
 		if err := billing.EnsureBillTaskSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化账单任务表失败，账单任务功能可能不可用: %v", err)
 		}
+		// 手工折扣表也有外键指向 customers，同样必须在客户表之后建。
+		if err := billing.EnsureCustomerGroupDiscountSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化客户手工折扣表失败，手工折扣功能可能不可用: %v", err)
+		}
 		if err := billing.EnsureSettingsSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化默认出账参数表失败，账单任务功能可能不可用: %v", err)
 		}
@@ -106,6 +110,8 @@ func main() {
 	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
 	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
 	mux.HandleFunc("/api/delete-customer", withCORS(requireAuth(handleDeleteCustomer)))
+	mux.HandleFunc("/api/group-discounts", withCORS(requireAuth(handleGroupDiscounts)))
+	mux.HandleFunc("/api/save-group-discounts", withCORS(requireAuth(handleSaveGroupDiscounts)))
 	mux.HandleFunc("/api/bill-tasks", withCORS(requireAuth(handleBillTasks)))
 	mux.HandleFunc("/api/save-bill-task", withCORS(requireAuth(handleSaveBillTask)))
 	mux.HandleFunc("/api/validate-bill-tasks", withCORS(requireAuth(handleValidateBillTasks)))
@@ -579,6 +585,158 @@ func handleDeleteCustomer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": in.ID})
+}
+
+// handleGroupDiscounts 读「客户 + 分组」的手工折扣，并在给了日志时一并解析出
+// 该日志里出现过的分组及各自当前的自动折扣。
+//
+// 两个用途合成一个接口：结算人员的工作流是「选客户 → 选一份这个时段的日志 →
+// 看有哪些分组、自动算成了多少 → 填上实际谈定的折扣」。分成两个接口的话，
+// 前端要自己把两份数据按分组名拼起来，而拼接口径（分组名是否带倍率后缀）
+// 正是最容易搞错的地方，放在后端做只有一处实现。
+func handleGroupDiscounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），手工折扣功能不可用")
+		return
+	}
+
+	customerID, err := strconv.ParseInt(strings.TrimSpace(r.URL.Query().Get("customerId")), 10, 64)
+	if err != nil || customerID <= 0 {
+		httpError(w, http.StatusBadRequest, "缺少客户 ID")
+		return
+	}
+
+	saved, err := billing.ListCustomerGroupDiscounts(*pgConfig, customerID)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	manual := make(map[string]float64, len(saved))
+	notes := make(map[string]string, len(saved))
+	for _, row := range saved {
+		manual[row.GroupKey] = row.Discount
+		notes[row.GroupKey] = row.Note
+	}
+
+	resp := map[string]interface{}{
+		"saved": saved,
+		"groups": []billing.GroupDiscountPreview{},
+	}
+
+	// 没给日志时只返回已维护的折扣：页面刚打开、还没选日志的情况下也要能显示现状。
+	sourcePath := strings.TrimSpace(r.URL.Query().Get("logPath"))
+	if sourcePath == "" {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	path, err := resolveInBrowseRoot(sourcePath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	preview, err := billing.PreviewGroupDiscounts(path, filepath.Join(dataDir, "price_table.xlsx"),
+		dbPriceCachePath(), manualDiscountPreviewParams(), manual)
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
+	// 备注落在这里而不是 billing 包：它属于「已维护的配置」，不属于从日志算出来的东西。
+	for i := range preview {
+		preview[i].Note = notes[preview[i].GroupKey]
+	}
+	resp["groups"] = preview
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// manualDiscountPreviewParams 解析日志分组时用的参数。
+//
+// 取任务页保存的默认出账参数，而不是入账时的那一份：预览只需要价表来源与汇率一致，
+// 折扣覆盖（全局折扣、手工折扣）都不参与——页面上那一列要展示的正是
+// 「不填手工折扣会算出多少」，见 PreviewGroupDiscounts 的说明。
+func manualDiscountPreviewParams() billing.Params {
+	if pgConfig == nil {
+		return billing.Params{ExchangeRate: billing.DefaultExchangeRate}
+	}
+	s, err := billing.GetSettings(*pgConfig)
+	if err != nil {
+		return billing.Params{ExchangeRate: billing.DefaultExchangeRate}
+	}
+	return billing.Params{
+		PriceSource:     billing.PriceSource(s.PriceSource),
+		ExchangeRate:    s.ExchangeRate,
+		DomesticMarkers: s.DomesticMarkerList(),
+	}
+}
+
+// handleSaveGroupDiscounts 批量保存某个客户的手工折扣（覆盖式）。
+func handleSaveGroupDiscounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），手工折扣功能不可用")
+		return
+	}
+
+	var body struct {
+		CustomerID int64 `json:"customerId"`
+		Items      []struct {
+			GroupKey string  `json:"groupKey"`
+			Discount *string `json:"discount"` // 前端提交的是原始文本，如「6折」
+			Note     string  `json:"note"`
+		} `json:"items"`
+	}
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	if body.CustomerID <= 0 {
+		httpError(w, http.StatusBadRequest, "缺少客户 ID")
+		return
+	}
+
+	// 折扣文本在服务端解析，复用处账用的同一套 ParseDiscountText：
+	// 前端另写一份解析迟早会与后端不一致（「6折」一边当 0.6 一边当 6）。
+	items := make([]billing.GroupDiscountInput, 0, len(body.Items))
+	for _, it := range body.Items {
+		in := billing.GroupDiscountInput{GroupKey: it.GroupKey, Note: it.Note}
+		if it.Discount != nil && strings.TrimSpace(*it.Discount) != "" {
+			value, ok := billing.ParseDiscountText(*it.Discount)
+			if !ok {
+				// 文案里的 %% 是转义：这里是 Sprintf 的格式串，单个 % 会被当成动词，
+				// 既通不过 vet，运行时也会打出 %!/(MISSING) 这种乱码给用户看。
+				httpError(w, http.StatusBadRequest,
+					fmt.Sprintf("分组「%s」的折扣「%s」无法识别，请填 6折 / 60%% / 0.6 这类写法（留空表示恢复自动折扣）",
+						it.GroupKey, strings.TrimSpace(*it.Discount)))
+				return
+			}
+			in.Discount = &value
+		}
+		// 提交了空折扣 = 撤销该分组的手工值，回到自动折扣（in.Discount 保持 nil）。
+		items = append(items, in)
+	}
+
+	if err := billing.UpsertCustomerGroupDiscounts(*pgConfig, body.CustomerID, items); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 回读一遍再返回：前端拿到的是真正落库的权威状态，而不是自己刚提交的东西。
+	saved, err := billing.ListCustomerGroupDiscounts(*pgConfig, body.CustomerID)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"saved": saved,
+		"count": len(saved),
+	})
 }
 
 // handleBillTasks 账单任务列表 + 按月汇总。

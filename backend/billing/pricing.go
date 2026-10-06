@@ -428,14 +428,17 @@ func ResolvePrice(model string, book *PriceBook, preferPriceTable bool, exchange
 	officialGemini, hasGemini := OfficialGeminiTextPrices[model]
 	officialKimi, hasKimi := OfficialKimiPrices[model]
 	officialImage, hasImage := OfficialImageTokenPrices[model]
-	mode := ImageBillingMode(model)
 
-	if mode == "per_call" {
-		return &ModelPrice{
-			InputPerM: 0, OutputPerM: 0, Currency: "USD",
-			Source: "per_call", Category: "Image", Channel: "per_call",
-		}, "图片按次计费，刊例取日志 model_price"
-	}
+	// 这里刻意不再按 ImageBillingMode 提前返回零价桩。
+	//
+	// 那个桩的写法是「模型名像 gpt-image* → 单价 0，刊例去日志里取 model_price」，
+	// 但它把整条查价链路都截断了：价格表、内建图片官价、db_price_cache 里明明有的
+	// 价格全都查不到。gpt-image-2.5-flare / -sunburst 就是这样被算成 0 的——
+	// 它们在价格缓存里有值（5/30，来自 ModelRatio），站点也把 billing_mode 配成了
+	// ratio，只有这个「名字像图片」的判定认为它们该按次计费。
+	//
+	// 按次与否现在由 priceRow 依据日志里的 model_price 决定，与查价彻底解耦：
+	// 一个模型按次卖，它的行会带 model_price，那条路径根本不经过这里。
 
 	var chosen *ModelPrice
 	switch {
@@ -593,6 +596,9 @@ type DiscountResult struct {
 	// Underivable 既没有价表折扣、又不能反推的分组 → 原因，供账单备注写清楚
 	// 折扣是从哪来的、为什么这个数需要人工确认。
 	Underivable map[string]string
+	// Manual 折扣来自「客户 + 分组」的手工维护值（见 DiscountOverrides.Manual）。
+	// 与 Derived 互斥：手工值就是真值，不需要反推，也不该被当成反推值提示复核。
+	Manual map[string]bool
 }
 
 // SettleFactor 取该桶的结算系数：优先用精确值，缺失时退回展示折扣。
@@ -603,12 +609,31 @@ func (r DiscountResult) SettleFactor(group string) float64 {
 	return r.Discounts[group]
 }
 
+// DiscountOverrides 出账时的折扣覆盖，两个来源按优先级从高到低排列。
+//
+// 合成一个结构体而不是两个散参数：折扣覆盖的调用点有六处（账单、成本利润表、
+// 成本汇总、前端摘要），参数越多越容易在某一处漏传——而漏传的表现是金额悄悄算错，
+// 不会报任何错。合成结构体后，多一个来源只需要改这一处和拼装处。
+type DiscountOverrides struct {
+	// Forced 全局强制折扣（出账页「折扣」输入框、任务设置里的默认参数）。
+	// 非 nil 时覆盖一切，包括下面 Manual 里的手工值——它是用户在本次出账里
+	// 显式填的数，意图最明确。
+	Forced *float64
+	// Manual 按分组的手工折扣，键是 AggRow.KeyGroup（不含倍率的原始分组名，如 Codex）。
+	//
+	// 键不带倍率是刻意的：这个功能存在的理由就是「new-api 里的分组倍率没及时更新」，
+	// 倍率本身就是不准的那个东西。挂到「分组|倍率」上，等于把正确的折扣绑在错误的键上，
+	// 业务方哪天把倍率改对了，手工折扣反而匹配不上、悄悄失效。
+	Manual map[string]float64
+}
+
 // ComputeGroupDiscounts 每个分组标识的折扣。
 //
 // 口径优先级（高到低）：
-//  1. forcedDiscount：调用方显式指定的统一折扣，直接覆盖，不做任何查表；
-//  2. 价表折扣 sheet：按模型厂商家族（见 VendorFamily）匹配，命中即用价表值；
-//  3. 反推：该组 Σ结算人民币 / Σ总金额人民币，只累加 DerivableListPrice 为真的行。
+//  1. ov.Forced：调用方显式指定的统一折扣，直接覆盖，不做任何查表；
+//  2. ov.Manual：按分组的手工折扣（线下谈定、new-api 里没及时更新），命中即用；
+//  3. 价表折扣 sheet：按模型厂商家族（见 VendorFamily）匹配，命中即用价表值；
+//  4. 反推：该组 Σ结算人民币 / Σ总金额人民币，只累加 DerivableListPrice 为真的行。
 //
 // 只有走到最后一步的分组才算「折扣为反推值」，需要由调用方在账单备注里写明——
 // 反推值只能保证账面对得上，并不能说明商务上谈定的折扣是多少。
@@ -617,21 +642,49 @@ func (r DiscountResult) SettleFactor(group string) float64 {
 // 它会被拆成多个桶，每个桶各自结算——用一个折扣套整组必然算错，且错多少取决于
 // 该组第一行是哪个模型，这种不确定性比数值偏差本身更危险。
 //
+// 手工折扣是唯一的例外：它按 KeyGroup 命中，一个键覆盖该分组下的**所有**倍率桶，
+// 因为那些桶的倍率差异恰恰来自同一个过期配置，商务上谈的是一个价。
+//
 // 既查不到价表折扣、又没有一行可反推、也没有可用倍率的分组，不能编一个数塞进账单：
 // 折扣回退到「按 quota 加权的组内平均实际倍率」，并记入 Underivable 由调用方要求人工确认。
-func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, forcedDiscount *float64, preferPriceTable bool, manualMarkers []string) DiscountResult {
-	if forcedDiscount != nil {
+func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64, ov DiscountOverrides, manualMarkers []string) DiscountResult {
+	if ov.Forced != nil {
 		result := map[string]float64{}
 		for _, agg := range rows {
-			result[agg.Group] = round(*forcedDiscount, DiscountDecimals)
+			result[agg.Group] = round(*ov.Forced, DiscountDecimals)
 		}
 		return DiscountResult{
 			Discounts: result, SettleFactors: map[string]float64{},
 			Derived: map[string]bool{}, Underivable: map[string]string{},
+			Manual: map[string]bool{},
 		}
 	}
 
 	discounts := map[string]float64{}
+	// 结算系数：只在按倍率结算时与展示折扣不同（精确值 vs 取整值）。
+	settleFactors := map[string]float64{}
+	// 哪些分组用了手工折扣，供账单备注写明来源。
+	manualGroups := map[string]bool{}
+	if len(ov.Manual) > 0 {
+		// 手工折扣排在价表和反推之前：这个功能的意义就是「反推出来的那个数不可信」，
+		// 若还让价表或反推先定下折扣，手工值就成了永远轮不到的死配置。
+		for _, agg := range rows {
+			if _, already := manualGroups[agg.Group]; already {
+				continue
+			}
+			d, ok := ov.Manual[agg.KeyGroup]
+			if !ok {
+				continue
+			}
+			// 展示值与结算系数都用手工值。反推那条链路之所以「显示取整、结算用精确商」，
+			// 是因为精确商才是账实相符的真值；手工折扣本身就是真值（商务谈定的那个数），
+			// 没有隐藏精度可言，两者相等才符合预期。
+			discounts[agg.Group] = round(d, DiscountDecimals)
+			settleFactors[agg.Group] = round(d, DiscountDecimals)
+			manualGroups[agg.Group] = true
+		}
+	}
+
 	// 价表优先：同一分组下若各模型的厂商家族折扣不一致，以先命中者为准，
 	// 并把该组记为「混合折扣」，由写账单时在备注里提示复核。
 	tableGroups := map[string]bool{}
@@ -650,8 +703,6 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 
 	derived := map[string]bool{}
 	underivable := map[string]string{}
-	// 结算系数：只在按倍率结算时与展示折扣不同（精确值 vs 取整值）。
-	settleFactors := map[string]float64{}
 
 	// 站内表达式计费的行直接按「本次请求实际使用的倍率」结算：
 	// 站内 quota = 表达式USD × GroupRatio × QuotaPerCNY，而 OfficialUSD = 表达式USD，
@@ -716,7 +767,7 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 	}
 	return DiscountResult{
 		Discounts: discounts, SettleFactors: settleFactors,
-		Derived: derived, Underivable: underivable,
+		Derived: derived, Underivable: underivable, Manual: manualGroups,
 	}
 }
 

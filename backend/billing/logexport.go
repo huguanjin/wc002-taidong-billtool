@@ -222,7 +222,14 @@ func buildLogExportQuery(table string, params LogExportParams, hasChannelID bool
 	//
 	// 区间写成半开 `< end+1s`：created_at 是整数秒，这与「结束时刻也包含在内」
 	// 的闭区间语义完全等价（`< T+1s` 即 `<= T`）。
-	conds := []string{"type = 2", "created_at >= ?", "created_at < ?"}
+	// type 2 = 消费，type 6 = 任务退款/差额结算。
+	//
+	// 退款必须一起导出来：异步任务提交时按预扣全额记一条 type=2，任务失败后站点会把
+	// 额度退还并记一条 type=6。只导 type=2 的话，账单按预扣全额计费，系统性偏高。
+	//
+	// 刻意不写成「不过滤 type」——那会把充值、管理操作、系统、错误、登录等
+	// 与消费无关的日志一并倒进来。
+	conds := []string{"type IN (2, 6)", "created_at >= ?", "created_at < ?"}
 	args := []interface{}{params.StartTime.Unix(), params.ExportQueryEnd().Unix()}
 	if len(params.Usernames) > 0 {
 		conds = append(conds, fmt.Sprintf("username IN (%s)", placeholders(len(params.Usernames))))

@@ -4,6 +4,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -278,4 +279,101 @@ func TestCustomerNameSanitizedInFileName(t *testing.T) {
 			assert.NotContains(t, filepath.Base(result.BillPath), "\\")
 		})
 	}
+}
+
+// TestManualDiscountAppliesToBillAndSummary 手工折扣必须同时作用于账单与前端摘要。
+//
+// 回归的是一个既有缺陷：buildSummary 曾经硬编码传 nil 折扣，导致填了折扣时
+// 账单 T 列用填的值、页面摘要却用反推值，同一笔账在两个地方显示不同的折扣和金额。
+// 手工折扣如果只改账单不改摘要，就是这个 bug 的翻版——而且更难发现，
+// 因为页面上那个折扣看起来「只是没生效」，而账单其实已经按它出好了。
+func TestManualDiscountAppliesToBillAndSummary(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "bill_template.xlsx")
+	priceTablePath := filepath.Join(dir, "price_table.xlsx")
+	logPath := filepath.Join(dir, "8月日志.xlsx")
+	outDir := filepath.Join(dir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+
+	buildFixtureTemplate(t, templatePath)
+	buildFixturePriceTable(t, priceTablePath)
+	buildFixtureLog(t, logPath)
+
+	// fixture 日志里的行都走 default / vip 两个分组。给 default 手工定 0.5。
+	const manualGroup = "default"
+	const manualValue = 0.5
+
+	result, err := GenerateBill(logPath, templatePath, priceTablePath, "", outDir, Params{
+		ExchangeRate:    7,
+		ManualDiscounts: map[string]float64{manualGroup: manualValue},
+	})
+	require.NoError(t, err)
+
+	// —— 摘要侧：该分组每一行的折扣与结算系数都应是手工值 ——
+	checked := 0
+	for _, row := range result.Summary.Rows {
+		if !strings.HasPrefix(row.Group, manualGroup) {
+			continue
+		}
+		checked++
+		assert.Equal(t, manualValue, row.SettleFactor,
+			"摘要里分组 %q 的结算系数应为手工值", row.Group)
+		assert.Equal(t, manualValue, row.Discount,
+			"摘要里分组 %q 的折扣应为手工值", row.Group)
+	}
+	assert.Positive(t, checked, "fixture 里应当有走 %q 分组的行", manualGroup)
+
+	// —— 账单侧：T 列（第 20 列）写的就是结算系数，必须与摘要同一个数 ——
+	f, sheet := readBill(t, result.BillPath)
+	found := false
+	for r := 2; r <= 12; r++ {
+		group := cell(t, f, sheet, 3, r) // C 列 = 分组展示名
+		if !strings.HasPrefix(group, manualGroup) {
+			continue
+		}
+		found = true
+		assert.Equal(t, manualValue, mustFloat(t, cell(t, f, sheet, 20, r)),
+			"账单 T 列（第 %d 行）应为手工折扣", r)
+		// V = S × T 是模板里的公式，这里核对折算结果与手工折扣自洽。
+		break
+	}
+	assert.True(t, found, "账单里应当有走 %q 分组的行", manualGroup)
+}
+
+// TestForcedDiscountAppliesToSummary 出账页填的全局折扣同样要落到摘要。
+//
+// 与上一条同源：这两个折扣来源以前都只在账单侧生效，摘要侧被硬编码的 nil 吞掉。
+func TestForcedDiscountAppliesToSummary(t *testing.T) {
+	dir := t.TempDir()
+	templatePath := filepath.Join(dir, "bill_template.xlsx")
+	priceTablePath := filepath.Join(dir, "price_table.xlsx")
+	logPath := filepath.Join(dir, "8月日志.xlsx")
+	outDir := filepath.Join(dir, "out")
+	_ = os.MkdirAll(outDir, 0o755)
+
+	buildFixtureTemplate(t, templatePath)
+	buildFixturePriceTable(t, priceTablePath)
+	buildFixtureLog(t, logPath)
+
+	forced := 0.25
+	result, err := GenerateBill(logPath, templatePath, priceTablePath, "", outDir, Params{
+		ExchangeRate: 7,
+		Discount:     &forced,
+	})
+	require.NoError(t, err)
+
+	require.NotEmpty(t, result.Summary.Rows)
+	for _, row := range result.Summary.Rows {
+		assert.Equal(t, forced, row.Discount,
+			"摘要里分组 %q 的折扣应为全局强制值", row.Group)
+		assert.Equal(t, forced, row.SettleFactor)
+	}
+}
+
+// mustFloat 解析账单单元格里的数字。
+func mustFloat(t *testing.T, s string) float64 {
+	t.Helper()
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	require.NoError(t, err, "解析单元格数值失败: %q", s)
+	return v
 }

@@ -71,6 +71,7 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 	idxCreated, hasCreated := col["created_at"]
 	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
 	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
+	idxType, hasType := col["type"]
 
 	// 聚合键包含「本次请求实际使用的分组倍率」：同一分组在账期内可能出现过
 	// 多种倍率，而站内结算额 = 表达式美金 × 倍率，用一个折扣算不全这一组。
@@ -105,6 +106,50 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		// 本次请求实际使用的分组倍率：分桶与结算都靠它。
 		// 取不到时记 0，该行单独成桶并交回原有折扣逻辑，不硬套倍率结算。
 		groupRatio, _ := GroupRatioFromOther(other)
+
+		// 倍率归桶：0 表示日志没给 group_ratio，单独成一桶，不与其他倍率混。
+		ratioBucket := ""
+		if groupRatio > 0 {
+			ratioBucket = strconv.FormatFloat(round(groupRatio, 4), 'f', -1, 64)
+		}
+		key := [3]string{model, group, ratioBucket}
+
+		// 异步任务的结算/退款行：只把额度调整并进桶，不做任何计价，也不写进脱敏日志。
+		//
+		// 这些行不是新的消费——任务提交时已经按预扣全额记过一条消费日志了，
+		// 它们只是把预扣调回真实值。所以 token 列、刊例、按次张数全部加 0：
+		// 刊例代表「这次请求值多少钱」，退款不改变这个事实，改变的是最终结算了多少。
+		// 混进刊例会连带污染折扣反推的分母，算出一个两边都不对的折扣。
+		//
+		// 放在这个位置（脱敏写出之前、时间解析之前）是刻意的：客户版脱敏日志里
+		// 不该出现退款行——那是站点与用户之间的额度往来，属于商务决定（已确认：
+		// 客户版只给消费明细，账单金额已含冲抵）。放在这里一处拦下，比在写出路径里
+		// 再加一层过滤更难漏。
+		if IsTaskQuotaAdjustment(other) {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			if delta, ok := QuotaAdjustmentDelta(logType, quota); ok {
+				agg, exists := buckets[key]
+				if !exists {
+					agg = &AggRow{
+						Model: model, Group: group, KeyGroup: group, GroupRatio: round(groupRatio, 4),
+					}
+					buckets[key] = agg
+					if !groupSeen[group] {
+						groupSeen[group] = true
+						groupOrder = append(groupOrder, group)
+					}
+				}
+				agg.QuotaDelta += delta
+				agg.HasQuotaAdjustment = true
+				// Rows 刻意不加：它不是一次请求，混进「请求行数」会让客户以为
+				// 这个模型多了一次调用。
+			}
+			// 无论是否识别出 type，都不继续走下面的计价与写出分支。
+			continue
+		}
 
 		var cacheRead, cacheWrite5m, cacheWrite1h float64
 		if hasCacheTokens && hasCacheCreation {
@@ -152,13 +197,6 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 				return nil, err
 			}
 		}
-		// 倍率归桶：0 表示日志没给 group_ratio，单独成一桶，不与其他倍率混。
-		ratioBucket := ""
-		if groupRatio > 0 {
-			ratioBucket = strconv.FormatFloat(round(groupRatio, 4), 'f', -1, 64)
-		}
-
-		key := [3]string{model, group, ratioBucket}
 		agg, exists := buckets[key]
 		if !exists {
 			// Group 是「含倍率层级」的桶键，折扣、结算、备注都按它查；
