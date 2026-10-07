@@ -176,16 +176,72 @@ func TestSimpleBillSortOrder(t *testing.T) {
 }
 
 // TestSumSimpleBill 合计等于逐行之和（逐位相等，客户手工加总不会差出几分钱）。
+// TestSimpleBillCacheColumns 缓存读 / 缓存创建两列从日志 other 里取，写进汇总行。
+//
+// 这两列是客户核账要的：缓存读比常规输入便宜得多、缓存创建反而更贵，
+// 客户拿它们各自乘自己的单价去对账，所以必须分开给，不能合成一个「缓存 token」。
+func TestSimpleBillCacheColumns(t *testing.T) {
+	headers := simpleLogHeaders()
+	rows := [][]string{
+		// 带 5m/1h 明细：两个创建桶都要累进「缓存创建」一列。
+		{"gpt-5.5", "Codex", "1000", "100", "45000",
+			`{"group_ratio":0.4,"cache_tokens":800,"cache_creation_tokens_5m":120,"cache_creation_tokens_1h":30}`, "2"},
+		// 只有笼统的 cache_creation_tokens：按 cache_creation_tokens 记进创建列。
+		{"gpt-5.5", "Codex", "2000", "200", "45000",
+			`{"group_ratio":0.4,"cache_tokens":500,"cache_creation_tokens":70}`, "2"},
+	}
+
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+
+	// 缓存读 800 + 500；缓存创建 (120+30) + 70。
+	assert.Equal(t, 1300.0, got[0].TotalCacheRead)
+	assert.Equal(t, 220.0, got[0].TotalCacheCreation)
+
+	// 输入/输出照旧只算 prompt/completion，不被缓存数污染：
+	// 若把缓存也加进「输入Token」，客户按输入单价算出来的钱会比账单多一大截。
+	assert.Equal(t, 3000.0, got[0].TotalPrompt)
+	assert.Equal(t, 300.0, got[0].TotalCompletion)
+}
+
+// TestSimpleBillCacheColumnsExcludeRefundRows 退款/补扣行不往缓存列里累加。
+//
+// 那两种行不是一次请求，缓存量本就是 0；万一日志里记着值（预扣时写过），
+// 累进去会让缓存数比实际调用量还大——客户一眼就会问为什么缓存的比输入的多。
+func TestSimpleBillCacheColumnsExcludeRefundRows(t *testing.T) {
+	headers := simpleLogHeaders()
+	rows := [][]string{
+		{"gpt-5.5", "Codex", "1000", "100", "45000",
+			`{"group_ratio":0.4,"cache_tokens":800}`, "2"},
+		{"gpt-5.5", "Codex", "0", "0", "5000",
+			`{"task_id":7,"group_ratio":0.4,"cache_tokens":9999}`, "6"},
+	}
+
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+
+	assert.Equal(t, 800.0, got[0].TotalCacheRead, "退款行的缓存量不该计入")
+	assert.Equal(t, 1, got[0].HitCount, "退款行不算一次请求")
+	assert.Equal(t, 40000.0, got[0].TotalQuota, "45000 − 5000，额度照旧冲抵")
+}
+
+// TestSumSimpleBill 缓存两列也进合计，摘要里的数要与文件里的两列对得上。
 func TestSumSimpleBill(t *testing.T) {
 	rows := []SimpleBillRow{
-		{Group: "A", Model: "m1", HitCount: 3, TotalPrompt: 100, TotalCompletion: 10, TotalQuota: 45000, TotalCostCNY: 0.09},
-		{Group: "A", Model: "m2", HitCount: 2, TotalPrompt: 200, TotalCompletion: 20, TotalQuota: 55000, TotalCostCNY: 0.11},
+		{Group: "A", Model: "m1", HitCount: 3, TotalPrompt: 100, TotalCompletion: 10,
+			TotalCacheRead: 30, TotalCacheCreation: 4, TotalQuota: 45000, TotalCostCNY: 0.09},
+		{Group: "A", Model: "m2", HitCount: 2, TotalPrompt: 200, TotalCompletion: 20,
+			TotalCacheRead: 60, TotalCacheCreation: 6, TotalQuota: 55000, TotalCostCNY: 0.11},
 	}
 	got := SumSimpleBill(rows)
 
 	assert.Equal(t, 5, got.HitCount)
 	assert.Equal(t, 300.0, got.TotalPrompt)
 	assert.Equal(t, 30.0, got.TotalCompletion)
+	assert.Equal(t, 90.0, got.TotalCacheRead)
+	assert.Equal(t, 10.0, got.TotalCacheCreation)
 	assert.Equal(t, 100000.0, got.TotalQuota)
 	assert.InDelta(t, 0.2, got.TotalCostCNY, 1e-9, "0.09 + 0.11，逐行相加")
 }
@@ -227,11 +283,17 @@ func TestWriteSimpleBillLayout(t *testing.T) {
 	// 合计行在第 4 行，金额列写的是 SUM 公式（可追溯）
 	v, err = f.GetCellValue(sheet, "A4")
 	require.NoError(t, err)
-	assert.Equal(t, "合计", v)
+	assert.Equal(t, "合计", v, "A 列是合计标签，任何列的合计公式都不能写在这里")
 
-	formula, err := f.GetCellFormula(sheet, "G4")
+	// 金额列现在是 I（加过缓存读/缓存创建两列之后从 G 右移）。
+	// 断言要按**列名**定位而不是写死字母：写死的话，G 换成了别的列，
+	// 那条断言照样能通过（新列恰好也叫 SUM(G2:G3)），等于没测到金额。
+	amountCol, ok := columnIndex(SimpleBillColumns, "金额（人民币）")
+	require.True(t, ok)
+	amountLetter, _ := excelize.ColumnNumberToName(amountCol + 1)
+	formula, err := f.GetCellFormula(sheet, amountLetter+"4")
 	require.NoError(t, err)
-	assert.Equal(t, "SUM(G2:G3)", formula, "合计写公式而不是算好的数值")
+	assert.Equal(t, "SUM("+amountLetter+"2:"+amountLetter+"3)", formula, "合计写公式而不是算好的数值")
 	formula, err = f.GetCellFormula(sheet, "C4")
 	require.NoError(t, err)
 	assert.Equal(t, "SUM(C2:C3)", formula)
@@ -1065,22 +1127,79 @@ func TestWriteSimpleBillCostColumns(t *testing.T) {
 	sheet := f.GetSheetName(0)
 
 	// 成本表比客户版多三列；客户版**不含**这三列（见 TestSimpleBillHasNoCostColumns）。
-	assert.Equal(t, 7, len(SimpleBillColumns), "客户版固定七列")
-	assert.Equal(t, 10, len(SimpleBillCostColumns), "成本表十列")
-	assert.Equal(t, "官方刊例（美金）", SimpleBillCostColumns[7])
-	assert.Equal(t, "上游成本（人民币）", SimpleBillCostColumns[8])
-	assert.Equal(t, "利润（人民币）", SimpleBillCostColumns[9])
+	assert.Equal(t, 9, len(SimpleBillColumns), "客户版固定九列")
+	assert.Equal(t, 12, len(SimpleBillCostColumns), "成本表十二列")
+	assert.Equal(t, "官方刊例（美金）", SimpleBillCostColumns[9])
+	assert.Equal(t, "上游成本（人民币）", SimpleBillCostColumns[10])
+	assert.Equal(t, "利润（人民币）", SimpleBillCostColumns[11])
 
-	assert.InDelta(t, 1.8, ToFloat(simpleCell(t, f, sheet, 8, 2)), 1e-9)
-	assert.InDelta(t, 0.72, ToFloat(simpleCell(t, f, sheet, 9, 2)), 1e-9)
-	assert.InDelta(t, 1.08, ToFloat(simpleCell(t, f, sheet, 10, 2)), 1e-9)
+	assert.InDelta(t, 1.8, ToFloat(simpleCell(t, f, sheet, 10, 2)), 1e-9)
+	assert.InDelta(t, 0.72, ToFloat(simpleCell(t, f, sheet, 11, 2)), 1e-9)
+	assert.InDelta(t, 1.08, ToFloat(simpleCell(t, f, sheet, 12, 2)), 1e-9)
 
 	// 合计行（第 3 行）对成本三列也写 SUM 公式。
-	for _, col := range []int{8, 9, 10} {
+	for _, col := range []int{10, 11, 12} {
 		letter, _ := excelize.ColumnNumberToName(col)
 		got, err := f.GetCellFormula(sheet, letter+"3")
 		require.NoError(t, err)
 		assert.Equal(t, "SUM("+letter+"2:"+letter+"2)", got, "第 %d 列合计写公式", col)
+	}
+}
+
+// TestWriteSimpleBillTotalLabelSurvivesCostColumns 合计行的 A 列必须是「合计」标签。
+//
+// 这看着是句废话，但它是真被弄坏过：取列号时若在**本表没有这一列**的情况下
+// 拿到一个兜底值（0 → A 列），成本三列的 SUM 就会写进 A 列，把「合计」顶掉。
+// 客户版（不带成本列）走的就是这条路径，所以下面覆盖两个开关都要测。
+//
+// 顺带钉住「成本列不写进客户版」：那张表的合计行只该有几个 token 与金额列的公式。
+func TestWriteSimpleBillTotalLabelSurvivesCostColumns(t *testing.T) {
+	official, cost, profit := 1.8, 0.72, 1.08
+	rows := []SimpleBillRow{
+		{Group: "Codex", Model: "gpt-5.5", HitCount: 3, TotalPrompt: 100, TotalCompletion: 10,
+			TotalCacheRead: 7, TotalCacheCreation: 2, TotalQuota: 900000, TotalCostCNY: 1.8,
+			OfficialListUSD: &official, UpstreamCostCNY: &cost, ProfitCNY: &profit,
+			CostRows: 3, TotalRows: 3},
+	}
+
+	for _, tc := range []struct {
+		name      string
+		costTable bool
+	}{
+		{"客户版账单", false},
+		{"成本表", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "t.xlsx")
+			require.NoError(t, WriteSimpleBill(path, rows, "简易账单",
+				SimpleBillWriteOptions{CostTable: tc.costTable}))
+
+			f, err := excelize.OpenFile(path)
+			require.NoError(t, err)
+			defer f.Close()
+			sheet := f.GetSheetName(0)
+
+			label, err := f.GetCellValue(sheet, "A3")
+			require.NoError(t, err)
+			assert.Equal(t, "合计", label, "A 列的「合计」标签不能被别的列的公式顶掉")
+
+			// A 列不该是任何 SUM：它是标签列。
+			got, err := f.GetCellFormula(sheet, "A3")
+			require.NoError(t, err)
+			assert.Empty(t, got, "A 列是合计标签列，不该写公式")
+
+			// 客户版不该出现任何成本列的表头。
+			header, err := f.GetRows(sheet)
+			require.NoError(t, err)
+			for _, name := range []string{"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）"} {
+				if tc.costTable {
+					assert.Contains(t, header[0], name, "成本表应当有 %s 列", name)
+				} else {
+					assert.NotContains(t, header[0], name, "客户版不得出现 %s 列", name)
+				}
+			}
+		})
 	}
 }
 
@@ -1110,10 +1229,11 @@ func TestWriteSimpleBillCostPartialNoSum(t *testing.T) {
 	sheet := f.GetSheetName(0)
 
 	// 合计行是第 4 行：金额列照写公式，成本三列不写。
-	formula, err := f.GetCellFormula(sheet, "G4")
+	// 金额列随缓存两列的加入从 G 挪到了 I（见 SimpleBillColumns）。
+	formula, err := f.GetCellFormula(sheet, "I4")
 	require.NoError(t, err)
-	assert.Equal(t, "SUM(G2:G3)", formula)
-	for _, col := range []string{"H4", "I4", "J4"} {
+	assert.Equal(t, "SUM(I2:I3)", formula)
+	for _, col := range []string{"J4", "K4", "L4"} {
 		got, err := f.GetCellFormula(sheet, col)
 		require.NoError(t, err)
 		assert.Empty(t, got, "%s 不该写 SUM——它会跳过空值，得到一个偏小的合计", col)

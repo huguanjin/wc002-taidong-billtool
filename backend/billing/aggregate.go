@@ -2,7 +2,6 @@ package billing
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,8 +68,6 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 	idxQuota, hasQuota := col["quota"]
 	idxOther, hasOther := col["other"]
 	idxCreated, hasCreated := col["created_at"]
-	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
-	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
 	idxType, hasType := col["type"]
 
 	// 聚合键包含「本次请求实际使用的分组倍率」：同一分组在账期内可能出现过
@@ -151,21 +148,8 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			continue
 		}
 
-		var cacheRead, cacheWrite5m, cacheWrite1h float64
-		if hasCacheTokens && hasCacheCreation {
-			cacheReadCol := ToFloat(cellAt(row, idxCacheTokens))
-			creationCol := ToFloat(cellAt(row, idxCacheCreation))
-			cr2, w5, w1 := ParseCacheTokens(other)
-			if w5 != 0 || w1 != 0 || strings.Contains(other, "cache_creation_tokens_5m") {
-				cacheRead = math.Max(cacheReadCol, cr2)
-				cacheWrite5m, cacheWrite1h = w5, w1
-			} else {
-				cacheRead = cacheReadCol
-				cacheWrite5m, cacheWrite1h = creationCol, 0
-			}
-		} else {
-			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
-		}
+		// 缓存列与 other 里都可能记着缓存量，取用规则见 rowCacheTokens。
+		cacheRead, cacheWrite5m, cacheWrite1h := rowCacheTokens(row, col, other)
 
 		// 该请求发生的时间：日志的 created_at 是 Unix 秒。出账面对历史日志，
 		// 带 hour() 一类的表达式必须按请求当时的时刻判断（见 RunBillingExpr）。

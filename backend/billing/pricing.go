@@ -84,6 +84,33 @@ func ParseCacheTokens(other string) (cacheRead, cacheWrite5m, cacheWrite1h float
 	return cr, cc, 0
 }
 
+// rowCacheTokens 取一行的缓存用量，返回 (缓存读, 缓存创建-5m, 缓存创建-1h)。
+//
+// 抽出来是因为这段判断有三个调用点：主账单聚合（aggregate.go）、脱敏日志明细
+// （simplebill.go 的逐行展开）、简易账单的缓存列。各写一份的话，某些部署上
+// 缓存数会一处有一处没有——那种差异极难发现，因为两边都「算得出来」，只是不一样。
+//
+// 判断依据是日志里到底给了什么：
+//   - 有 cache_tokens / cache_creation_tokens 列（手工 SQL 导出的形态），用列值；
+//     此时若 other 里带 5m/1h 拆分，拆分更细，优先按拆分取，
+//     缓存读取「列值与 other 里的较大者」——列偶尔记 0，而 other 里其实有值。
+//   - 没有这些列（工具导出的形态），只能从 other 里解析。
+func rowCacheTokens(row []string, col map[string]int, other string) (cacheRead, cacheWrite5m, cacheWrite1h float64) {
+	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
+	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
+
+	if !hasCacheTokens || !hasCacheCreation {
+		return ParseCacheTokens(other)
+	}
+	cacheReadCol := ToFloat(cellAt(row, idxCacheTokens))
+	creationCol := ToFloat(cellAt(row, idxCacheCreation))
+	cr2, w5, w1 := ParseCacheTokens(other)
+	if w5 != 0 || w1 != 0 || strings.Contains(other, "cache_creation_tokens_5m") {
+		return math.Max(cacheReadCol, cr2), w5, w1
+	}
+	return cacheReadCol, creationCol, 0
+}
+
 // ParseRowDetails 解析脱敏日志新增的逐条明细列（3.1/3.2 契约），全部来自 other
 // 的单次 JSON 解析，复用 jsonNumber 取值，不为每个字段单独 Unmarshal。
 // 非 JSON / 空字符串时返回零值，不报错、不 panic——缓存族字段的容错解析仍由

@@ -2,7 +2,6 @@ package billing
 
 import (
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -37,6 +36,13 @@ type SimpleBillRow struct {
 	// TotalPrompt / TotalCompletion 输入、输出 token 合计。
 	TotalPrompt     float64 `json:"totalPrompt"`
 	TotalCompletion float64 `json:"totalCompletion"`
+	// TotalCacheRead / TotalCacheCreation 缓存读与缓存创建的 token 合计，取自日志 other
+	// （cache_tokens、cache_creation_tokens[_5m/_1h]，见 rowCacheTokens）。
+	//
+	// 分成两列而不是合成一列：客户拿这两列各自乘自己的单价核对金额——缓存读比常规输入便宜得多、
+	// 缓存创建反而更贵，合成一个数就没法核了。
+	TotalCacheRead     float64 `json:"totalCacheRead"`
+	TotalCacheCreation float64 `json:"totalCacheCreation"`
 	// TotalQuota 额度合计，**净额**（消费 − 退款 + 补扣）。
 	TotalQuota float64 `json:"totalQuota"`
 	// TotalCostCNY 金额 = 额度 / QuotaPerCNY，即站点实收。
@@ -77,9 +83,14 @@ type SimpleBillRow struct {
 	SkipReasons map[string]int `json:"skipReasons,omitempty"`
 }
 
-// SimpleBillColumns 模板二**客户版**的列名：账单与脱敏日志都是这七列。
+// SimpleBillColumns 模板二**汇总表**的列名：账单与成本表的前九列都用它。
 //
-// 成本三列（官方刊例 / 上游成本 / 利润）不在其中，它们只出现在独立的成本表里
+// 注意配套的脱敏日志**不是**这张表：它是逐行明细（见 WriteSimpleSanitizedLog），
+// 列的加工口径与模板一一致。汇总留在账单里，明细才是脱敏日志该有的样子——
+// 早先这里图省事把汇总表当脱敏日志写出去，结果两个文件内容一模一样，
+// 客户拿它核不了任何一笔账。
+//
+// 成本三列（官方刊例 / 上游成本 / 利润）不在客户版里，它们只出现在独立的成本表
 // （见 SimpleBillCostColumns）。这是有意的边界：
 //
 //	客户拿到的任何文件里都不该有我们的采购价与单笔毛利。
@@ -88,21 +99,16 @@ type SimpleBillRow struct {
 // 且逐列看清删对了，风险与收益不对等。挪进单独的成本表后，客户版文件里
 // **根本不存在**这些列，不需要靠自觉。
 var SimpleBillColumns = []string{
-	"分组", "模型", "次数", "输入Token", "输出Token", "额度", "金额（人民币）",
+	"分组", "模型", "次数", "输入Token", "输出Token", "缓存读Token", "缓存创建Token",
+	"额度", "金额（人民币）",
 }
 
-// SimpleBillCostColumns 成本表的列名：客户版的七列 + 成本三列。
+// SimpleBillCostColumns 成本表的列名：客户版诸列 + 成本三列。
 var SimpleBillCostColumns = []string{
-	"分组", "模型", "次数", "输入Token", "输出Token", "额度", "金额（人民币）",
+	"分组", "模型", "次数", "输入Token", "输出Token", "缓存读Token", "缓存创建Token",
+	"额度", "金额（人民币）",
 	"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）",
 }
-
-// SimpleBillCostColFirst 成本三列在成本表里的起始下标（0 基）。
-//
-// 抽出来是因为「哪些列是成本列」在四处要用：表头、合计行、表末备注、列宽。
-// 写死成 7/8/9 散在各处，将来加一列就会漏改一两处，
-// 而漏改的表现是**金额串列**——最不容易一眼看出来的那种错。
-const SimpleBillCostColFirst = 7
 
 // SimpleBillOptions 模板二的算法开关与运行时输入。
 //
@@ -198,8 +204,6 @@ func streamSimpleSanitizedRows(w SanitizedRowWriter, headers []string, rows [][]
 	idxOther, hasOther := col["other"]
 	idxType, hasType := col["type"]
 	idxPrompt, hasPrompt := col["prompt_tokens"]
-	idxCacheTokens, hasCacheTokens := col["cache_tokens"]
-	idxCacheCreation, hasCacheCreation := col["cache_creation_tokens"]
 
 	for _, row := range rows {
 		if len(row) == 0 {
@@ -222,21 +226,7 @@ func streamSimpleSanitizedRows(w SanitizedRowWriter, headers []string, rows [][]
 			}
 		}
 
-		var cacheRead, cacheWrite5m, cacheWrite1h float64
-		if hasCacheTokens && hasCacheCreation {
-			cacheReadCol := ToFloat(cellAt(row, idxCacheTokens))
-			creationCol := ToFloat(cellAt(row, idxCacheCreation))
-			cr2, w5, w1 := ParseCacheTokens(other)
-			if w5 != 0 || w1 != 0 || strings.Contains(other, "cache_creation_tokens_5m") {
-				cacheRead = math.Max(cacheReadCol, cr2)
-				cacheWrite5m, cacheWrite1h = w5, w1
-			} else {
-				cacheRead = cacheReadCol
-				cacheWrite5m, cacheWrite1h = creationCol, 0
-			}
-		} else {
-			cacheRead, cacheWrite5m, cacheWrite1h = ParseCacheTokens(other)
-		}
+		cacheRead, cacheWrite5m, cacheWrite1h := rowCacheTokens(row, col, other)
 
 		details := ParseRowDetails(other, includeBilling)
 		// 未命中输入量是个派生值（见 UncachedInputTokens），模板一由 priceRow 算出。
@@ -446,6 +436,12 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			r.TotalPrompt += ToFloat(cellAt(row, idxPrompt))
 			r.TotalCompletion += ToFloat(cellAt(row, idxCompletion))
 			r.TotalQuota += quota
+
+			// 缓存两列也只在消费行累加：退款行不是一次请求，它的缓存量是 0，
+			// 但万一日志里记了值，累进去会让缓存数比实际调用量还大。
+			cacheRead, cacheWrite5m, cacheWrite1h := rowCacheTokens(row, col, other)
+			r.TotalCacheRead += cacheRead
+			r.TotalCacheCreation += cacheWrite5m + cacheWrite1h
 		}
 
 		if !opts.CostColumns {
@@ -629,11 +625,10 @@ func columnIndex(headers []string, name string) (int, bool) {
 
 // SimpleBillWriteOptions 写出模板二时的开关。
 type SimpleBillWriteOptions struct {
-	// CostTable 写出成本表（客户版七列 + 成本三列）而不是客户版账表。
+	// CostTable 写出成本表（汇总表的全部列 + 成本三列）而不是客户版账单。
 	//
-	// **只有成本表为 true**：账单、脱敏日志都是 false，两者列完全相同。
-	// 成本三列是站点的内部数据（采购价与单笔毛利），客户拿到的任何文件里都不该有；
-	// 挪进单独的成本表后，客户版文件里根本不存在这些列，
+	// **只有成本表为 true**。成本三列是站点的内部数据（采购价与单笔毛利），
+	// 客户拿到的账单里不该有；挪进单独的成本表后，客户版文件里根本不存在这些列，
 	// 不需要靠「发出去之前记得删列」来兜——那要求人永远不忘。
 	CostTable bool
 }
@@ -661,12 +656,38 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 	}
 	sheet := f.GetSheetName(0)
 
-	// 本次要写的列：成本表多三列，客户版账表就是七列。
+	// 本次要写的列：成本表多三列，客户版账表没有。
 	columns := SimpleBillColumns
+	// 列号一律按**列名**查，不写死数字：这张表刚加过两列（缓存读/缓存创建），
+	// 每加一列，后面所有列号都要跟着挪，而写死的数字漏改一处就会串列——
+	// 串列不会报错，只是金额列里装着别的数，是最难发现的一类错。
+	//
+	// 查不到就 panic，**不能返回 0/1 之类的兜底值**：那些兜底值指向 A 列，
+	// 而 A 列是合计行的「合计」标签所在。查不到时悄悄写进 A 列的表现是
+	// 合计标签被一个 SUM 公式顶掉——表看起来正常，标签没了。
+	// 列名写错是编译期查不出的，就让它在第一次跑到时立刻炸出来。
+	//
+	// colNum 闭包引用 columns 本身，所以在下面给它重新赋值（切到成本列集合）之后，
+	// 查到的就是成本表里的列号，不需要两套常量。
+	colNum := func(name string) int {
+		idx, ok := columnIndex(columns, name)
+		if !ok {
+			panic(fmt.Sprintf("简易账单：列集合里没有 %q（可用：%v）", name, columns))
+		}
+		return idx + 1 // Excel 列号是 1 基
+	}
+	// 成本三列的列名。用来判断某一列是不是成本列，以及取成本表的列号。
+	costColumnNames := []string{"官方刊例（美金）", "上游成本（人民币）", "利润（人民币）"}
+	isCostColumn := map[string]bool{}
+	for _, name := range costColumnNames {
+		isCostColumn[name] = true
+	}
 	var costCols []int // 成本三列的 1 基列号，客户版为空
 	if opts.CostTable {
 		columns = SimpleBillCostColumns
-		costCols = []int{8, 9, 10}
+		for _, name := range costColumnNames {
+			costCols = append(costCols, colNum(name))
+		}
 	}
 
 	styleHeader, err := f.NewStyle(&excelize.Style{Font: &excelize.Font{Bold: true}})
@@ -719,7 +740,12 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 	firstDataRow := 2
 	for i, r := range rows {
 		row := firstDataRow + i
-		values := []interface{}{r.Group, r.Model, r.HitCount, r.TotalPrompt, r.TotalCompletion, r.TotalQuota, r.TotalCostCNY}
+		values := []interface{}{
+			r.Group, r.Model, r.HitCount,
+			r.TotalPrompt, r.TotalCompletion,
+			r.TotalCacheRead, r.TotalCacheCreation,
+			r.TotalQuota, r.TotalCostCNY,
+		}
 		if opts.CostTable {
 			if r.CostPartial || (r.TotalRows > 0 && r.CostRows == 0) {
 				costPartial = true
@@ -730,20 +756,26 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 			costVals := []*float64{r.OfficialListUSD, r.UpstreamCostCNY, r.ProfitCNY}
 			for j, v := range costVals {
 				if v != nil {
-					values[SimpleBillCostColFirst+j] = *v
+					values[costCols[j]-1] = *v
 				}
 			}
 		}
 		if err := f.SetSheetRow(sheet, axis(1, row), &values); err != nil {
 			return err
 		}
-		for _, col := range []int{4, 5, 6} {
+		// token 四列用千分位会计格式：数字大、客户要逐位核对，挤在一起很难读。
+		for _, name := range []string{"输入Token", "输出Token", "缓存读Token", "缓存创建Token"} {
+			col := colNum(name)
 			if err := f.SetCellStyle(sheet, axis(col, row), axis(col, row), styleAccounting); err != nil {
 				return err
 			}
 		}
-		if err := f.SetCellStyle(sheet, axis(7, row), axis(7, row), styleMoney); err != nil {
-			return err
+		// 额度与金额用金额格式。
+		for _, name := range []string{"额度", "金额（人民币）"} {
+			col := colNum(name)
+			if err := f.SetCellStyle(sheet, axis(col, row), axis(col, row), styleMoney); err != nil {
+				return err
+			}
 		}
 		// 成本三列的样式逐列指定（而不是写区间）：将来插一列不会连样式一起串位。
 		for _, col := range costCols {
@@ -765,33 +797,40 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 			return err
 		}
 		sumCols := []struct {
-			col   int
+			name  string
 			style int
 		}{
-			{3, styleAccountingBold}, // 次数
-			{4, styleAccountingBold}, // 输入
-			{5, styleAccountingBold}, // 输出
-			{6, styleMoneyBold},      // 额度
-			{7, styleMoneyBold},      // 金额
-			{8, styleMoneyBold},      // 官方刊例USD
-			{9, styleMoneyBold},      // 上游成本
-			{10, styleMoneyBold},     // 利润
+			{"次数", styleAccountingBold},
+			{"输入Token", styleAccountingBold},
+			{"输出Token", styleAccountingBold},
+			{"缓存读Token", styleAccountingBold},
+			{"缓存创建Token", styleAccountingBold},
+			{"额度", styleMoneyBold},
+			{"金额（人民币）", styleMoneyBold},
+			{"官方刊例（美金）", styleMoneyBold},
+			{"上游成本（人民币）", styleMoneyBold},
+			{"利润（人民币）", styleMoneyBold},
 		}
 		for _, sc := range sumCols {
 			// 成本三列在客户版里根本不存在，自然不写合计。
-			isCostCol := sc.col > len(SimpleBillColumns)
-			if isCostCol && (!opts.CostTable || costPartial) {
+			// 这一判必须**在查列号之前**：查不到会 panic（那个 panic 是留给写错列名的），
+			// 拿「本表根本没有这一列」去触发它就本末倒置了。
+			//
+			// 按列名判定而不是按列号大小：那种比较只有在成本列恰好排在最后、
+			// 且客户版列数正好是成本表前缀时才成立，改一处就会悄悄失效。
+			if isCostColumn[sc.name] && (!opts.CostTable || costPartial) {
 				continue
 			}
 			// 成本三列只要有行没算出来就不写合计：SUM 会**跳过空单元格**，
-			// 于是合计看起来是个正常数字，实际只加了有成本的那部分。
-			// 那比留空更糟——留空至少看得出来"没算"，一个偏小的合计看不出来。
-			letter, _ := excelize.ColumnNumberToName(sc.col)
+			// 于是合计看起来是个正常数字、实际只加了有成本的那部分。
+			// 那比留空更糟——留空至少看得出来「没算」，一个偏小的合计看不出来。
+			col := colNum(sc.name)
+			letter, _ := excelize.ColumnNumberToName(col)
 			formula := fmt.Sprintf("SUM(%s%d:%s%d)", letter, firstDataRow, letter, lastDataRow)
-			if err := f.SetCellFormula(sheet, axis(sc.col, totalRow), formula); err != nil {
+			if err := f.SetCellFormula(sheet, axis(col, totalRow), formula); err != nil {
 				return err
 			}
-			if err := f.SetCellStyle(sheet, axis(sc.col, totalRow), axis(sc.col, totalRow), sc.style); err != nil {
+			if err := f.SetCellStyle(sheet, axis(col, totalRow), axis(col, totalRow), sc.style); err != nil {
 				return err
 			}
 		}
@@ -828,16 +867,21 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 		}
 	}
 
+	// 列宽也按列名给：与列号一样，避免插入新列后宽度整体错位。
+	// 没列在这里的列保持 Excel 默认宽度。
 	widths := map[string]float64{
-		"A": 20, "B": 28, "C": 10, "D": 16, "E": 16, "F": 16, "G": 16,
+		"分组": 20, "模型": 28, "次数": 10,
+		"输入Token": 16, "输出Token": 16, "缓存读Token": 16, "缓存创建Token": 16,
+		"额度": 16, "金额（人民币）": 16,
+		"官方刊例（美金）": 18, "上游成本（人民币）": 18, "利润（人民币）": 16,
 	}
-	if opts.CostTable {
-		widths["H"] = 18
-		widths["I"] = 18
-		widths["J"] = 16
-	}
-	for col, w := range widths {
-		if err := f.SetColWidth(sheet, col, col, w); err != nil {
+	for name, w := range widths {
+		col, ok := columnIndex(columns, name)
+		if !ok {
+			continue // 客户版没有成本列，跳过即可
+		}
+		letter, _ := excelize.ColumnNumberToName(col + 1)
+		if err := f.SetColWidth(sheet, letter, letter, w); err != nil {
 			return err
 		}
 	}
@@ -853,8 +897,12 @@ type SimpleBillTotals struct {
 	HitCount        int
 	TotalPrompt     float64
 	TotalCompletion float64
-	TotalQuota      float64
-	TotalCostCNY    float64
+	// TotalCacheRead / TotalCacheCreation 缓存读与缓存创建的 token 合计，
+	// 与表内两列同源（都来自 rowCacheTokens），所以摘要里的数能和文件对上。
+	TotalCacheRead     float64
+	TotalCacheCreation float64
+	TotalQuota         float64
+	TotalCostCNY       float64
 
 	// ---- 成本三项。与成本利润表的 CostTotals 同一约定：算不全时是 nil 而不是 0。----
 
@@ -891,6 +939,8 @@ func SumSimpleBill(rows []SimpleBillRow) SimpleBillTotals {
 		t.HitCount += r.HitCount
 		t.TotalPrompt += r.TotalPrompt
 		t.TotalCompletion += r.TotalCompletion
+		t.TotalCacheRead += r.TotalCacheRead
+		t.TotalCacheCreation += r.TotalCacheCreation
 		t.TotalQuota += r.TotalQuota
 		t.TotalCostCNY += r.TotalCostCNY
 
