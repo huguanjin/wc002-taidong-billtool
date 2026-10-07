@@ -172,8 +172,17 @@ func SanitizedColumns(includeBilling bool) []string {
 // SanitizedDropColumns 脱敏日志整体丢弃的原始列。SanitizedDetailColumns /
 // SanitizedBillingColumns 是从 other 里提出来的新列，other 本身仍整体丢弃，
 // 不因新增列而改变脱敏策略。
+//
+// channel_id 也在其中：渠道号指向我们的上游渠道，客户拿到它就能看出这批请求
+// 走了哪几条上游、各占多少，进而倒推出供应商与成本结构。它只该留在站内用的原始
+// 导出日志里（成本估算靠它，见 logRequiredColumns），不属于客户版明细。
+//
+// other 里同样藏着渠道号（admin_info.use_channel 等），但 other 整列已丢弃，
+// ParseRowDetails 也只取白名单里的顶层字段，不会把它带回来——所以脱敏日志里
+// 渠道号唯一的出口就是这个原始列。账单一与账单二的脱敏日志都经这张表过滤。
 var SanitizedDropColumns = map[string]bool{
 	"other":                    true,
+	"channel_id":               true,
 	"cache_tokens":             true,
 	"cache_creation_tokens":    true,
 	"cache_creation_tokens_5m": true,

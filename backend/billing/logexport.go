@@ -26,9 +26,11 @@ var (
 	}
 	// logRequiredColumns 人工 SQL 之外必需的列，紧跟基础列之后：
 	//   other      —— 缓存计费、阶梯表达式、工具调用、web_search 全在它里面；
-	//   channel_id —— 成本估算要按渠道展开，且脱敏日志会把 other 整列丢掉，
-	//                 渠道号只藏在 other.admin_info 里的话，脱敏日志就永远做不了成本利润表。
-	// 两列都放在必选而非可选：缺了 any 一个，对应功能就直接失效而不是降级。
+	//   channel_id —— 成本估算要按渠道展开。
+	//                 它只存在于**原始导出日志**里：脱敏日志会把它与 other 一并丢弃
+	//                 （见 SanitizedDropColumns），渠道号是站内的采购信息，不给客户看。
+	//                 所以成本利润表只能从原始导出日志出，不能拿脱敏日志回算。
+	// 两列都放在必选而非可选：缺了任何一个，对应功能就直接失效而不是降级。
 	logRequiredColumns = []string{"other", "channel_id"}
 	// logOptionalColumns 勾选才加的可选列（跨账号排查用）。
 	logOptionalColumns = []string{"user_id"}

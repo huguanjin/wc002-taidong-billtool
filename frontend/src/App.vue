@@ -1067,6 +1067,11 @@ async function handleSubmit() {
           结果 {{ fmtNum(mergeResult.rowCount) }} 行<template v-if="mergeResult.droppedRows > 0">，去重丢弃 {{ fmtNum(mergeResult.droppedRows) }} 行</template>。
         </p>
         <p class="hint">已写入：{{ mergeResult.mergedPath }}</p>
+        <!-- 脱敏日志合并时会剔除渠道号列：输入里有、结果里没有，必须说出来，
+             否则用户拿结果与源文件逐列对会以为合并丢了数据。 -->
+        <p class="hint" v-if="mergeResult.droppedColumns && mergeResult.droppedColumns.length > 0">
+          已剔除列：{{ mergeResult.droppedColumns.join('、') }}（脱敏日志不外露渠道号）。
+        </p>
         <div class="downloads">
           <a class="btn" :href="mergeResult.mergedUrl">下载合并日志：{{ mergeResult.mergedFileName }}</a>
           <button type="button" class="btn-browse" @click="useMergedAsBillInput">作为账单输入</button>

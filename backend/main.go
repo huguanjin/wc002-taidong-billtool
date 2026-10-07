@@ -1862,6 +1862,8 @@ func handleMergeLogs(w http.ResponseWriter, r *http.Request) {
 		"inputRows":      result.InputRows,
 		"rowCount":       result.RowCount,
 		"droppedRows":    result.DroppedRows,
+		// 被剔除的列（脱敏日志合并时的 channel_id）：页面要告诉用户「输入里有、结果里没有」。
+		"droppedColumns": result.DroppedColumns,
 		"headers":        result.Headers,
 		"format":         result.Format,
 	})

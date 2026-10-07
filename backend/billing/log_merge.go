@@ -27,7 +27,11 @@ type MergeResult struct {
 	InputRows   int // 各源文件数据行合计（去重前）
 	RowCount    int // 实际写入合并文件的数据行数
 	DroppedRows int // 因去重丢弃的行数
-	Format      string
+	// DroppedColumns 合并时从输入里剔除的列。目前只有脱敏日志形态的合并会剔除
+	// channel_id（见 MergeLogs）。列出来是为了让调用方能告诉用户「输入里有这一列、
+	// 结果里没有」，而不是悄悄少一列——这个函数的原则本来就是不默默丢数据。
+	DroppedColumns []string
+	Format         string
 }
 
 // mergeRowWriter 合并结果的写出目标：xlsx 或 csv/tsv。
@@ -147,8 +151,57 @@ func (w *CSVMergeWriter) Close() error {
 	return w.f.Close()
 }
 
+// channelIDColumn 渠道号列名。脱敏日志不得带它（见 SanitizedDropColumns）。
+const channelIDColumn = "channel_id"
+
+// headerIndex 表头里某列的下标，找不到返回 -1。
+// 与 mergeColumnPermutation 一样按去掉首尾空白后的列名比对。
+func headerIndex(headers []string, name string) int {
+	for i, h := range headers {
+		if strings.TrimSpace(h) == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// isSanitizedLogHeaders 表头是不是脱敏日志的形态：没有 other，且带脱敏才会展开的明细列。
+//
+// 判据必须**只命中脱敏日志**——原始导出日志合并后还要拿去估成本，channel_id 得留着：
+//   - 原始导出一定带 other（它是必选导出列，见 logRequiredColumns），脱敏日志一定没有；
+//   - 只看「没有 other」还不够：手工 SQL 导出的日志同样没有 other，
+//     所以再要求带 uncached_input_tokens，那是脱敏日志才会展开出来的明细列。
+//
+// 这条判据对「带 channel_id 的脱敏日志」没有漏网：channel_id 是在脱敏明细列之后
+// 才进导出列的，凡带 channel_id 的脱敏日志必然已经带着 uncached_input_tokens。
+func isSanitizedLogHeaders(headers []string) bool {
+	return headerIndex(headers, "other") < 0 && headerIndex(headers, "uncached_input_tokens") >= 0
+}
+
+// dropColumn 把某一列从表头和所有行里去掉，返回是否真的去掉了。找不到该列时原样返回。
+// 行是就地改短的：合并的源文件可能有几十万行，再复制一份只会把内存占用翻倍。
+func dropColumn(headers []string, rows [][]string, name string) ([]string, [][]string, bool) {
+	idx := headerIndex(headers, name)
+	if idx < 0 {
+		return headers, rows, false
+	}
+	outHeaders := make([]string, 0, len(headers)-1)
+	outHeaders = append(outHeaders, headers[:idx]...)
+	outHeaders = append(outHeaders, headers[idx+1:]...)
+	for i, row := range rows {
+		// 比表头短的行本来就没有这一列的值，不用动。
+		if idx < len(row) {
+			rows[i] = append(row[:idx], row[idx+1:]...)
+		}
+	}
+	return outHeaders, rows, true
+}
+
 // MergeLogs 把多个日志文件按行拼成一个文件，表头取首个文件，后续文件按列名对齐。
 // 列名与首个文件不一致、或出现首个文件没有的列时直接报错，避免默默拼出错位的日志。
+//
+// 唯一的例外是脱敏日志形态的合并：结果里不带 channel_id，输入里有也一律剔除
+// （剔除了哪些列见 MergeResult.DroppedColumns）。
 func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 	if len(inputPaths) == 0 {
 		return nil, fmt.Errorf("请至少提供一个日志文件")
@@ -167,6 +220,21 @@ func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 	}
 	if len(baseHeaders) == 0 {
 		return nil, fmt.Errorf("%s 没有表头", filepath.Base(inputPaths[0]))
+	}
+
+	// 脱敏日志形态的合并，结果里不得带 channel_id（渠道号不给客户看，见 SanitizedDropColumns）。
+	//
+	// 不处理的话有两种坏结果，都出在「旧版脱敏日志（那时还带 channel_id）」与新版混着合并时：
+	//   · 新版在前当基准：旧版多出一列 channel_id，mergeColumnPermutation 直接报错，合并失败；
+	//   · 旧版在前当基准：结果表头保留 channel_id，旧文件的行填着真实渠道号、新文件的行是空的——
+	//     等于借合并把已经脱掉的渠道号又交了出去。
+	// 判据只认脱敏形态（见 isSanitizedLogHeaders），原始日志的合并照旧保留 channel_id。
+	sanitizedMerge := isSanitizedLogHeaders(baseHeaders)
+	var ignoreColumns map[string]bool
+	droppedChannel := false
+	if sanitizedMerge {
+		ignoreColumns = map[string]bool{channelIDColumn: true}
+		baseHeaders, baseRows, droppedChannel = dropColumn(baseHeaders, baseRows, channelIDColumn)
 	}
 
 	outPath, err := resolveMergeOutputPath(params.OutDir, format)
@@ -222,10 +290,15 @@ func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 			writer.Close()
 			return nil, fmt.Errorf("读取 %s 失败: %w", filepath.Base(path), err)
 		}
-		perm, err := mergeColumnPermutation(baseHeaders, headers)
+		perm, err := mergeColumnPermutation(baseHeaders, headers, ignoreColumns)
 		if err != nil {
 			writer.Close()
 			return nil, fmt.Errorf("%s: %w", filepath.Base(path), err)
+		}
+		// 后续文件里带着 channel_id 也要记下来：它在 mergeColumnPermutation 里被忽略了，
+		// 不记的话调用方只会看到基准文件那一列，漏报「别的文件里也被剔除过」。
+		if sanitizedMerge && headerIndex(headers, channelIDColumn) >= 0 {
+			droppedChannel = true
 		}
 		aligned := make([][]string, 0, len(rows))
 		for _, row := range rows {
@@ -241,6 +314,9 @@ func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 	if err := writer.Close(); err != nil {
 		return nil, fmt.Errorf("写出合并结果失败: %w", err)
 	}
+	if droppedChannel {
+		result.DroppedColumns = []string{channelIDColumn}
+	}
 	if result.RowCount == 0 {
 		return nil, fmt.Errorf("合并结果没有任何数据行")
 	}
@@ -252,7 +328,11 @@ func MergeLogs(inputPaths []string, params MergeParams) (*MergeResult, error) {
 // src 里出现 base 没有的列（基准没有的新列）仍然报错，避免默默丢弃数据——
 // 这专门用于兼容「脱敏日志新增列后，旧版/新版产物混合合并」的场景：
 // 旧版缺的新列允许留空，但不允许新版文件反过来悄悄缺列。
-func mergeColumnPermutation(base, src []string) ([]int, error) {
+//
+// ignore 里的列是例外：src 有、base 没有时不报错，也不进结果（perm 只按 base 的列建）。
+// 这是给「该列是故意从结果里剔除的」用的（见 MergeLogs 对 channel_id 的处理），
+// 不是放宽对错位的检查——除这几列之外的陌生列照样报错。
+func mergeColumnPermutation(base, src []string, ignore map[string]bool) ([]int, error) {
 	index := make(map[string]int, len(src))
 	for i, h := range src {
 		key := strings.TrimSpace(h)
@@ -271,7 +351,7 @@ func mergeColumnPermutation(base, src []string) ([]int, error) {
 		}
 	}
 	for key := range index {
-		if !baseSet[key] {
+		if !baseSet[key] && !ignore[key] {
 			return nil, fmt.Errorf("表头存在基准没有的列: %s", key)
 		}
 	}

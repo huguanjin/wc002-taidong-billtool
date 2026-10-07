@@ -158,3 +158,65 @@ func TestExcelSanitizedWriterDetailColumns(t *testing.T) {
 	assert.Equal(t, "anthropic", outRows[0][col["usage_semantic"]])
 	assert.Equal(t, "", outRows[1][col["usage_semantic"]])
 }
+
+// TestSanitizedHeadersDropChannelID 渠道号列不进脱敏日志，其余列的表头顺序不变。
+func TestSanitizedHeadersDropChannelID(t *testing.T) {
+	headers := []string{"id", "model_name", "request_id", "other", "channel_id",
+		"cache_tokens", "cache_creation_tokens", "cache_creation_tokens_5m", "cache_creation_tokens_1h"}
+
+	got := buildSanitizedHeaders(headers, false)
+
+	assert.NotContains(t, got, "channel_id")
+	assert.NotContains(t, got, "other")
+	want := append([]string{"id", "model_name", "request_id"}, SanitizedColumns(false)...)
+	assert.Equal(t, want, got, "丢掉 channel_id 不能连带改变别的列的顺序")
+}
+
+// TestSanitizedWritersStayAlignedWithoutChannelID 两种写出器丢掉 channel_id 之后，
+// 排在它**后面**的列取值没有错位。
+//
+// 表头与每行的取值是两处各自过滤出来的（buildSanitizedHeaders 与 WriteRow），
+// 靠的是同一张 SanitizedDropColumns 表。要是哪天其中一处改成了别的判据，
+// 表头少一列而取值没少（或反过来），后面的列会整体错一格——数据照样写得出来、
+// 也不报错，只是 quota 那一列里装着别的东西。所以拿 channel_id 后面的 quota 来对。
+func TestSanitizedWritersStayAlignedWithoutChannelID(t *testing.T) {
+	headers := []string{"id", "model_name", "request_id", "other", "channel_id", "quota"}
+	other := `{"admin_info":{"use_channel":["73917"]},"usage_semantic":"anthropic"}`
+	row := []string{"1001", "claude-sonnet-5", "req-1", other, "73917", "50000"}
+
+	cases := []struct {
+		name string
+		file string
+		open func(path string) (SanitizedWriter, error)
+	}{
+		{"xlsx", "脱敏日志.xlsx", func(p string) (SanitizedWriter, error) {
+			return NewExcelSanitizedWriter(p, headers, false)
+		}},
+		{"tsv", "脱敏日志.tsv", func(p string) (SanitizedWriter, error) {
+			return NewCSVSanitizedWriter(p, headers, '\t', false)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), tc.file)
+			w, err := tc.open(path)
+			require.NoError(t, err)
+			require.NoError(t, w.WriteRow(row, 0, 0, 0, ParseRowDetails(other, false)))
+			require.NoError(t, w.Close())
+
+			gotHeaders, rows, err := LoadLogRows(path, "", "")
+			require.NoError(t, err)
+			require.Len(t, rows, 1)
+			col := map[string]int{}
+			for i, h := range gotHeaders {
+				col[h] = i
+			}
+
+			assert.NotContains(t, gotHeaders, "channel_id")
+			assert.Equal(t, "1001", rows[0][col["id"]])
+			assert.Equal(t, "req-1", rows[0][col["request_id"]], "channel_id 前面的列")
+			assert.Equal(t, "50000", rows[0][col["quota"]], "channel_id 后面的列：错位时最先坏在这里")
+			assert.False(t, fileContains(t, path, "73917"), "渠道号不得出现在产物任何位置")
+		})
+	}
+}
