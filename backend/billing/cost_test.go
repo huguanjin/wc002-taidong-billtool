@@ -414,7 +414,7 @@ func TestAggregateCostByChannelSplitsRows(t *testing.T) {
 	ratios := map[int]float64{101: 1.8, 102: 0.4}
 	names := map[int]string{101: "AZ", 102: "AWS"}
 
-	costRows, err := AggregateCostByChannel(rows, headers, nil, 7.0, false, nil, ratios, names)
+	costRows, err := AggregateCostByChannel(rows, headers, nil, 7.0, false, nil, ratios, nil, names)
 	require.NoError(t, err)
 	require.Len(t, costRows, 2, "两个渠道应各成一行")
 
@@ -458,7 +458,7 @@ func TestAggregateCostByChannelMissingColumn(t *testing.T) {
 	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other"}
 	rows := [][]string{{"m", "g", "1", "1", "1", ""}}
 
-	_, err := AggregateCostByChannel(rows, headers, nil, 7.0, false, nil, nil, nil)
+	_, err := AggregateCostByChannel(rows, headers, nil, 7.0, false, nil, nil, nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "channel_id")
 	assert.Contains(t, err.Error(), "重新导出", "提示要能指导用户下一步动作")
@@ -487,7 +487,7 @@ func TestUnmaintainedChannelCostIsEmpty(t *testing.T) {
 	headers, rows := buildCostFixture(t)
 	// 只维护渠道 101；102 未维护。
 	costRows, err := AggregateCostByChannel(rows, headers, nil, 7.0, false, nil,
-		map[int]float64{101: 1.8}, map[int]string{101: "AZ", 102: "AWS"})
+		map[int]float64{101: 1.8}, nil, map[int]string{101: "AZ", 102: "AWS"})
 	require.NoError(t, err)
 	require.Len(t, costRows, 2)
 

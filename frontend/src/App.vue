@@ -397,11 +397,18 @@ async function copyBillSummary() {
   const text = result.value && result.value.billSummary
   if (!text) return
   const state = await copyText(text)
-  if (state === 'fail') selectElementText(billSummaryRef.value)
+  if (state === 'fail') selectBillSummary()
   billCopyState.value = state
   setTimeout(() => {
     billCopyState.value = ''
   }, 2000)
+}
+
+// 选中账单摘要文本，供用户按 Ctrl+C；复制失败时的兜底，也是点击摘要框时的行为
+// （模板里 <pre @click="selectBillSummary"> 一直引用着它，但此前这个函数并不存在，
+// 点击摘要框什么都不会发生）。
+function selectBillSummary() {
+  selectElementText(billSummaryRef.value)
 }
 
 // isSimpleTemplate 选了简易汇总账单。简易模板不参与定价，所以与定价有关的
@@ -479,6 +486,14 @@ const checkChannelsMsg = ref('')
 // 日志里用到的渠道 + 各自填写的倍率，可就地补录。
 const usedChannels = ref([])
 const usedRatioDraft = ref({})
+// 国模渠道的勾选草稿，键是渠道号。国模渠道的上游倍率按折扣理解（0.4 = 4 折），
+// 其余渠道按「每美金刊例的成本」理解（0.4 ≈ 0.57 折）——同一个数差 7 倍，所以要有这个标识。
+const usedDomesticDraft = ref({})
+// 渠道号 → 本次日志里观测到的模型与国模提示依据（后端 reviewChannels，按渠道号索引）。
+// 光有渠道号与名称判断不了它承接的是国产还是海外模型，所以把模型一并摆出来。
+const usedReviewById = ref({})
+// 「折合官方折扣」的换算基数，由后端带回，页面里不另写一个裸 7（7 只是缺字段时的兜底）。
+const usedDiscountBase = ref(7)
 // 分组名 → 该分组下用到的渠道号。同一份日志里一个渠道可能出现在多个分组下，
 // 所以是「分组 → 渠道」而不是反查；展示时按分组分节，与用户认知一致。
 const usedGroupChannels = ref({})
@@ -520,6 +535,8 @@ const usedUnsavedCount = computed(
 // 这个函数在模板渲染期被调用（:class / v-if），抛异常会让 Vue 卸载整棵组件树，
 // 表现是整页白屏，而不是某个输入框报错。
 function usedDirty(c) {
+  // 只改国模勾选、不动倍率，同样算「有改动」，否则这个勾点了却存不下来。
+  if (!!usedDomesticDraft.value[c.channelId] !== !!c.isDomestic) return true
   const raw = String(usedRatioDraft.value[c.channelId] ?? '').trim()
   if (raw === '') return false
   const num = Number(raw)
@@ -528,12 +545,55 @@ function usedDirty(c) {
   return before === null || num !== before
 }
 
+// usedDiscountText 把草稿里的倍率折合成「官方人民币刊例的几折」，随输入实时变化。
+// 在渲染期被调用，不能抛异常——取值一律 String() 归一并带兜底。
+function usedDiscountText(c) {
+  const raw = String(usedRatioDraft.value[c.channelId] ?? '').trim()
+  if (raw === '') return '—'
+  const num = Number(raw)
+  if (!Number.isFinite(num)) return '—'
+  const base = usedDiscountBase.value > 0 ? usedDiscountBase.value : 7
+  const discount = usedDomesticDraft.value[c.channelId] ? num : num / base
+  return `${Math.round(discount * 1000) / 100} 折`
+}
+
+// usedModelsText 该渠道在本次日志里跑过的模型，最多列三个。
+function usedModelsText(c) {
+  const models = (usedReviewById.value[c.channelId] || {}).models || []
+  if (models.length === 0) return '—'
+  return models.length > 3 ? `${models.slice(0, 3).join('、')} 等 ${models.length} 个` : models.join('、')
+}
+
+// usedHints 国模标识的一致性提示，只提示、从不自动改——标识该由人拍板。
+function usedHints(c) {
+  const info = usedReviewById.value[c.channelId] || {}
+  const domestic = !!usedDomesticDraft.value[c.channelId]
+  const num = Number(String(usedRatioDraft.value[c.channelId] ?? '').trim() || NaN)
+  const out = []
+  if (!domestic && info.allDomesticModels) {
+    out.push({ key: 'shouldMark', text: '日志里只跑国产模型，通常应标为国模渠道' })
+  }
+  if (domestic && !info.anyDomesticModels && (info.models || []).length > 0) {
+    // 判据是模型名；标准明细对「识别不出」的国产模型会把人民币刊例当美金再乘汇率（偏高约 7 倍）。
+    out.push({
+      key: 'shouldUnmark',
+      text: '标了国模，但按模型名识别不出国产厂商的模型（识别：deepseek / glm / minimax / kimi / qwen / 可灵）；标准明细的成本会因此偏高约 7 倍，请确认',
+    })
+  }
+  if (domestic && Number.isFinite(num) && num > 1) {
+    out.push({ key: 'over1', text: '国模倍率按折扣填（0.4 = 4 折），大于 1 表示成本高于官方刊例' })
+  }
+  return out
+}
+
 async function checkChannels() {
   checkChannelsError.value = ''
   checkChannelsMsg.value = ''
   checkChannelsDone.value = false
   usedChannels.value = []
   usedRatioDraft.value = {}
+  usedDomesticDraft.value = {}
+  usedReviewById.value = {}
   usedGroupChannels.value = {}
   checkChannelsMissGroupRatio.value = 0
 
@@ -560,11 +620,18 @@ async function checkChannels() {
     usedChannels.value = data.usedChannels || []
     usedGroupChannels.value = data.groupChannels || {}
     checkChannelsMissGroupRatio.value = data.missingGroupRatioRows || 0
+    if (Number(data.discountBaseFactor) > 0) usedDiscountBase.value = Number(data.discountBaseFactor)
+    const review = {}
+    for (const r of data.reviewChannels || []) review[r.channelId] = r
+    usedReviewById.value = review
     const draft = {}
+    const domestic = {}
     for (const c of usedChannels.value) {
       draft[c.channelId] = c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
+      domestic[c.channelId] = !!c.isDomestic
     }
     usedRatioDraft.value = draft
+    usedDomesticDraft.value = domestic
 
     if (data.missingCount === 0 && data.unknownCount === 0) {
       checkChannelsMsg.value = `日志用到的 ${usedChannels.value.length} 个渠道都已维护倍率，可以生成成本利润表。`
@@ -581,7 +648,7 @@ async function checkChannels() {
   }
 }
 
-// 就地补录：只提交有改动、且有值的项。
+// 就地补录：只提交有改动的项（倍率改了，或国模勾选改了）。
 async function saveUsedRatios() {
   checkChannelsError.value = ''
   checkChannelsMsg.value = ''
@@ -589,19 +656,29 @@ async function saveUsedRatios() {
   for (const c of usedChannels.value) {
     // 同 usedDirty：type=number 的 v-model 会给到 number，必须 String() 归一化后再 trim。
     const raw = String(usedRatioDraft.value[c.channelId] ?? '').trim()
-    if (raw === '') continue
-    const num = Number(raw)
-    if (!Number.isFinite(num) || num < 0) {
-      checkChannelsError.value = `渠道 ${c.channelId} 的倍率必须是非负数字`
-      return
-    }
-    // 用数值比较，避免 "0.60" 与已存的 0.6 被当成改动而重复提交。
     const before = c.upstreamRatio === null || c.upstreamRatio === undefined ? null : c.upstreamRatio
-    if (before !== null && before === num) continue
-    items.push({ channelId: c.channelId, upstreamRatio: num, note: '' })
+    const flag = !!usedDomesticDraft.value[c.channelId]
+    const flagChanged = flag !== !!c.isDomestic
+
+    // 倍率框是空的：这个页面从不借此「取消维护」，沿用库里原值（只改国模勾选时要用到）。
+    let num = before
+    let ratioChanged = false
+    if (raw !== '') {
+      num = Number(raw)
+      if (!Number.isFinite(num) || num < 0) {
+        checkChannelsError.value = `渠道 ${c.channelId} 的倍率必须是非负数字`
+        return
+      }
+      // 用数值比较，避免 "0.60" 与已存的 0.6 被当成改动而重复提交。
+      ratioChanged = before === null || num !== before
+    }
+    if (!ratioChanged && !flagChanged) continue
+    // 不带 note：后端把没传的 note 当作「保持原值」，这里只该动倍率与国模标识，
+    // 不该顺手把用户在渠道页写的备注清掉。
+    items.push({ channelId: c.channelId, upstreamRatio: num, isDomestic: flag })
   }
   if (items.length === 0) {
-    checkChannelsMsg.value = '没有新的倍率需要保存。'
+    checkChannelsMsg.value = '没有新的倍率或国模标识需要保存。'
     return
   }
 
@@ -618,7 +695,7 @@ async function saveUsedRatios() {
       checkChannelsError.value = data.error || `保存失败（${resp.status}）`
       return
     }
-    checkChannelsMsg.value = `已保存 ${data.saved} 个渠道的倍率，可以生成成本利润表了。`
+    checkChannelsMsg.value = `已保存 ${data.saved} 个渠道的倍率与国模标识，可以生成成本利润表了。`
     // 保存后刷新两处清单：预检结果与下方维护卡片。
     await checkChannels()
   } catch (err) {
@@ -1488,7 +1565,10 @@ async function handleSubmit() {
                 <th>渠道 ID</th>
                 <th>渠道名称</th>
                 <th>分组</th>
+                <th>模型</th>
                 <th>上游倍率</th>
+                <th>国模渠道</th>
+                <th>折合官方折扣</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -1515,6 +1595,8 @@ async function handleSubmit() {
                     style="margin-right: 4px"
                   >{{ g }}</span>
                 </td>
+                <!-- 该渠道在本次日志里跑过的模型：光看渠道号与名称分不清它承接的是国产还是海外模型。 -->
+                <td>{{ usedModelsText(c) }}</td>
                 <td>
                   <input
                     v-model="usedRatioDraft[c.channelId]"
@@ -1525,12 +1607,24 @@ async function handleSubmit() {
                     class="ratio-input"
                   />
                 </td>
+                <!-- 国模渠道的倍率按折扣理解（0.4 = 4 折），其余按「每美金刊例的成本」（0.4 ≈ 0.57 折）。
+                     同一个数差 7 倍，所以填倍率的同时要决定它属于哪一类；右边的折合折扣随勾选实时变。 -->
+                <td style="text-align: center">
+                  <input v-model="usedDomesticDraft[c.channelId]" type="checkbox" />
+                </td>
+                <td>{{ usedDiscountText(c) }}</td>
                 <td>
                   <span v-if="c.upstreamRatio === null || c.upstreamRatio === undefined">未维护</span>
                   <span v-else>已维护</span>
                   <!-- 「填了未保存」必须与「从未维护」分开：以前状态列读的是输入框草稿，
                        一敲键盘就显示「已维护」，用户以为存好了，实际没提交。 -->
                   <span v-if="usedDirty(c)" class="unsaved-tag">填了未保存</span>
+                  <span
+                    v-for="h in usedHints(c)"
+                    :key="h.key"
+                    class="tag"
+                    style="display: block; margin: 2px 0 0; border-radius: 6px; white-space: normal"
+                  >{{ h.text }}</span>
                 </td>
               </tr>
             </tbody>

@@ -45,6 +45,10 @@ const planForm = ref({
   // generateCost 管「要不要那张独立的成本利润表」。简易模板没有那张表，
   // 但它的账单上有成本三列——所以简易模板下 generateCost 无意义、checkCost 照样有用。
   checkCost: true,
+  // 执行时是否停下来核对上游渠道倍率与国模标识（见 BillTask.ReviewUpstream）。
+  // 默认不勾：它会打断每一次执行，只有需要逐期核对上游数据的计划才开。
+  // 依附于 checkCost——没开成本核算就没有上游成本可核对。
+  reviewUpstream: false,
   // 是否套用该客户手工维护的「分组 → 折扣」（线下谈定、没同步到 new-api 的）。
   // 默认不勾：折扣直接决定收客户多少钱，不该在用户没表态时自动套用人工数值。
   useManualDiscount: false,
@@ -59,11 +63,19 @@ const selectedTasks = ref([])
 const runResults = ref([])
 const validationResults = ref([])
 // runResults 里带下载链接的那几条，用于展示
-const runFailures = computed(() => runResults.value.filter((r) => !r.ok && !r.needsChannelRatios))
+//
+// 「执行失败」必须把两种等待用户输入的中间态排除掉：缺倍率被拦、停在核对窗口上。
+// 它们都是 ok=false 但**不是失败**——漏排任何一种，用户会在失败列表里看到一条没有
+// 错误原因的记录，以为任务坏了。
+const runFailures = computed(() =>
+  runResults.value.filter((r) => !r.ok && !r.needsChannelRatios && !r.needsUpstreamReview)
+)
 const runSuccesses = computed(() => runResults.value.filter((r) => r.ok))
 // 被成本核算预检拦下的那几条。**不是失败**：没有产物，但用户补录倍率后重跑即可，
 // 所以不能混进「执行失败」里——那会让用户以为任务坏了，去查根本不存在的 bug。
 const runBlocked = computed(() => runResults.value.filter((r) => r.needsChannelRatios))
+// 停在「核对上游倍率与国模标识」上的那几条（计划勾了核对）。同样不是失败，也没有出账。
+const runReview = computed(() => runResults.value.filter((r) => r.needsUpstreamReview))
 
 // 复制按钮的状态，按任务 ID 记（见 copySummary）。
 const copyStates = ref({})
@@ -241,6 +253,7 @@ function resetPlanForm() {
     generateSanitized: planForm.value.generateSanitized,
     generateCost: planForm.value.generateCost,
     checkCost: planForm.value.checkCost,
+    reviewUpstream: planForm.value.reviewUpstream,
     useManualDiscount: planForm.value.useManualDiscount,
     billTemplate: planForm.value.billTemplate,
   }
@@ -262,6 +275,8 @@ function startEditPlan(t) {
     generateCost: !!t.generateCost,
     // 老计划没有这个字段（库里的列是后加的，默认 true），undefined 时按勾选算。
     checkCost: t.checkCost === undefined || t.checkCost === null ? true : !!t.checkCost,
+    // 核对开关是后加的，老计划没有这个字段：按未勾选算（与后端迁移的默认 false 一致）。
+    reviewUpstream: !!t.reviewUpstream,
     // 这个字段相反：老计划迁移时默认 true（保住既有口径），新建默认 false。
     // 但后端已经把这个默认值落在库里了，页面只需原样反映，不再自己兜底——
     // 兜底成 false 会让已在用线下折扣的老计划显示成未勾选，而实际出账仍生效。
@@ -299,6 +314,7 @@ async function savePlan() {
         generateSanitized: planForm.value.generateSanitized,
         generateCost: planForm.value.generateCost,
         checkCost: planForm.value.checkCost,
+        reviewUpstream: planForm.value.reviewUpstream,
         useManualDiscount: planForm.value.useManualDiscount,
         billTemplate: planForm.value.billTemplate,
       }),
@@ -400,8 +416,14 @@ async function runSelected() {
   // 折扣草稿同样清掉——它比倍率更危险：提交上去就直接改了这个客户的报价。
   blockedRatioDraft.value = {}
   blockedDiscountDraft.value = {}
+  blockedDomesticDraft.value = {}
   blockedError.value = ''
   blockedMsg.value = ''
+  // 核对窗口的状态同理：换了批次，上一轮的草稿不能带进来。
+  reviewOpen.value = false
+  reviewRatioDraft.value = {}
+  reviewDomesticDraft.value = {}
+  reviewError.value = ''
   const ids = [...selectedTasks.value]
   running.value = true
   try {
@@ -417,9 +439,17 @@ async function runSelected() {
       return
     }
     runResults.value = data.results || []
+    if (Number(data.discountBaseFactor) > 0) discountBaseFactor.value = Number(data.discountBaseFactor)
+    // 有计划停在核对上：用后端给的当前配置初始化草稿，并直接弹出核对窗口。
+    seedChannelDrafts()
+    if (runReview.value.length > 0) reviewOpen.value = true
+    // 等待用户输入的计划（核对 / 补录）不算成功也不算失败，要单独说一句，
+    // 否则「0 条全部成功」会让人以为什么都没发生。
+    const pending = runResults.value.filter((r) => r.needsUpstreamReview || r.needsChannelRatios).length
+    const pendingText = pending > 0 ? `，${pending} 条等待核对/补录` : ''
     message.value = data.failCount > 0
-      ? `执行完成：成功 ${data.okCount} 条，失败 ${data.failCount} 条`
-      : `执行完成：${data.okCount} 条全部成功`
+      ? `执行完成：成功 ${data.okCount} 条，失败 ${data.failCount} 条${pendingText}`
+      : `执行完成：${data.okCount} 条成功${pendingText}`
     await loadTasks()
   } catch (err) {
     error.value = '执行失败：' + err.message
@@ -474,6 +504,10 @@ async function deleteSelected() {
 // 待补录的倍率草稿，键是渠道 ID。按任务分不开：同一批执行里两条任务可能都缺
 // 同一个渠道的倍率，那个渠道只需要填一次，所以草稿是全局的一份而不是按任务一份。
 const blockedRatioDraft = ref({})
+// 待补录渠道的「国模渠道」勾选草稿，键同样是渠道 ID，全局一份（理由同上）。
+// 初值取库里现有的标识（见 seedChannelDrafts），不能默认 false——
+// 先标了国模、倍率还没填的渠道，勾要保持住。
+const blockedDomesticDraft = ref({})
 const savingBlockedRatios = ref(false)
 const blockedError = ref('')
 const blockedMsg = ref('')
@@ -535,6 +569,9 @@ const blockedHasDiscountWork = computed(() => blockedDiscountGroups.value.length
 
 // blockedRatioItems 把草稿整理成接口要的形态，顺手校验。
 // 空串表示「这次不填」，跳过而不是报错——用户可能只想先补其中几个。
+//
+// 不带 note：后端把没传的 note 当作「保持原值」，这里只该动倍率与国模标识，
+// 不该顺手把用户在渠道页写的备注清掉。
 function blockedRatioItems() {
   const items = []
   for (const r of runBlocked.value) {
@@ -545,7 +582,11 @@ function blockedRatioItems() {
       if (!Number.isFinite(num) || num < 0) {
         return { error: `渠道 ${ch.channelId} 的倍率必须是非负数字` }
       }
-      items.push({ channelId: ch.channelId, upstreamRatio: num, note: '' })
+      items.push({
+        channelId: ch.channelId,
+        upstreamRatio: num,
+        isDomestic: !!blockedDomesticDraft.value[ch.channelId],
+      })
     }
   }
   return { items }
@@ -712,11 +753,51 @@ async function saveBlockedRatios() {
   }
 }
 
-// continueAfterFix 保存倍率后重跑被拦下的那几条计划。
+// rerunPending 保存补录/核对之后，重跑指定的几条计划，并把结果并回 runResults。
 //
 // **会重新导出日志**：渠道集合要导出后才知道，所以检查必然发生在导出之后，
 // 「继续」只能是重跑整条链路。这是刻意的取舍——换来的是不需要一套跨请求的
 // 中间态机制。界面上必须说清楚，别让用户以为点了继续就完全不重来。
+//
+// 一律带 skipUpstreamReview：走到这里说明用户已经看过核对窗口（或这条计划本来就没勾核对）。
+// 不带的话，重跑又会停回同一个窗口，永远出不了账。
+async function rerunPending(ids) {
+  error.value = ''
+  running.value = true
+  try {
+    const resp = await fetch('/api/run-bill-tasks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ taskIds: ids, skipUpstreamReview: true }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      error.value = data.error || `继续执行失败（${resp.status}）`
+      return false
+    }
+    // 只替换这几条的结果，别动其它条：用户可能同时跑了别的计划，
+    // 整份覆盖会把它们的结果连下载链接一起抹掉。
+    const byId = new Map((data.results || []).map((r) => [r.taskId, r]))
+    const merged = runResults.value.map((r) => (byId.has(r.taskId) ? byId.get(r.taskId) : r))
+    // 不在原结果里的（理论上不会出现）补在后面，免得静默丢掉。
+    for (const [id, r] of byId) {
+      if (!runResults.value.some((x) => x.taskId === id)) merged.push(r)
+    }
+    runResults.value = merged
+    // 重跑后可能又冒出新的待补录渠道，给它们补上草稿初值（已有的不动）。
+    seedChannelDrafts()
+    await loadTasks()
+    return true
+  } catch (err) {
+    error.value = '继续执行失败：' + err.message
+    return false
+  } finally {
+    running.value = false
+  }
+}
+
+// continueAfterFix 保存倍率 / 折扣后重跑被拦下的那几条计划。
 async function continueAfterFix() {
   blockedError.value = ''
   blockedMsg.value = ''
@@ -740,36 +821,264 @@ async function continueAfterFix() {
 
   const ids = runBlocked.value.map((r) => r.taskId)
   if (ids.length === 0) return
+  await rerunPending(ids)
+}
 
-  error.value = ''
-  running.value = true
-  try {
-    const resp = await fetch('/api/run-bill-tasks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ taskIds: ids }),
-    })
-    const data = await resp.json()
-    if (!resp.ok) {
-      if (resp.status === 401) emit('unauthorized')
-      error.value = data.error || `继续执行失败（${resp.status}）`
-      return
+// ---- 核对上游倍率与国模标识 ----
+//
+// 计划勾了「执行时核对」时，执行会在导出日志之后、出账之前停下来，把这份日志用到的渠道
+// 连同当前的上游倍率与国模标识弹给用户过目：确认无误直接继续，要改就改完再继续。
+// 用意是让人**每次都**有机会看一眼——国模标识标错一个渠道，成本就差 7 倍，账面上看不出来。
+
+// 「折合官方折扣」的换算基数：海外渠道 倍率 ÷ 基数，国模渠道直接是倍率。
+// 真正的值由后端随执行结果带回（见 runSelected），页面里不另写一个裸 7；
+// 这里的 7 只是响应缺字段时的兜底。
+const discountBaseFactor = ref(7)
+
+const reviewOpen = ref(false)
+// 核对草稿，键是渠道 ID。与补录草稿同理是全局一份：同一批里两条计划可能共用一个渠道，
+// 那个渠道只需要看一次、改一次。
+const reviewRatioDraft = ref({})
+const reviewDomesticDraft = ref({})
+const savingReview = ref(false)
+const reviewError = ref('')
+
+// normNum 数字归一化后再比较，避免 "0.60" 与 0.6 被当成改动。
+// 统一 String()：type=number 的 v-model 会给到 number，直接 .trim() 会在渲染期抛 TypeError，
+// 表现是整页白屏而不是某个输入框报错。
+function normNum(v) {
+  const t = String(v ?? '').trim()
+  if (t === '') return ''
+  const n = Number(t)
+  return Number.isFinite(n) ? String(n) : t
+}
+
+// seedChannelDrafts 用后端给的当前配置给草稿起初值。**只补缺、不覆盖**：
+// 重跑后新出现的渠道要有初值，而用户已经改过的不能被冲掉。
+// 新一批执行开始时草稿会先清空（见 runSelected），那时「只补缺」就等于全量初始化。
+function seedChannelDrafts() {
+  const rd = { ...reviewRatioDraft.value }
+  const dd = { ...reviewDomesticDraft.value }
+  for (const r of runReview.value) {
+    for (const ch of r.channelCheck?.reviewChannels || []) {
+      if (!(ch.channelId in rd)) {
+        rd[ch.channelId] = ch.upstreamRatio === null || ch.upstreamRatio === undefined ? '' : String(ch.upstreamRatio)
+      }
+      if (!(ch.channelId in dd)) dd[ch.channelId] = !!ch.isDomestic
     }
-    // 只替换这几条的结果，别动其它条：用户可能同时跑了别的计划，
-    // 整份覆盖会把它们的结果连下载链接一起抹掉。
-    const byId = new Map((data.results || []).map((r) => [r.taskId, r]))
-    const merged = runResults.value.map((r) => (byId.has(r.taskId) ? byId.get(r.taskId) : r))
-    // 不在原结果里的（理论上不会出现）补在后面，免得静默丢掉。
-    for (const [id, r] of byId) {
-      if (!runResults.value.some((x) => x.taskId === id)) merged.push(r)
-    }
-    runResults.value = merged
-    await loadTasks()
-  } catch (err) {
-    error.value = '继续执行失败：' + err.message
-  } finally {
-    running.value = false
   }
+  reviewRatioDraft.value = rd
+  reviewDomesticDraft.value = dd
+
+  // 缺倍率补录面板里的国模勾选同样要从库里现有的标识起步：
+  // 先标了国模、倍率还没填的渠道，那个勾不能被默认的「未勾」冲掉。
+  const bd = { ...blockedDomesticDraft.value }
+  for (const r of runBlocked.value) {
+    for (const ch of r.channelCheck?.missing || []) {
+      if (!(ch.channelId in bd)) bd[ch.channelId] = !!ch.isDomestic
+    }
+  }
+  blockedDomesticDraft.value = bd
+}
+
+function reviewPeriodText(r) {
+  if (!r.periodYear || !r.periodMonth) return ''
+  return `${r.periodYear}-${String(r.periodMonth).padStart(2, '0')}`
+}
+
+// reviewSections 每条停在核对上的计划一节。
+//
+// 说明文字里**去掉 no_upstream_ratio 这一类**：核对表里缺倍率的渠道本来就逐个高亮了，
+// 而这一类的计数在预检里是「渠道数」不是「行数」，套进「N 行…」的句式会把渠道数读成行数。
+const reviewSections = computed(() =>
+  runReview.value.map((r) => {
+    const rest = { ...(r.channelCheck?.uncostableRows || {}) }
+    delete rest.no_upstream_ratio
+    return {
+      taskId: r.taskId,
+      taskName: r.taskName || r.task?.name || `任务 ${r.taskId}`,
+      customerName: r.customerName || r.task?.customerName || '',
+      period: reviewPeriodText(r),
+      totalRows: r.channelCheck?.totalRows || 0,
+      notice: skipReasonText(rest),
+      channels: r.channelCheck?.reviewChannels || [],
+    }
+  })
+)
+
+// 以下几个函数在模板渲染期被调用，**不能抛异常**——抛了整个组件会被 Vue 卸载，页面白屏。
+// 所以取值一律带兜底（?? / ?.），数字一律 String() 归一后再处理。
+
+function reviewDraftText(ch) {
+  return String(reviewRatioDraft.value[ch.channelId] ?? '').trim()
+}
+
+function reviewIsMissing(ch) {
+  return reviewDraftText(ch) === ''
+}
+
+// discountText 把一个倍率折合成「官方人民币刊例的几折」。
+// 这个展示存在的理由就是让那 7 倍的差别肉眼可见：
+// 同样填 0.4，国模渠道是 4 折，海外渠道是 0.57 折。
+function discountText(rawRatio, domestic) {
+  const raw = String(rawRatio ?? '').trim()
+  if (raw === '') return '—'
+  const num = Number(raw)
+  if (!Number.isFinite(num)) return '—'
+  const base = discountBaseFactor.value > 0 ? discountBaseFactor.value : 7
+  const discount = domestic ? num : num / base
+  return `${Math.round(discount * 1000) / 100} 折`
+}
+
+function reviewDiscountText(ch) {
+  return discountText(reviewDraftText(ch), !!reviewDomesticDraft.value[ch.channelId])
+}
+
+function blockedDiscountText(ch) {
+  return discountText(blockedRatioDraft.value[ch.channelId], !!blockedDomesticDraft.value[ch.channelId])
+}
+
+// channelHints 国模标识的一致性提示，只提示、从不自动改——标识该由人拍板。
+// ch 需要带 models / allDomesticModels / anyDomesticModels（核对清单与待补录清单都有）。
+function channelHints(ch, rawRatio, domestic) {
+  const out = []
+  const raw = String(rawRatio ?? '').trim()
+  const num = raw === '' ? NaN : Number(raw)
+  const models = ch.models || []
+  if (!domestic && ch.allDomesticModels) {
+    out.push({ key: 'shouldMark', kind: 'warn', text: '日志里只跑国产模型，通常应标为国模渠道' })
+  }
+  if (domestic && !ch.anyDomesticModels && models.length > 0) {
+    // 判据是模型名（与账单里换算币种用的同一个）。写清识别范围，是因为标准明细对「识别不出」的
+    // 国产模型会把人民币刊例当美金再乘汇率，成本偏高约 7 倍；简易汇总按渠道标识算，不受影响。
+    out.push({
+      key: 'shouldUnmark',
+      kind: 'warn',
+      text: '标了国模，但按模型名识别不出国产厂商的模型（识别：deepseek / glm / minimax / kimi / qwen / 可灵）；标准明细的成本会因此偏高约 7 倍，请确认',
+    })
+  }
+  if (domestic && ch.anyDomesticModels && !ch.allDomesticModels) {
+    out.push({ key: 'mixed', kind: 'info', text: '混有非国产模型，请确认按国模折扣算是否合适' })
+  }
+  if (domestic && Number.isFinite(num) && num > 1) {
+    out.push({ key: 'over1', kind: 'warn', text: '国模倍率按折扣填（0.4 = 4 折），大于 1 表示成本高于官方刊例' })
+  }
+  return out
+}
+
+function reviewHints(ch) {
+  const raw = reviewDraftText(ch)
+  const out = []
+  if (raw === '') {
+    out.push({ key: 'missing', kind: 'warn', text: '还没维护倍率，必须填写' })
+  }
+  return out.concat(channelHints(ch, raw, !!reviewDomesticDraft.value[ch.channelId]))
+}
+
+// 缺倍率补录面板里的行本来就都是「未维护」，不再重复提示「还没维护」，只给国模相关的。
+function blockedHints(ch) {
+  return channelHints(ch, blockedRatioDraft.value[ch.channelId], !!blockedDomesticDraft.value[ch.channelId])
+}
+
+function modelsText(ch) {
+  const models = ch.models || []
+  if (models.length === 0) return '—'
+  return models.length > 3 ? `${models.slice(0, 3).join('、')} 等 ${models.length} 个` : models.join('、')
+}
+
+// reviewChangedItems 把草稿与库里现状对比，整理成要保存的改动，顺手校验。
+// 同一个渠道在几条计划里重复出现只算一次。不带 note：没传就保持原值。
+function reviewChangedItems() {
+  const items = []
+  const seen = new Set()
+  for (const sec of reviewSections.value) {
+    for (const ch of sec.channels) {
+      if (seen.has(ch.channelId)) continue
+      seen.add(ch.channelId)
+      const raw = reviewDraftText(ch)
+      const flag = !!reviewDomesticDraft.value[ch.channelId]
+      const before = ch.upstreamRatio === null || ch.upstreamRatio === undefined ? '' : String(ch.upstreamRatio)
+      if (normNum(raw) === normNum(before) && flag === !!ch.isDomestic) continue
+      let num = null
+      if (raw !== '') {
+        num = Number(raw)
+        if (!Number.isFinite(num) || num < 0) {
+          return { error: `渠道 ${ch.channelId} 的倍率必须是非负数字` }
+        }
+      }
+      items.push({ channelId: ch.channelId, upstreamRatio: num, isDomestic: flag })
+    }
+  }
+  return { items }
+}
+
+// 还没填倍率的渠道数（按渠道去重）。核对窗口里它们高亮，且必须填完才能继续——
+// 否则继续之后马上又会被「缺倍率」再拦一次，用户得填两遍。
+const reviewMissingCount = computed(() => {
+  const missing = new Set()
+  for (const sec of reviewSections.value) {
+    for (const ch of sec.channels) {
+      if (reviewIsMissing(ch)) missing.add(ch.channelId)
+    }
+  }
+  return missing.size
+})
+
+// 有改动的渠道数；校验不过（填了非法值）时也算有改动，让按钮显示「保存并继续」去触发报错。
+const reviewDirtyCount = computed(() => {
+  const { items } = reviewChangedItems()
+  return items ? items.length : 1
+})
+
+function openReview() {
+  reviewError.value = ''
+  reviewOpen.value = true
+}
+
+// closeReview 关掉窗口但不执行：这些计划仍停在核对上、没有出账，
+// 结果区会留一条提示，可以随时重新打开。
+function closeReview() {
+  reviewOpen.value = false
+}
+
+// continueReview 有改动先保存，再重跑。
+async function continueReview() {
+  reviewError.value = ''
+  const { items, error: itemsError } = reviewChangedItems()
+  if (itemsError) {
+    reviewError.value = itemsError
+    return
+  }
+  if (reviewMissingCount.value > 0) {
+    reviewError.value = `还有 ${reviewMissingCount.value} 个渠道没填上游倍率——先补上，否则继续后会被「缺倍率」再拦一次。`
+    return
+  }
+
+  savingReview.value = true
+  try {
+    if (items.length > 0) {
+      const resp = await fetch('/api/channel-ratios', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      })
+      const data = await resp.json()
+      if (!resp.ok) {
+        if (resp.status === 401) emit('unauthorized')
+        reviewError.value = data.error || `保存失败（${resp.status}）`
+        return
+      }
+    }
+  } catch (err) {
+    reviewError.value = '保存失败：' + err.message
+    return
+  } finally {
+    savingReview.value = false
+  }
+
+  const ids = runReview.value.map((r) => r.taskId)
+  reviewOpen.value = false
+  await rerunPending(ids)
 }
 
 // summaryText 取该条结果的可复制文字。
@@ -1039,6 +1348,12 @@ defineExpose({ loadAll })
           <input v-model="planForm.generateCost" type="checkbox" :disabled="!planForm.checkCost" />
           生成成本利润表
         </label>
+        <!-- 核对开关同样依附于成本核算：没开成本核算就没有上游成本可核对，
+             所以关掉成本核算时它淡下去并禁用，与「生成成本利润表」同一个处理。 -->
+        <label :class="{ muted: !planForm.checkCost }">
+          <input v-model="planForm.reviewUpstream" type="checkbox" :disabled="!planForm.checkCost" />
+          执行时核对上游倍率与国模标识
+        </label>
         <!-- 折扣与成本是两个方向：折扣决定**收客户多少钱**（客户侧），
              上游倍率决定**我们花多少钱**（成本侧）。所以并排放在同一层，
              而不是谁套谁——两者可以任意组合。 -->
@@ -1062,6 +1377,14 @@ defineExpose({ loadAll })
       <p class="hint" v-else>
         执行前会检查本时段日志用到的渠道是否都维护了上游倍率；缺了会先拦下，
         可以在本页就地补录后继续。
+      </p>
+      <!-- 放在上面那条 v-if / v-else-if / v-else 链**之后**：链中间不能插别的元素，
+           否则 v-else 会找不到它的 v-if。 -->
+      <p class="hint" v-if="planForm.checkCost && planForm.reviewUpstream">
+        每次执行都会在导出日志后停下来，弹出本次日志用到的渠道及其上游倍率、国模标识，
+        确认无误（或改完）再出账。<strong>国模渠道的倍率按折扣理解（0.4 = 4 折），
+        其余渠道按「每美金刊例的成本」理解（0.4 ≈ 0.57 折）</strong>——同一个数差 7 倍，
+        所以标识务必核对。<strong>继续执行会重新导一次日志。</strong>
       </p>
 
       <div class="path-row">
@@ -1100,6 +1423,24 @@ defineExpose({ loadAll })
         </li>
       </ul>
       <p class="hint">失败的计划保持原样，不会覆盖上次的结果。修正后重新勾选执行即可。</p>
+    </div>
+
+    <!-- 停在「核对上游倍率与国模标识」上的计划：核对窗口被关掉后在这里留一个入口，
+         随时可以重新打开。这些计划**还没出账**，也不是失败。 -->
+    <div v-if="runReview.length > 0 && !reviewOpen" class="result-box warn-box">
+      <strong>等待核对上游倍率与国模标识（{{ runReview.length }} 条）</strong>
+      <p class="hint">
+        这些计划勾了「执行时核对」，已停在核对这一步，<strong>还没有出账</strong>。
+      </p>
+      <ul class="result-list">
+        <li v-for="s in reviewSections" :key="'rvn-' + s.taskId">
+          <span class="name">{{ s.taskName }}</span>
+          <span class="hint inline">{{ s.channels.length }} 个渠道待核对</span>
+        </li>
+      </ul>
+      <div class="path-row">
+        <button type="button" class="btn-primary" @click="openReview" :disabled="running">打开核对窗口</button>
+      </div>
     </div>
 
     <!-- 被成本核算预检拦下：不是失败，而是等待用户补录上游倍率。
@@ -1149,7 +1490,10 @@ defineExpose({ loadAll })
               <tr>
                 <th>渠道 ID</th>
                 <th>渠道名称</th>
+                <th>模型</th>
                 <th>上游倍率</th>
+                <th>国模渠道</th>
+                <th>折合官方折扣</th>
                 <th>状态</th>
               </tr>
             </thead>
@@ -1160,6 +1504,7 @@ defineExpose({ loadAll })
                   {{ ch.name }}
                   <span v-if="ch.known === false" class="tag warn">不在渠道清单里</span>
                 </td>
+                <td>{{ modelsText(ch) }}</td>
                 <td>
                   <input
                     v-model="blockedRatioDraft[ch.channelId]"
@@ -1170,6 +1515,12 @@ defineExpose({ loadAll })
                     class="ratio-input"
                   />
                 </td>
+                <!-- 国模渠道的倍率按折扣理解（0.4 = 4 折），其余按「每美金刊例的成本」
+                     （0.4 ≈ 0.57 折）。填倍率的同时就要决定它属于哪一类，所以放在同一行。 -->
+                <td class="center">
+                  <input v-model="blockedDomesticDraft[ch.channelId]" type="checkbox" />
+                </td>
+                <td>{{ blockedDiscountText(ch) }}</td>
                 <td>
                   <!-- 同一个渠道可能在多个分组下重复出现，所以状态读的是**草稿**：
                        在一节里填了，另一节也会立刻显示已填，不会让人以为那边还没填。 -->
@@ -1177,6 +1528,12 @@ defineExpose({ loadAll })
                   <span v-else>未维护</span>
                   <!-- 影响行数：用户据此决定先补哪一个。 -->
                   <span v-if="ch.rowCount" class="hint inline">（影响 {{ ch.rowCount }} 行）</span>
+                  <span
+                    v-for="h in blockedHints(ch)"
+                    :key="h.key"
+                    class="tag hint-tag"
+                    :class="h.kind"
+                  >{{ h.text }}</span>
                 </td>
               </tr>
             </tbody>
@@ -1317,6 +1674,8 @@ defineExpose({ loadAll })
           <td>
             <span v-if="t.checkCost" class="ok">开</span>
             <span v-else class="hint inline">关</span>
+            <!-- 勾了「执行时核对」的计划在这里做个标记，免得执行时突然弹窗让人意外。 -->
+            <span v-if="t.checkCost && t.reviewUpstream" class="tag">核对</span>
           </td>
           <td>{{ rangeLabel(t) }}</td>
           <td>{{ periodLabel(t) }}</td>
@@ -1425,6 +1784,116 @@ defineExpose({ loadAll })
       标「未跑」的计划还没有执行过，不计入账单数与金额——它们的金额列是空的，
       计进去会出现「有账单但金额为 0」这种对不上的行。
     </p>
+  </div>
+
+  <!-- 核对上游渠道倍率与国模标识。
+       计划勾了「执行时核对」时，执行会先停在这里；这是用户主动要求的人工确认，
+       所以是弹窗而不是结果区里的一行字——它得打断，才起得到「每次都过一眼」的作用。 -->
+  <div class="modal-mask" v-if="reviewOpen && runReview.length > 0" @click.self="closeReview">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>核对上游渠道倍率与国模标识</h3>
+        <button type="button" class="btn-close" @click="closeReview" title="关闭（不执行）">×</button>
+      </div>
+
+      <div class="modal-body">
+        <p class="hint">
+          下面是本次日志用到的渠道，按金额从大到小排。<strong>国模渠道的倍率按折扣理解</strong>
+          （0.4 = 4 折），<strong>其余渠道按「每美金刊例的成本」理解</strong>（0.4 ≈ 0.57 折）——
+          同一个数差 7 倍，标错一个成本就整个失真。「折合官方折扣」列会随你的修改实时变化。
+        </p>
+
+        <div v-for="sec in reviewSections" :key="'rv-' + sec.taskId" class="blocked-task">
+          <strong>{{ sec.taskName }}</strong>
+          <span class="hint inline">
+            <template v-if="sec.customerName">{{ sec.customerName }}　</template>
+            <template v-if="sec.period">账期 {{ sec.period }}　</template>
+            日志 {{ sec.totalRows }} 行，{{ sec.channels.length }} 个渠道
+          </span>
+          <!-- 补倍率解决不了的缺口（没渠道号、多渠道、缺 group_ratio）只说明、不拦：
+               它们在账单上会如实报出「N 行未计入成本」。 -->
+          <p class="hint" v-if="sec.notice">另有行算不出成本，与上面的倍率无关：{{ sec.notice }}</p>
+
+          <table>
+            <thead>
+              <tr>
+                <th>渠道 ID</th>
+                <th>渠道名称</th>
+                <th>分组</th>
+                <th>模型</th>
+                <th>请求数</th>
+                <th>日志额度折算(¥)</th>
+                <th>上游倍率</th>
+                <th>国模渠道</th>
+                <th>折合官方折扣</th>
+                <th>提示</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="ch in sec.channels"
+                :key="sec.taskId + '-' + ch.channelId"
+                :class="{ 'row-missing': reviewIsMissing(ch) }"
+              >
+                <td>{{ ch.channelId }}</td>
+                <td>
+                  {{ ch.name }}
+                  <span v-if="ch.known === false" class="tag warn">不在渠道清单里</span>
+                </td>
+                <td>{{ (ch.groups || []).join('、') || '—' }}</td>
+                <td>{{ modelsText(ch) }}</td>
+                <td>{{ ch.rows }}</td>
+                <td>{{ fmtMoney(ch.amountCny) }}</td>
+                <td>
+                  <input
+                    v-model="reviewRatioDraft[ch.channelId]"
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="未维护"
+                    class="ratio-input"
+                  />
+                </td>
+                <td class="center">
+                  <input v-model="reviewDomesticDraft[ch.channelId]" type="checkbox" />
+                </td>
+                <td>{{ reviewDiscountText(ch) }}</td>
+                <td class="left">
+                  <span
+                    v-for="h in reviewHints(ch)"
+                    :key="h.key"
+                    class="tag hint-tag"
+                    :class="h.kind"
+                  >{{ h.text }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <p class="error" v-if="reviewError">{{ reviewError }}</p>
+      <div class="modal-footer">
+        <span class="hint">
+          继续执行会<strong>重新导一次日志</strong>（只读查询，不影响业务库）。
+          <template v-if="reviewDirtyCount > 0">有 {{ reviewDirtyCount }} 个渠道的改动，会先保存。</template>
+          <template v-else>没有改动。</template>
+        </span>
+        <span>
+          <button type="button" class="btn-browse" @click="closeReview" :disabled="savingReview || running">
+            取消（本次不执行）
+          </button>
+          <button
+            type="button"
+            class="btn-primary"
+            @click="continueReview"
+            :disabled="savingReview || running || reviewMissingCount > 0"
+          >
+            {{ savingReview ? '保存中…' : running ? '执行中…' : reviewDirtyCount > 0 ? '保存修改并继续执行' : '确认无误，继续执行' }}
+          </button>
+        </span>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1553,6 +2022,79 @@ defineExpose({ loadAll })
   padding: 2px 6px;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+
+/* 核对窗口。样式与 App.vue 里的文件浏览弹窗同款，但 scoped 样式不跨组件，
+   所以在这里再写一份；宽度放大是因为核对表有十列。 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal-box {
+  background: #fff;
+  border-radius: 8px;
+  padding: 20px;
+  width: 1180px;
+  max-width: 96vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.modal-header h3 {
+  margin: 0;
+}
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  color: #666;
+}
+.modal-body {
+  overflow: auto;
+  min-height: 0;
+}
+.modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.modal-footer button {
+  margin-left: 8px;
+}
+
+/* 缺倍率的行高亮：必须填完才能继续，所以要一眼找得到。 */
+.row-missing {
+  background: #fff8e1;
+}
+td.left {
+  text-align: left;
+}
+td.center {
+  text-align: center;
+}
+/* 一致性提示是整句话，不能像普通标签那样被压成一个圆角胶囊。 */
+.tag.hint-tag {
+  display: block;
+  margin: 0 0 3px;
+  border-radius: 6px;
+  white-space: normal;
+  text-align: left;
 }
 .discount-input {
   width: 110px;

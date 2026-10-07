@@ -66,6 +66,13 @@ type TaskRunDeps struct {
 	// TaskID 要执行的**计划** ID。客户、时段、勾选全部来自这条计划，
 	// 不再由调用方拼参数——那样「先建好计划、之后批量执行」就失去意义了。
 	TaskID int64
+
+	// SkipUpstreamReview 跳过「核对上游倍率与国模标识」这一步（即便计划勾了 ReviewUpstream）。
+	//
+	// 用户在核对弹窗里点了「继续」之后的那次重跑必须置位，否则每次重跑又会停在同一个
+	// 弹窗上，永远出不了账。它是**一次性**的：只属于这次调用，不落到计划上——
+	// 下一次从列表里点执行，计划勾了核对就照样会再弹。
+	SkipUpstreamReview bool
 }
 
 // TaskRunResult 一次任务执行的结果。
@@ -93,6 +100,19 @@ type TaskRunResult struct {
 	Summary      Summary
 	LogPath      string // 导出的源日志
 	LogRowCount  int64
+}
+
+// needsUpstreamReview 这次执行要不要停在「核对上游倍率与国模标识」。
+//
+// 四个条件缺一不可，抽成函数是为了能单独测每一个：
+//   - 计划勾了 ReviewUpstream，且确实在做成本核算（没有成本就没有上游数据可核对）；
+//   - 本次没有 skip——这是防**无限弹窗**的那一道：用户在弹窗里点了继续，重跑时必须放行，
+//     漏了这个判断，每次重跑又停回同一个弹窗，永远出不了账；
+//   - 日志里观测到了渠道：一个渠道都识别不出时弹个空表只会让人困惑，
+//     那种日志的问题（取不到渠道号）账单备注里会如实报出。
+func needsUpstreamReview(task BillTask, skip bool, observedChannels int) bool {
+	return (task.CheckCost || task.GenerateCost) &&
+		task.ReviewUpstream && !skip && observedChannels > 0
 }
 
 // RunBillExportTask 执行一条计划。
@@ -168,6 +188,32 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		return h, r, nil
 	}
 
+	// 上游配置（倍率 + 国模标识 + 渠道清单）只读一次，预检、核对弹窗、出账三处共用。
+	//
+	// 不能各读各的：核对弹窗给用户看的、预检判断的、出账实际用的，必须是同一份数——
+	// 分几次读，中间被别处改一下，就会出现「弹窗里看着是新的、账单按旧的算」。
+	type upstreamConfig struct {
+		ratios   map[int]float64
+		domestic map[int]bool
+		channels []ChannelWithRatio
+	}
+	var upCfg *upstreamConfig
+	loadUpstream := func() (*upstreamConfig, error) {
+		if upCfg != nil {
+			return upCfg, nil
+		}
+		ratios, domestic, err := ChannelUpstreamConfig(deps.PG)
+		if err != nil {
+			return nil, err
+		}
+		channels, err := ListChannels(deps.PG)
+		if err != nil {
+			return nil, err
+		}
+		upCfg = &upstreamConfig{ratios: ratios, domestic: domestic, channels: channels}
+		return upCfg, nil
+	}
+
 	// ---- 3.5 成本核算预检：日志用到的渠道是否都维护了上游倍率 ----
 	//
 	// 放在这里（导出之后、出账之前）是唯一可选的时点：要判断缺哪些倍率，
@@ -183,19 +229,14 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			return nil, fmt.Errorf("读取已导出的日志失败: %w", rerr)
 		}
 
-		ratios, cerr := ChannelRatioMap(deps.PG)
+		cfg, cerr := loadUpstream()
 		if cerr != nil {
 			return nil, cerr
 		}
-		channelList, cerr := ListChannels(deps.PG)
-		if cerr != nil {
-			return nil, cerr
-		}
-		infoMap := make(map[int]ChannelInfo, len(channelList))
-		knownIDs := make(map[int]bool, len(channelList))
-		for _, c := range channelList {
+		ratios, domestic := cfg.ratios, cfg.domestic
+		infoMap := make(map[int]ChannelInfo, len(cfg.channels))
+		for _, c := range cfg.channels {
 			infoMap[c.ChannelID] = c.ChannelInfo
-			knownIDs[c.ChannelID] = true
 		}
 
 		// 按**行**判据统计（与出账侧同一个 RowCostReason），而不是按渠道。
@@ -226,6 +267,30 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 
 		check := ChannelCheckResult{}
 		fill(&check)
+
+		// 渠道观测事实（行数、金额、分组、模型）：核对弹窗与待补录面板都要，只扫一次。
+		var obs map[int]*ChannelObservation
+		observe := func() map[int]*ChannelObservation {
+			if obs == nil {
+				obs = ObserveChannels(headers, rows)
+			}
+			return obs
+		}
+
+		// ---- 3.55 核对上游倍率与国模标识（计划勾了 ReviewUpstream 时）----
+		//
+		// 放在「缺倍率就拦」**之前**：核对弹窗里已经包含了缺倍率的渠道（高亮、必须填），
+		// 用户在那里一次改完，就不会在核对之后又撞上第二道拦截。
+		//
+		// 日志里一个渠道都识别不出来时跳过：没有东西可核对，弹一个空表只会让人困惑，
+		// 那种日志的问题（取不到渠道号）账单备注里会如实报出。
+		if needsUpstreamReview(task, deps.SkipUpstreamReview, len(observe())) {
+			review := check
+			review.NeedsUpstreamReview = true
+			review.ReviewChannels = BuildChannelReview(observe(), ratios, domestic, infoMap)
+			return &TaskRunResult{TaskID: task.ID, Task: task, Customer: customer, ChannelCheck: &review}, nil
+		}
+
 		// 待补录渠道：**含渠道清单里查不到的**。倍率表以 channel_id 为主键，
 		// 与清单无关，所以清单没拉到的渠道照样能填——把它们排除在外，
 		// 就是那 392 行永远算不出成本、界面上还没地方可填的原因。
@@ -233,8 +298,10 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		// 只有当确实存在「有渠道号但没倍率」的行时才走这条路径（missingRatios 非空）。
 		if len(missingRatios) > 0 {
 			usage, _ := ExtractChannelUsage(headers, rows)
-			check = CheckChannelRatios(usage, ratios, infoMap, rowsPerChannel)
+			check = CheckChannelRatios(usage, ratios, domestic, infoMap, rowsPerChannel)
 			fill(&check)
+			// 补录面板里填倍率的同时要能判断「这是不是国模渠道」，所以带上模型信息。
+			EnrichIssues(check.Missing, observe())
 		}
 
 		// 拦下的判据：只要存在**没维护倍率的渠道**就拦。
@@ -326,27 +393,27 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	// 保持同一个条件。分开写迟早会漂移，表现是账单上的成本列全空而预检明明跑过了。
 	if (task.GenerateCost && !IsSimpleBillTemplate(task.BillTemplate)) ||
 		(task.CheckCost && IsSimpleBillTemplate(task.BillTemplate)) {
-		ratios, err := ChannelRatioMap(deps.PG)
+		// 与预检用的是同一次读出来的配置（见 loadUpstream），预检看到的与账单用的不会两样。
+		cfg, err := loadUpstream()
 		if err != nil {
 			return nil, err
 		}
-		params.ChannelUpstreamRatios = ratios
+		params.ChannelUpstreamRatios = cfg.ratios
+		// 国模标识与倍率成对：折扣 = f(倍率, 是否国模)。只传倍率不传标识，
+		// 国模渠道就会按海外口径多除一个 7，成本整体偏低 7 倍而毫无提示。
+		params.ChannelDomestic = cfg.domestic
 
-		channels, err := ListChannels(deps.PG)
-		if err != nil {
-			return nil, err
-		}
 		// 模板二只用这份清单来判断「这个缺倍率的渠道还有没有救」：
 		// 清单里有的可以补录，没有的（业务库已删）补不了，账单备注里要分开说。
-		params.ChannelKnownIDs = make(map[int]bool, len(channels))
-		for _, c := range channels {
+		params.ChannelKnownIDs = make(map[int]bool, len(cfg.channels))
+		for _, c := range cfg.channels {
 			params.ChannelKnownIDs[c.ChannelID] = true
 		}
 		// 渠道名与渠道信息只有模板一写成本利润表时才用得上。
 		if !IsSimpleBillTemplate(task.BillTemplate) {
-			params.ChannelNames = make(map[int]string, len(channels))
-			params.ChannelInfos = make(map[int]ChannelInfo, len(channels))
-			for _, c := range channels {
+			params.ChannelNames = make(map[int]string, len(cfg.channels))
+			params.ChannelInfos = make(map[int]ChannelInfo, len(cfg.channels))
+			for _, c := range cfg.channels {
 				params.ChannelNames[c.ChannelID] = c.Name
 				params.ChannelInfos[c.ChannelID] = c.ChannelInfo
 			}

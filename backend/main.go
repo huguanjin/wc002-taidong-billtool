@@ -813,6 +813,10 @@ type taskInput struct {
 	// 老版本前端编辑一次计划就会把用户勾上的线下折扣悄悄取消——
 	// 而折扣直接决定收客户多少钱。与 CheckCost 同一个理由。
 	UseManualDiscount *bool `json:"useManualDiscount"`
+	// ReviewUpstream 用指针：false 是有效值（明确不要每次弹核对窗），
+	// 「没传」与「传了 false」必须区分——老版本前端编辑一次计划不带这个字段，
+	// 用值类型的话会把用户勾上的核对开关悄悄取消。与 CheckCost 同一个理由。
+	ReviewUpstream *bool `json:"reviewUpstream"`
 	// BillTemplate 用指针：空串是**有效值**（= 标准模板），所以「没传这个字段」
 	// 与「传了空串」必须区分开。否则老版本前端编辑一次计划，就会把用户选的
 	// 简易模板重置成标准模板——而且不会有任何提示。
@@ -868,6 +872,10 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	if in.UseManualDiscount != nil {
 		task.UseManualDiscount = *in.UseManualDiscount
 	}
+	// 没传就默认不弹核对窗：它会打断每一次执行，不该在用户没表态时开启。
+	if in.ReviewUpstream != nil {
+		task.ReviewUpstream = *in.ReviewUpstream
+	}
 	if in.BillTemplate != nil {
 		task.BillTemplate = strings.TrimSpace(*in.BillTemplate)
 	}
@@ -920,7 +928,7 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 模板同理：没传就保留库里的值，别把用户选的简易模板悄悄重置成标准模板。
 	// 成本核算开关一起处理：没传时若走默认值 true，会把用户明确取消的勾选又打开。
-	if in.BillTemplate == nil || in.CheckCost == nil || in.UseManualDiscount == nil {
+	if in.BillTemplate == nil || in.CheckCost == nil || in.UseManualDiscount == nil || in.ReviewUpstream == nil {
 		if existing, err := billing.GetBillTask(*pgConfig, in.ID); err == nil {
 			if in.BillTemplate == nil {
 				task.BillTemplate = existing.BillTemplate
@@ -930,6 +938,9 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 			}
 			if in.UseManualDiscount == nil {
 				task.UseManualDiscount = existing.UseManualDiscount
+			}
+			if in.ReviewUpstream == nil {
+				task.ReviewUpstream = existing.ReviewUpstream
 			}
 		}
 	}
@@ -1047,6 +1058,10 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 
 	var in struct {
 		TaskIDs []int64 `json:"taskIds"`
+		// SkipUpstreamReview 本次请求里的任务都跳过「核对上游倍率与国模标识」。
+		// 前端只在用户已经在核对弹窗里点过「继续」之后的那次重跑里置位——
+		// 否则重跑会再次停在同一个弹窗上。它只对这一次请求有效，不落库。
+		SkipUpstreamReview bool `json:"skipUpstreamReview"`
 	}
 	if !decodeJSONBody(w, r, &in) {
 		return
@@ -1072,7 +1087,7 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 		}
 		one["taskName"] = task.DisplayName()
 
-		res, err := runOneBillTask(id)
+		res, err := runOneBillTask(id, in.SkipUpstreamReview)
 		if err != nil {
 			one["ok"] = false
 			one["error"] = err.Error()
@@ -1084,14 +1099,25 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 		// 成本核算预检拦下：没有产物，但**也不是失败**——用户补录倍率后重跑即可。
 		// 单独一个 ok=false + needsChannelRatios 的形态，前端据此渲染补录界面，
 		// 而不是混进「执行失败」里让用户以为任务坏了。
+		//
+		// 「核对上游倍率与国模标识」同理：是用户主动要求的人工确认，不是失败，
+		// 但与「缺倍率被拦」是两个不同的界面（前者弹窗列出全部渠道，后者只列缺的），
+		// 所以用独立的 needsUpstreamReview 标记，前端靠它分流。
 		if res.channelCheck != nil {
 			one["ok"] = false
-			one["needsChannelRatios"] = true
+			if res.channelCheck.NeedsUpstreamReview {
+				one["needsUpstreamReview"] = true
+			} else {
+				one["needsChannelRatios"] = true
+			}
 			one["channelCheck"] = res.channelCheck
 			// customerId 必须带上：就地补录线下折扣是按「客户 + 分组」存的，
 			// 页面没有客户 ID 就没法提交（见 saveBlockedDiscounts）。
 			one["customerId"] = res.task.CustomerID
 			one["customerName"] = res.task.CustomerName
+			// 弹窗里要说明是哪一条计划、哪个账期：同一批里可能有好几条同时停在核对上。
+			one["periodYear"] = res.task.PeriodYear
+			one["periodMonth"] = res.task.PeriodMonth
 			results = append(results, one)
 			// 不计入 failCount：这不是失败，是等待用户输入。
 			continue
@@ -1134,6 +1160,9 @@ func handleRunBillTasks(w http.ResponseWriter, r *http.Request) {
 		"results":   results,
 		"okCount":   okCount,
 		"failCount": failCount,
+		// 前端算「折合官方折扣」用：海外渠道 倍率÷这个数，国模渠道直接是倍率。
+		// 由后端给而不是页面里再写一个裸 7——换算基数改了，页面不会还停在旧值上。
+		"discountBaseFactor": billing.DiscountBaseFactor,
 	})
 }
 
@@ -1158,8 +1187,9 @@ type taskRunOutcome struct {
 
 // runOneBillTask 跑一条计划：出账 → 登记下载 → 落库。
 //
+// skipUpstreamReview 为真时跳过「核对上游倍率与国模标识」（见 TaskRunDeps.SkipUpstreamReview）。
 // 失败时清掉 job 目录并返回 error，**不落库**（上一次的结果保持原样）。
-func runOneBillTask(taskID int64) (*taskRunOutcome, error) {
+func runOneBillTask(taskID int64, skipUpstreamReview bool) (*taskRunOutcome, error) {
 	jobID := newJobID()
 	jobPath := filepath.Join(jobDir, jobID)
 	if err := os.MkdirAll(jobPath, 0o755); err != nil {
@@ -1167,14 +1197,15 @@ func runOneBillTask(taskID int64) (*taskRunOutcome, error) {
 	}
 
 	result, err := billing.RunBillExportTask(billing.TaskRunDeps{
-		DB:               *dbConfig,
-		PG:               *pgConfig,
-		DataDir:          dataDir,
-		JobDir:           jobPath,
-		TemplatePath:     filepath.Join(dataDir, "bill_template.xlsx"),
-		PriceTablePath:   filepath.Join(dataDir, "price_table.xlsx"),
-		DBPriceCachePath: dbPriceCachePath(),
-		TaskID:           taskID,
+		DB:                 *dbConfig,
+		PG:                 *pgConfig,
+		DataDir:            dataDir,
+		JobDir:             jobPath,
+		TemplatePath:       filepath.Join(dataDir, "bill_template.xlsx"),
+		PriceTablePath:     filepath.Join(dataDir, "price_table.xlsx"),
+		DBPriceCachePath:   dbPriceCachePath(),
+		TaskID:             taskID,
+		SkipUpstreamReview: skipUpstreamReview,
 	})
 	if err != nil {
 		_ = os.RemoveAll(jobPath)
@@ -1360,6 +1391,8 @@ func handleChannels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"channels":     channels,
 		"missingCount": missing,
+		// 页面算「折合官方折扣」用，见 handleRunBillTasks 里同名字段的说明。
+		"discountBaseFactor": billing.DiscountBaseFactor,
 	})
 }
 
@@ -1463,7 +1496,7 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 
 	groupChannels := billing.GroupChannelMap(usage)
 
-	ratios, err := billing.ChannelRatioMap(*pgConfig)
+	ratios, domestic, err := billing.ChannelUpstreamConfig(*pgConfig)
 	if err != nil {
 		httpError(w, http.StatusBadGateway, err.Error())
 		return
@@ -1473,10 +1506,8 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	nameMap := make(map[int]string, len(channelList))
 	infoMap := make(map[int]billing.ChannelInfo, len(channelList))
 	for _, c := range channelList {
-		nameMap[c.ChannelID] = c.Name
 		infoMap[c.ChannelID] = c.ChannelInfo
 	}
 	// 日志里出现、但本地渠道清单里没有的渠道号，也要能就地补录，
@@ -1492,10 +1523,6 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 	// 从前这里只遍历「有渠道号的行」（ExtractChannelUsage 会把没有渠道号的行跳过），
 	// 于是这些行对检查完全隐形：页面显示「都维护好了」，出账时却报
 	// 「392 行缺少渠道倍率或分组倍率」。用户按页面提示补完再来查还是这句话。
-	knownIDs := make(map[int]bool, len(channelList))
-	for _, c := range channelList {
-		knownIDs[c.ChannelID] = true
-	}
 	rowCounts, missingRatios, rowsPerChannel := billing.CountRowCostReasons(headers, rows, ratios)
 	if rowCounts[billing.SkipNoUpstreamRatio] > 0 {
 		// 缺倍率的渠道要能在页面上就地补，所以补进 infoMap 供填写。
@@ -1506,10 +1533,14 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 渠道观测事实（行数、金额、分组、模型）：页面据此提示「这个渠道看起来是国模渠道」。
+	obs := billing.ObserveChannels(headers, rows)
+
 	// 待补录清单直接用 CheckChannelRatios：它从**倍率表**推，
 	// 因而包含渠道清单里查不到的那些（它们照样能填倍率），
 	// 而 CheckUpstreamRatios 会把它们当成「补不了」排除掉。
-	check := billing.CheckChannelRatios(usage, ratios, infoMap, rowsPerChannel)
+	check := billing.CheckChannelRatios(usage, ratios, domestic, infoMap, rowsPerChannel)
+	billing.EnrichIssues(check.Missing, obs)
 	// 兼容旧字段：missingChannels 从前是 []ChannelInfo，前端与既有测试都按那个形状读。
 	// 新的 missingIssues 带 groups / known / rowCount，页面按分组分节展示用它。
 	missingInfos := make([]billing.ChannelInfo, 0, len(check.Missing))
@@ -1533,7 +1564,7 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 	used := make([]billing.ChannelWithRatio, 0, len(channelIDs))
 	for _, id := range channelIDs {
 		info := infoMap[id]
-		cw := billing.ChannelWithRatio{ChannelInfo: info}
+		cw := billing.ChannelWithRatio{ChannelInfo: info, IsDomestic: domestic[id]}
 		if v, ok := ratios[id]; ok {
 			ratio := v
 			cw.UpstreamRatio = &ratio
@@ -1551,6 +1582,11 @@ func handleCheckChannels(w http.ResponseWriter, r *http.Request) {
 		"missingIssues":     check.Missing,
 		"unknownChannelIds": check.UnknownChannelIDs,
 		"channelTableEmpty": len(channelList) == 0,
+		// 日志里用到的全部渠道 + 观测事实（模型、金额、国模提示依据），按金额降序。
+		// 页面里要让人判断「这是不是国模渠道」，光有渠道号与名称不够。
+		"reviewChannels": billing.BuildChannelReview(obs, ratios, domestic, infoMap),
+		// 页面算「折合官方折扣」用，见 handleRunBillTasks 里同名字段的说明。
+		"discountBaseFactor": billing.DiscountBaseFactor,
 		// 按分组归类的渠道（页面分节展示用，见上面的 groupChannels）。
 		"groupChannels": groupChannels,
 		// group_ratio 缺失的行数：这些行的官方刊例反推不出来，成本列会留空。
@@ -1733,7 +1769,7 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 			httpError(w, http.StatusBadRequest, "生成成本利润表需要先配置 PostgreSQL（BILL_PG_*）并拉取渠道清单")
 			return
 		}
-		ratios, err := billing.ChannelRatioMap(*pgConfig)
+		ratios, domestic, err := billing.ChannelUpstreamConfig(*pgConfig)
 		if err != nil {
 			httpError(w, http.StatusBadGateway, err.Error())
 			return
@@ -1744,6 +1780,8 @@ func handleGenerateBill(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		params.ChannelUpstreamRatios = ratios
+		// 国模标识与倍率成对使用（折扣 = f(倍率, 是否国模)），漏传会让国模渠道成本偏低 7 倍。
+		params.ChannelDomestic = domestic
 		params.ChannelNames = make(map[int]string, len(channels))
 		params.ChannelInfos = make(map[int]billing.ChannelInfo, len(channels))
 		for _, c := range channels {

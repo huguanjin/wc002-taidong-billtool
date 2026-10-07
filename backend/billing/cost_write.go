@@ -42,7 +42,14 @@ func WriteCostFromTemplate(templatePath, outputPath string, rows []*CostRow, yea
 				if rowIdx >= len(rows) {
 					return nil, ""
 				}
-				return rows[rowIdx].ChannelName, ""
+				// 国模渠道在名称后挂个标记（只在展示层加，ChannelName 本身保持原名）：
+				// 「上游折扣」一列国模渠道是 0.4、海外渠道是 0.057，不标出来的话
+				// 读表的人会以为是哪一行填错了倍率。
+				name := rows[rowIdx].ChannelName
+				if rows[rowIdx].UpstreamDomestic {
+					name += "（国模渠道）"
+				}
+				return name, ""
 			},
 		},
 		{

@@ -215,9 +215,10 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 	// 成本列只在开了成本核算时才填（见 Params.CheckCost）。关掉时列还在、值为空——
 	// 列集合固定，否则同一份产物在两种开关下结构不同，下游脚本会莫名对不上。
 	opts := SimpleBillOptions{
-		UpstreamRatios: params.ChannelUpstreamRatios,
-		KnownChannels:  params.ChannelKnownIDs,
-		CostColumns:    params.CheckCost,
+		UpstreamRatios:   params.ChannelUpstreamRatios,
+		DomesticChannels: params.ChannelDomestic,
+		KnownChannels:    params.ChannelKnownIDs,
+		CostColumns:      params.CheckCost,
 		// 汇率与模板一同一来源：两边的成本都经这一步换算，用不同的汇率会得出两个成本数。
 		ExchangeRate: params.ExchangeRate,
 	}
@@ -470,7 +471,7 @@ func generateCostTable(inputPath, templatePath, billPath string, rows [][]string
 	// 它们的成本列留空且不计入合计，与页面提示、DEPLOY.md 的说法一致。
 
 	costRows, err := AggregateCostByChannel(rows, headers, book, exchangeRate, preferPriceTable,
-		nil, params.ChannelUpstreamRatios, params.ChannelNames)
+		nil, params.ChannelUpstreamRatios, params.ChannelDomestic, params.ChannelNames)
 	if err != nil {
 		return "", nil, "", false, nil, nil, fmt.Errorf("成本聚合失败: %w", err)
 	}

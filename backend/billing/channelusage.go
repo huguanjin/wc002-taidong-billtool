@@ -388,10 +388,31 @@ type ChannelIssue struct {
 	Known bool `json:"known"`
 	// RowCount 该渠道在本次日志里未计入成本的行数，供页面按工作量排序/提示。
 	RowCount int `json:"rowCount"`
+
+	// ---- 国模标识相关：填倍率的同时要能顺手标国模，所以待补录清单也带上这几项 ----
+
+	// IsDomestic 该渠道当前是否已标为国模渠道。倍率还没填、但先标过国模的渠道也会是 true。
+	IsDomestic bool `json:"isDomestic"`
+	// Models 该渠道在本次日志里跑过的模型，按行数降序。用户靠它判断这是不是国模渠道。
+	Models []string `json:"models,omitempty"`
+	// AllDomesticModels / AnyDomesticModels 这些模型里按模型名能识别为国产厂商的情况，
+	// 页面据此提示「看起来该标国模」。只是提示，从不自动勾选——标识直接决定成本差 7 倍，
+	// 该由人来拍板。
+	AllDomesticModels bool `json:"allDomesticModels"`
+	AnyDomesticModels bool `json:"anyDomesticModels"`
 }
 
 // ChannelCheckResult 一次「上游倍率维护情况」检查的结果。
 type ChannelCheckResult struct {
+	// NeedsUpstreamReview 为真表示本次执行停在「核对上游倍率与国模标识」这一步
+	// （计划勾了 ReviewUpstream），此时 ReviewChannels 是核对清单。
+	//
+	// 与 Missing 非空的「被拦下」是两回事：核对是用户主动要求的人工确认，
+	// 哪怕所有渠道都维护好了也会停；被拦下是因为缺倍率、不补就算不了成本。
+	NeedsUpstreamReview bool `json:"needsUpstreamReview,omitempty"`
+	// ReviewChannels 核对清单：本次日志用到的**全部**渠道（含已维护的），
+	// 按日志额度折算的金额降序——先看对成本影响最大的。
+	ReviewChannels []ChannelReviewItem `json:"reviewChannels,omitempty"`
 	// UsedChannels 本次日志用到的全部渠道（含已维护的），供页面展示完整清单。
 	UsedChannels []UsedChannel `json:"usedChannels"`
 	// Maintained 已维护倍率的渠道。
@@ -434,15 +455,249 @@ type UsedChannel struct {
 	ChannelGroup  string   `json:"channelGroup"`
 	Groups        []string `json:"groups"`
 	UpstreamRatio *float64 `json:"upstreamRatio"` // nil = 未维护
+	// IsDomestic 是否国模渠道（见 UpstreamDiscountFor）。
+	IsDomestic bool `json:"isDomestic"`
 	// Known 该渠道号在本地渠道清单里是否存在。不存在时无法补录（业务库已删）。
 	Known bool `json:"known"`
 }
 
+// ChannelObservation 一个渠道在本次日志里**被观测到的事实**，与「配置了什么」无关。
+//
+// 核对上游倍率时人要判断的是「这个渠道到底在跑什么」：光看渠道号与名称，
+// 分不清它承接的是国产模型还是海外模型——而这两类的成本折扣差 7 倍。
+// 所以把日志里能观测到的（行数、金额、分组、模型）一并给出来，让判断有依据。
+type ChannelObservation struct {
+	ChannelID int
+	// Rows / QuotaNet 只统计「这一行只经过这一个渠道」的消费行与净额度。
+	// 一行经多个渠道时额度怎么分摊日志没说（见 SkipMultiChannel），归给谁都是猜，所以不归。
+	// 退款/补扣行不计入 Rows（它不是一次请求），但计入 QuotaNet（与账单的净额口径一致）。
+	Rows     int
+	QuotaNet float64
+	// Groups / Models 该渠道出现过的分组与模型。这两项含多渠道行：
+	// 「出现过」不需要分摊，只要这一行经过了它。Models 按行数降序，同数按名称升序。
+	Groups []string
+	Models []string
+	// AllDomesticModels / AnyDomesticModels：Models 里按模型名能识别为国产厂商的情况，
+	// 判据与账单里换算币种用的是同一个（VendorFamily），不另起一套。
+	// Models 为空时两者都是 false。
+	AllDomesticModels bool
+	AnyDomesticModels bool
+}
+
+// ObserveChannels 扫一遍日志，得出每个渠道的观测事实。只读日志，不涉及任何配置。
+//
+// 渠道号的取法与出账、预检共用 rowChannelIDs（channel_id 列优先，回退 other.use_channel），
+// 额度的符号口径与 CountRowCostReasons / AggregateSimpleBill 完全一致——
+// 核对界面上看到的金额必须与之后出的账同一把尺子，否则「核对时看着对、出账又不对」。
+func ObserveChannels(headers []string, rows [][]string) map[int]*ChannelObservation {
+	col := map[string]int{}
+	for i, h := range headers {
+		if h != "" {
+			col[h] = i
+		}
+	}
+	idxChannel, hasChannelCol := col["channel_id"]
+	idxOther, hasOtherCol := col["other"]
+	idxQuota, hasQuota := col["quota"]
+	idxType, hasType := col["type"]
+	idxGroup, hasGroup := col["group"]
+	idxModel, hasModel := col["model_name"]
+
+	type acc struct {
+		obs        *ChannelObservation
+		groups     map[string]bool
+		modelsRows map[string]int
+	}
+	byID := map[int]*acc{}
+	get := func(id int) *acc {
+		a, ok := byID[id]
+		if !ok {
+			a = &acc{
+				obs:        &ChannelObservation{ChannelID: id},
+				groups:     map[string]bool{},
+				modelsRows: map[string]int{},
+			}
+			byID[id] = a
+		}
+		return a
+	}
+
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		ids := rowChannelIDs(row, idxChannel, hasChannelCol, idxOther, hasOtherCol)
+		if len(ids) == 0 {
+			continue
+		}
+
+		other := ""
+		if hasOtherCol {
+			other = cellAt(row, idxOther)
+		}
+		delta := 0.0
+		if hasQuota {
+			delta = ToFloat(cellAt(row, idxQuota))
+		}
+		isAdjustment := IsTaskQuotaAdjustment(other)
+		if isAdjustment {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			d, ok := QuotaAdjustmentDelta(logType, delta)
+			if !ok {
+				continue
+			}
+			delta = -d
+		}
+
+		group, model := "", ""
+		if hasGroup {
+			group = strings.TrimSpace(cellAt(row, idxGroup))
+		}
+		if hasModel {
+			model = strings.TrimSpace(cellAt(row, idxModel))
+		}
+
+		for _, id := range ids {
+			if id <= 0 {
+				continue
+			}
+			a := get(id)
+			if group != "" {
+				a.groups[group] = true
+			}
+			// 模型按「消费行」计数：退款行带的模型名不代表这个渠道又服务了一次请求。
+			if model != "" && !isAdjustment {
+				a.modelsRows[model]++
+			}
+		}
+
+		// 额度与行数只在「单渠道行」上归属，原因见 ChannelObservation。
+		if len(ids) == 1 && ids[0] > 0 {
+			a := get(ids[0])
+			a.obs.QuotaNet += delta
+			if !isAdjustment {
+				a.obs.Rows++
+			}
+		}
+	}
+
+	out := make(map[int]*ChannelObservation, len(byID))
+	for id, a := range byID {
+		o := a.obs
+		for g := range a.groups {
+			o.Groups = append(o.Groups, g)
+		}
+		sort.Strings(o.Groups)
+
+		for m := range a.modelsRows {
+			o.Models = append(o.Models, m)
+		}
+		sort.Slice(o.Models, func(i, j int) bool {
+			ri, rj := a.modelsRows[o.Models[i]], a.modelsRows[o.Models[j]]
+			if ri != rj {
+				return ri > rj
+			}
+			return o.Models[i] < o.Models[j]
+		})
+
+		if len(o.Models) > 0 {
+			o.AllDomesticModels = true
+			for _, m := range o.Models {
+				if VendorFamily(m) != "" {
+					o.AnyDomesticModels = true
+				} else {
+					o.AllDomesticModels = false
+				}
+			}
+		}
+		out[id] = o
+	}
+	return out
+}
+
+// ChannelReviewItem 核对弹窗里的一行：一个渠道的当前配置 + 它在本次日志里的观测事实。
+type ChannelReviewItem struct {
+	ChannelID int    `json:"channelId"`
+	Name      string `json:"name"`
+	Known     bool   `json:"known"`
+
+	// UpstreamRatio / IsDomestic 是**当前存着的配置**，弹窗里让用户确认或修改。
+	// UpstreamRatio 为 nil 表示还没维护。
+	UpstreamRatio *float64 `json:"upstreamRatio"`
+	IsDomestic    bool     `json:"isDomestic"`
+
+	// 以下是本次日志里的观测事实，只读展示。
+	Groups []string `json:"groups"`
+	Models []string `json:"models"`
+	Rows   int      `json:"rows"`
+	// AmountCNY 该渠道在本次日志里的金额（净额度 ÷ QuotaPerCNY）。
+	// 是**日志额度折算**，不是账单上的结算额（模板一的结算额是刊例 × 折扣），
+	// 这里只用来让用户判断「这个渠道值不值得认真核对」。
+	AmountCNY         float64 `json:"amountCny"`
+	AllDomesticModels bool    `json:"allDomesticModels"`
+	AnyDomesticModels bool    `json:"anyDomesticModels"`
+}
+
+// BuildChannelReview 把观测事实与当前配置拼成核对清单，按金额降序（同额按渠道号升序）。
+//
+// 按金额排序是因为人的注意力有限：一个月 3 元的渠道标错了无关痛痒，
+// 占了九成金额的渠道标错了成本就整个失真，后者必须排在最前面。
+func BuildChannelReview(obs map[int]*ChannelObservation, ratios map[int]float64,
+	domestic map[int]bool, channels map[int]ChannelInfo) []ChannelReviewItem {
+
+	out := make([]ChannelReviewItem, 0, len(obs))
+	for id, o := range obs {
+		info, known := channels[id]
+		name := info.Name
+		if !known {
+			name = fmt.Sprintf("渠道 %d（不在渠道清单里）", id)
+		}
+		item := ChannelReviewItem{
+			ChannelID: id, Name: name, Known: known,
+			IsDomestic: domestic[id],
+			Groups:     o.Groups, Models: o.Models, Rows: o.Rows,
+			AmountCNY:         round(o.QuotaNet/QuotaPerCNY, MoneyDecimals),
+			AllDomesticModels: o.AllDomesticModels,
+			AnyDomesticModels: o.AnyDomesticModels,
+		}
+		if v, ok := ratios[id]; ok {
+			r := v
+			item.UpstreamRatio = &r
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].AmountCNY != out[j].AmountCNY {
+			return out[i].AmountCNY > out[j].AmountCNY
+		}
+		return out[i].ChannelID < out[j].ChannelID
+	})
+	return out
+}
+
+// EnrichIssues 把本次日志里观测到的模型信息补到待补录清单上（国模标识本身已由
+// CheckChannelRatios 带上）。
+//
+// 单独成函数而不是让 CheckChannelRatios 自己去扫日志：后者只吃 ChannelUsage，
+// 而模型信息只在任务页的补录面板里用得上，就地补一遍比把每个调用方都拖去多扫一遍更稳。
+func EnrichIssues(issues []ChannelIssue, obs map[int]*ChannelObservation) {
+	for i := range issues {
+		if o, ok := obs[issues[i].ChannelID]; ok {
+			issues[i].Models = o.Models
+			issues[i].AllDomesticModels = o.AllDomesticModels
+			issues[i].AnyDomesticModels = o.AnyDomesticModels
+		}
+	}
+}
+
 // CheckChannelRatios 检查这批渠道的倍率维护情况。
 //
-// ratios 只含已维护的渠道（见 ChannelRatioMap）；channels 是本地渠道清单。
-// 判定复用 CheckUpstreamRatios，这里只负责把结果映射成带分组的展示结构。
-func CheckChannelRatios(usage map[int]*ChannelUsage, ratios map[int]float64,
+// ratios 只含已维护的渠道（见 ChannelUpstreamConfig）；domestic 是国模标识（只含标了的，可为 nil）；
+// channels 是本地渠道清单。判定复用 CheckUpstreamRatios，这里只负责把结果映射成带分组的展示结构。
+func CheckChannelRatios(usage map[int]*ChannelUsage, ratios map[int]float64, domestic map[int]bool,
 	channels map[int]ChannelInfo, rowCounts map[int]int) ChannelCheckResult {
 
 	ids := make([]int, 0, len(usage))
@@ -478,11 +733,13 @@ func CheckChannelRatios(usage map[int]*ChannelUsage, ratios map[int]float64,
 		result.UsedChannels = append(result.UsedChannels, UsedChannel{
 			ChannelID: id, Name: name, ChannelGroup: info.ChannelGroup,
 			Groups: u.Groups, UpstreamRatio: ratio, Known: known,
+			IsDomestic: domestic[id],
 		})
 		if ratio == nil {
 			result.Missing = append(result.Missing, ChannelIssue{
 				ChannelID: id, Name: name, ChannelGroup: info.ChannelGroup,
 				Groups: u.Groups, Known: known, RowCount: rowCounts[id],
+				IsDomestic: domestic[id],
 			})
 		}
 	}

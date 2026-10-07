@@ -19,6 +19,15 @@ const channelsMessage = ref('')
 // ratioDraft 渠道ID → 输入框里的倍率文本（空串表示未维护）。
 const ratioDraft = ref({})
 const ratioNotes = ref({})
+// domesticDraft 渠道ID → 是否国模渠道的勾选草稿。
+//
+// 国模渠道承接的是站上按人民币报价的国产模型（站点充值 1 元 = 1 美金，1 倍率分组即原价），
+// 它的上游倍率按「折扣」理解：0.4 就是 4 折。其余渠道按「每美金刊例的成本」理解：
+// 折扣 = 倍率 ÷ 7，0.4 只是 0.57 折。同一个数差 7 倍，所以必须有这个标识。
+const domesticDraft = ref({})
+// 「折合官方折扣」的换算基数，由后端随清单带回（见 loadChannels），页面里不另写一个裸 7。
+// 7 只是响应缺字段时的兜底。
+const discountBaseFactor = ref(7)
 
 // missingChannelCount / maintainedCount 读的是**服务端**的维护状态（c.upstreamRatio），
 // 不是输入框里的草稿——否则一敲键盘「已维护」就涨上去，用户会以为已经存好了。
@@ -50,19 +59,40 @@ function isDirty(c) {
     const n = Number(t)
     return Number.isFinite(n) ? String(n) : t
   }
-  return normalize(raw) !== normalize(before) || (ratioNotes.value[c.channelId] || '') !== (c.note || '')
+  return (
+    normalize(raw) !== normalize(before) ||
+    (ratioNotes.value[c.channelId] || '') !== (c.note || '') ||
+    // 国模标识也算改动：只改这个勾、不动倍率，同样要能保存。
+    !!domesticDraft.value[c.channelId] !== !!c.isDomestic
+  )
 }
 
 function syncChannelDraft(list) {
   const rd = {}
   const rn = {}
+  const dd = {}
   for (const c of list) {
     rd[c.channelId] =
       c.upstreamRatio === null || c.upstreamRatio === undefined ? '' : String(c.upstreamRatio)
     rn[c.channelId] = c.note || ''
+    dd[c.channelId] = !!c.isDomestic
   }
   ratioDraft.value = rd
   ratioNotes.value = rn
+  domesticDraft.value = dd
+}
+
+// discountText 把当前草稿里的倍率折合成「官方人民币刊例的几折」，随输入实时变化。
+// 这一列存在的理由就是让那 7 倍的差别肉眼可见：同样填 0.4，国模渠道是 4 折，海外渠道是 0.57 折。
+// 在渲染期被调用，不能抛异常——取值一律 String() 归一并带兜底。
+function discountText(c) {
+  const raw = String(ratioDraft.value[c.channelId] ?? '').trim()
+  if (raw === '') return '—'
+  const num = Number(raw)
+  if (!Number.isFinite(num)) return '—'
+  const base = discountBaseFactor.value > 0 ? discountBaseFactor.value : 7
+  const discount = domesticDraft.value[c.channelId] ? num : num / base
+  return `${Math.round(discount * 1000) / 100} 折`
 }
 
 async function loadChannels() {
@@ -77,6 +107,7 @@ async function loadChannels() {
       return
     }
     channels.value = data.channels || []
+    if (Number(data.discountBaseFactor) > 0) discountBaseFactor.value = Number(data.discountBaseFactor)
     channelsLoaded.value = true
     syncChannelDraft(channels.value)
   } catch (err) {
@@ -123,9 +154,12 @@ async function saveChannelRatios() {
     // 用 isDirty 统一判据，免得这里的比较与按钮上的计数漂移。
     if (!isDirty(c)) continue
 
+    // 国模标识每条都带上（显式 true / false）：后端把没传的当作「保持原值」，
+    // 而这里的草稿初值就取自库里，带上不会改到没碰过的渠道。
+    const isDomestic = !!domesticDraft.value[c.channelId]
     if (raw === '') {
       // 清空表示「取消维护」，发 null。
-      items.push({ channelId: c.channelId, upstreamRatio: null, note: noteNow })
+      items.push({ channelId: c.channelId, upstreamRatio: null, note: noteNow, isDomestic })
       continue
     }
     const num = Number(raw)
@@ -133,7 +167,7 @@ async function saveChannelRatios() {
       channelsError.value = `渠道 ${c.channelId} 的倍率必须是非负数字`
       return
     }
-    items.push({ channelId: c.channelId, upstreamRatio: num, note: noteNow })
+    items.push({ channelId: c.channelId, upstreamRatio: num, note: noteNow, isDomestic })
   }
 
   if (items.length === 0) {
@@ -174,9 +208,18 @@ defineExpose({ loadChannels })
   <div class="card">
     <h2>渠道成本倍率维护</h2>
     <p class="hint">
-      拉取业务库 channels 表的渠道清单，为每个渠道填一个上游分组倍率。
-      成本利润表按「官方刊例 × (上游倍率 ÷ 7)」估算上游成本，与站内折扣同一套换算基准。
-      只读业务库，倍率只存在本地 PostgreSQL，不会回写。
+      拉取业务库 channels 表的渠道清单，为每个渠道填一个上游倍率，并标明它是不是<strong>国模渠道</strong>。
+      成本利润表按「官方刊例 × 上游折扣」估算上游成本，折扣怎么从倍率换算取决于这个标识：
+    </p>
+    <ul class="hint">
+      <li><strong>国模渠道</strong>（承接站上按人民币报价的国产模型）：倍率就是折扣，<strong>0.4 = 4 折</strong>。
+        站点充值 1 元 = 1 美金，国产模型 1 倍率分组即原价。</li>
+      <li><strong>其余渠道</strong>：倍率是「每美金刊例的成本」，折扣 = 倍率 ÷ {{ discountBaseFactor }}，
+        同样的 0.4 只是 <strong>0.57 折</strong>。</li>
+    </ul>
+    <p class="hint">
+      同一个数差 {{ discountBaseFactor }} 倍，标错一个渠道成本就整个失真——「折合官方折扣」列会随你的修改实时变化，
+      保存前请对一眼。只读业务库，倍率与标识只存在本地 PostgreSQL，不会回写。
     </p>
     <p class="hint">
       未维护倍率的渠道不会被估算——成本列留空并排除在合计之外，而不是按 0 算
@@ -219,6 +262,8 @@ defineExpose({ loadChannels })
           <th>类型</th>
           <th>状态</th>
           <th>上游倍率</th>
+          <th>国模渠道</th>
+          <th>折合官方折扣</th>
           <th>备注</th>
         </tr>
       </thead>
@@ -242,6 +287,10 @@ defineExpose({ loadChannels })
               class="ratio-input"
             />
           </td>
+          <td class="center">
+            <input v-model="domesticDraft[c.channelId]" type="checkbox" title="国模渠道：倍率按折扣理解（0.4 = 4 折）" />
+          </td>
+          <td>{{ discountText(c) }}</td>
           <td><input v-model="ratioNotes[c.channelId]" type="text" placeholder="可选" /></td>
         </tr>
       </tbody>
@@ -343,5 +392,15 @@ input {
 
 .ratio-input {
   width: 100px;
+}
+
+td.center {
+  text-align: center;
+}
+
+/* 说明里的两条口径是并列的要点，不要被全局的 .hint 压成一行。 */
+ul.hint {
+  margin: 4px 0;
+  padding-left: 20px;
 }
 </style>

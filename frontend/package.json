@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "npm run check:templates && vite",
-    "build": "npm run check:templates && vite build",
+    "build": "npm run check:templates && npm run check:render && vite build",
     "preview": "vite preview",
-    "check:templates": "node scripts/check-vue-templates.mjs && node scripts/check-billtasks-table.mjs"
+    "check:templates": "node scripts/check-vue-templates.mjs && node scripts/check-billtasks-table.mjs",
+    "check:render": "node scripts/smoke-render.mjs"
   },
   "dependencies": {
     "vue": "^3.5.13"

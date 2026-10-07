@@ -19,22 +19,44 @@ type CostRow struct {
 	// UpstreamRatio 为 nil 表示该渠道未维护倍率：成本列留空且不参与合计，
 	// 并在备注里写明。静默按 0 算会让成本虚低、按 1 算会虚高，两者都会误导毛利判断。
 	UpstreamRatio *float64
+	// UpstreamDomestic 该渠道是否标为「国模渠道」，决定上游折扣怎么从倍率换算（见 UpstreamDiscountFor）。
+	UpstreamDomestic bool
 }
 
-// UpstreamDiscount 上游折扣 = 上游倍率 / DiscountBaseFactor。
-// 与站内折扣同一套基准（见 group_ratio_source.md），只是把「分组倍率」换成「上游倍率」。
+// UpstreamDiscountFor 把上游倍率换算成相对**官方人民币刊例**的折扣。
+//
+//   - 默认（海外模型渠道）：折扣 = 倍率 / DiscountBaseFactor。
+//     站点充值 1 元 = 1 美金，所以倍率 1 只相当于官方人民币价的 1/7；
+//     与站内折扣同一套基准（见 group_ratio_source.md），只是把「分组倍率」换成「上游倍率」。
+//   - 国模渠道：折扣 = 倍率本身。国产模型在站上本来就按人民币报价
+//     （「1 元 = 1 美金」充值下 1 倍率分组 ≈ 原价），倍率 0.4 就是 4 折，
+//     再除以 7 会把成本压到 0.057 折——这正是需要这个标识的原因。
+//
+// 单独成函数是因为模板一（CostRow）与模板二（AggregateSimpleBill）两条路径都要用：
+// 各写一份换算的话，同一个渠道在两张表里会算出两个折扣。
+func UpstreamDiscountFor(ratio float64, domestic bool) float64 {
+	if domestic {
+		return ratio
+	}
+	return ratio / DiscountBaseFactor
+}
+
+// UpstreamDiscount 上游折扣，换算规则见 UpstreamDiscountFor。
 func (c *CostRow) UpstreamDiscount() (float64, bool) {
 	if c.UpstreamRatio == nil {
 		return 0, false
 	}
-	return *c.UpstreamRatio / DiscountBaseFactor, true
+	return UpstreamDiscountFor(*c.UpstreamRatio, c.UpstreamDomestic), true
 }
 
 // UpstreamCostCNY 上游成本（人民币）。
 //
 // 与站内结算对称：成本 = 官方刊例（人民币） × 上游折扣
 //
-//	= OfficialUSD × exchangeRate × (UpstreamRatio / DiscountBaseFactor)
+//	= OfficialUSD × exchangeRate × UpstreamDiscount
+//
+// 国产模型的 OfficialUSD 本身就是「人民币刊例 ÷ 汇率」（见 priceRow 里 VendorFamily 的归一），
+// 所以两类渠道套同一个式子，差别只在折扣怎么换算。
 //
 // 倍率缺失时返回 (0, false)——调用方必须把这种情况与「成本真的是 0」区分开。
 func (c *CostRow) UpstreamCostCNY(exchangeRate float64) (float64, bool) {
@@ -45,6 +67,26 @@ func (c *CostRow) UpstreamCostCNY(exchangeRate float64) (float64, bool) {
 	return OfficialListCNY(c.AggRow, exchangeRate) * d, true
 }
 
+// newCostRow 建一行成本利润，并把该渠道的倍率、国模标识与展示名一次带上。
+//
+// 抽成函数是因为 AggregateCostByChannel 里有两处要建行（正常消费行、退款行）：
+// 各写一份的话，国模标识很容易只在其中一处带上——退款行的折扣就会按海外口径算，
+// 同一个渠道的消费与退款冲抵出两个折扣，而账面上完全看不出来。
+func newCostRow(agg *AggRow, channelID int, quotas map[int]float64,
+	domestic map[int]bool, channelNames map[int]string) *CostRow {
+
+	cr := &CostRow{AggRow: agg, ChannelID: channelID, UpstreamDomestic: domestic[channelID]}
+	if v, ok := quotas[channelID]; ok {
+		ratio := v
+		cr.UpstreamRatio = &ratio
+	}
+	cr.ChannelName = channelNames[channelID]
+	if cr.ChannelName == "" {
+		cr.ChannelName = fmt.Sprintf("渠道 %d", channelID)
+	}
+	return cr
+}
+
 // AggregateCostByChannel 按 (模型, 分组, 倍率桶, 渠道) 聚合，供成本利润表使用。
 //
 // 刻意与 AggregateFromRows 分开：主账单的桶键不含渠道，把 channelId 加进去
@@ -52,9 +94,10 @@ func (c *CostRow) UpstreamCostCNY(exchangeRate float64) (float64, bool) {
 // 成本利润表是独立产物，各按各的粒度聚合。
 //
 // quotas 是渠道 → 上游倍率；缺失的渠道其成本列留空，由调用方在备注里说明。
+// domestic 是渠道 → 是否国模渠道（见 UpstreamDiscountFor），nil 表示一个都没标（全按海外口径）。
 func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, exchangeRate float64,
 	preferPriceTable bool, exprSetting *BillingExprSetting, quotas map[int]float64,
-	channelNames map[int]string) ([]*CostRow, error) {
+	domestic map[int]bool, channelNames map[int]string) ([]*CostRow, error) {
 
 	col := map[string]int{}
 	for i, h := range headers {
@@ -138,19 +181,11 @@ func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, 
 					if ratioBucket != "" {
 						groupKey = group + "|" + ratioBucket
 					}
-					cr = &CostRow{AggRow: &AggRow{
-						Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
-					}, ChannelID: channelID}
 					// 渠道名与上游倍率照常带上：退款行仍属于那个渠道，
 					// 只是它不产生成本，成本列会算成 0。
-					cr.ChannelName = channelNames[channelID]
-					if cr.ChannelName == "" {
-						cr.ChannelName = fmt.Sprintf("渠道 %d", channelID)
-					}
-					if v, ok := quotas[channelID]; ok {
-						ratio := v
-						cr.UpstreamRatio = &ratio
-					}
+					cr = newCostRow(&AggRow{
+						Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
+					}, channelID, quotas, domestic, channelNames)
 					buckets[k] = cr
 					order = append(order, k)
 				}
@@ -199,16 +234,7 @@ func AggregateCostByChannel(rows [][]string, headers []string, book *PriceBook, 
 				BillingMode: pr.BillingMode, ListOrigin: pr.ListOrigin,
 				ExprUnitCurrency: pr.ExprUnitCurrency,
 			}
-			if v, ok := quotas[channelID]; ok {
-				ratio := v
-				cr = &CostRow{AggRow: agg, ChannelID: channelID, UpstreamRatio: &ratio}
-			} else {
-				cr = &CostRow{AggRow: agg, ChannelID: channelID}
-			}
-			cr.ChannelName = channelNames[channelID]
-			if cr.ChannelName == "" {
-				cr.ChannelName = fmt.Sprintf("渠道 %d", channelID)
-			}
+			cr = newCostRow(agg, channelID, quotas, domestic, channelNames)
 			buckets[k] = cr
 			order = append(order, k)
 		} else {

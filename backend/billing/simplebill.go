@@ -50,15 +50,18 @@ type SimpleBillRow struct {
 
 	// ---- 成本核算。三项要么都有值、要么整体为 nil（见 SimpleBillRow.CostPartial）。----
 
-	// OfficialListUSD 官方刊例（美金）＝ Σ(quota ÷ group_ratio) ÷ QuotaPerCNY。
+	// OfficialListUSD 官方刊例（美金口径）＝ Σ(quota ÷ group_ratio) ÷ QuotaPerCNY。
 	//
 	// 反推而非查表：站内的 quota 就是「官方刊例 × 分组倍率 × QuotaPerCNY」算出来的，
 	// 所以除回去就得到刊例。这条路径不需要价表，与模板二不依赖定价数据的定位一致。
-	OfficialListUSD *float64 `json:"officialListUsd"`
-	// UpstreamCostCNY 上游成本 ＝ 官方刊例USD × 上游倍率 ÷ DiscountBaseFactor。
 	//
-	// 与成本利润表同一公式（见 CostRow.UpstreamCostCNY），只是那边还要用汇率把刊例
-	// 从美金换成人民币，这里刊例本来就是从 quota 反推出来的人民币，直接乘即可。
+	// 国模渠道的行先 ÷ 汇率再累加：那些模型在站上按人民币报价，反推出来的本是人民币，
+	// 归一成美金口径后这一列才是同一个币种（与模板一对国产模型的处理一致）。
+	OfficialListUSD *float64 `json:"officialListUsd"`
+	// UpstreamCostCNY 上游成本 ＝ 官方刊例USD × 汇率 × 上游折扣。
+	//
+	// 与成本利润表同一公式（见 CostRow.UpstreamCostCNY）。上游折扣怎么从倍率换算
+	// 取决于渠道是否国模渠道，见 UpstreamDiscountFor。
 	UpstreamCostCNY *float64 `json:"upstreamCostCny"`
 	// ProfitCNY 利润 ＝ 金额 − 上游成本。
 	ProfitCNY *float64 `json:"profitCny"`
@@ -119,6 +122,9 @@ type SimpleBillOptions struct {
 	// billing 包不连 PG——与 Params.ChannelUpstreamRatios 同一个约定。
 	// 为空表示一条倍率都没有（首次部署、还没拉过渠道清单）。
 	UpstreamRatios map[int]float64
+	// DomesticChannels 渠道 ID → 是否国模渠道（只含标了的），与 UpstreamRatios 成对使用。
+	// nil 表示一个都没标，全按海外口径算。换算规则见 UpstreamDiscountFor。
+	DomesticChannels map[int]bool
 	// CostColumns 是否写成本三列。
 	//
 	// 关掉时三列**仍然存在**但整列为空：列集合是固定的十列（账单与脱敏日志必须同构，
@@ -313,7 +319,12 @@ func DescribeSkipReasons(reasons map[string]int) string {
 // 表达式行、按次行三条计费路径都满足这条恒等式），于是：
 //
 //	官方刊例USD = quota ÷ group_ratio ÷ QuotaPerCNY
-//	上游成本CNY = 官方刊例USD × 上游倍率 ÷ DiscountBaseFactor
+//	上游成本CNY = 官方刊例USD × 汇率 × 上游折扣
+//	上游折扣    = 上游倍率 ÷ DiscountBaseFactor        （默认，海外渠道）
+//	            = 上游倍率                              （国模渠道，见 UpstreamDiscountFor）
+//
+// 国模渠道的模型在站上按人民币报价，反推出来的「刊例」本来就是人民币，
+// 所以先除一次汇率归一成美金口径（见循环里的说明），算成本时再乘回来。
 //
 // 所以成本列**不需要价表**，也就不破坏本模板「不参与定价」的定位——
 // 它是把已经记在额度里的信息除回去，不是重新算一遍价。
@@ -480,18 +491,39 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			continue
 		}
 		upstream := opts.UpstreamRatios[ids[0]]
+		domestic := opts.DomesticChannels[ids[0]]
 		ca.rows++
+
+		// 反推出来的刊例，仍是 quota 量纲（分组倍率这一个因子已除掉，见 officialQuota 的说明）。
 		// 净额口径与 TotalQuota 一致（退款行为负），否则同一条退款在
 		// 金额列与成本列上冲抵的方向会相反。
-		ca.officialQuota += delta / costRatio
+		listQuota := delta / costRatio
+		if domestic {
+			// 国模渠道承接的是站上按人民币报价的国产模型（1 元 = 1 美金充值），
+			// 所以反推出来的「刊例」本来就是人民币。除回汇率，归一成美金口径：
+			//   - 官方刊例（美金）这一列才不会把人民币与美金直接相加；
+			//   - 与模板一 priceRow 对国产模型的处理同口径（OfficialUSD = 人民币刊例 ÷ 汇率），
+			//     两张表同一渠道的刊例才对得上。
+			// 模板二没有价表可查模型的币种，只能由渠道标识来告知。
+			listQuota /= rate
+		}
+		ca.officialQuota += listQuota
 		// 成本逐行算再累加，而不是「汇总刊例 × 某个倍率」：
 		// 一个 (分组, 模型) 横跨多个渠道时，各渠道倍率不同，只有逐行加权才对。
 		//
-		// 单位换算走两步，与 CostRow.UpstreamCostCNY 完全一致：
+		// 单位换算走几步，与 CostRow.UpstreamCostCNY 完全一致：
 		//   ÷ QuotaPerCNY 把 quota 量纲换成刊例美金（见上面的恒等式）
 		//   × 汇率         换成人民币
-		//   ÷ DiscountBaseFactor 是上游折扣（上游倍率 / 7，见 group_ratio_source.md）
-		ca.upstreamCNY += delta / costRatio / QuotaPerCNY * rate * upstream / DiscountBaseFactor
+		//   × 上游折扣     见 UpstreamDiscountFor（海外渠道 倍率/7，国模渠道 倍率本身）
+		//
+		// 国模渠道的式子是 (刊例人民币 ÷ 汇率) × 汇率 × 倍率 = 刊例人民币 × 倍率，
+		// 汇率在里面一进一出，成本数与汇率无关（模板一的 OfficialListCNY × 折扣同理）。
+		//
+		// 升级影响（只在汇率恰好等于 DiscountBaseFactor=7 时成立）：
+		// 旧口径对所有渠道都是「刊例 × 汇率 × 倍率 ÷ 7」，汇率为 7 时国模渠道的成本数
+		// 碰巧与新口径相同，变的只有官方刊例那一列的币种（原先把人民币当美金写，现在归一了）。
+		// 汇率不是 7 时旧口径的国模成本会偏 汇率/7 倍，新口径不再有这个偏差。
+		ca.upstreamCNY += listQuota / QuotaPerCNY * rate * UpstreamDiscountFor(upstream, domestic)
 	}
 
 	out := make([]SimpleBillRow, 0, len(buckets))
