@@ -304,7 +304,7 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		// AC 直接是「单价×用量」公式，与单价列同源；不能还原的行（跨档、按次计费、
 		// isTiered 兜底展示价等），AC 落官方刊例本身——这是全表唯一允许出现裸数值的
 		// 单元格，且只出现在这一列，不再散落进 S/W 的公式字符串里。
-		// S/W 一律引用 AC，不再各写一套分支：S = (AC+O*10/1000)*汇率，W = S÷汇率。
+		// S/W 一律引用 AC，不再各写一套分支：S = (AC+O*10/1000)*汇率，W = (AC+O*10/1000)*折扣。
 		// 价格列在系数为 0 时会被留空（见下方 hasExpr 分支），留空写入的是空字符串
 		// 而不是数字 0；AC 公式若直接引用会在 Excel 里算出 #VALUE!（数字×文本）。
 		// 用 N() 包一层：N(空文本)=0，N(数字)=原数字，两种情况都安全。
@@ -320,7 +320,10 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 		// 结算金额：口径统一为「总金额 × 折扣」，不再直接取日志 quota 折算的金额。
 		// 两者的差额就是商务折扣与日志里 groupRatio 的差额，差异来源写在 AB 列。
 		setFormula(22, r, fmt.Sprintf("S%d*T%d", r, r), styleMoney)
-		setFormula(23, r, fmt.Sprintf("V%d/%s", r, formatFloat(exchangeRate)), styleMoney)
+		// W 直接用美金刊例 × 折扣，不再由 V 除以汇率倒推：客户看到「V÷汇率」
+		// 容易把折扣后的美金误读成受汇率波动影响。美金刊例项与 S 同源
+		// （AC + 网页搜索），所以 W × 汇率 仍严格等于 V。
+		setFormula(23, r, fmt.Sprintf("(AC%d+O%d*10/1000)*T%d", r, r, r), styleMoney)
 
 		switch {
 		case !HasKnownListPrice(agg):

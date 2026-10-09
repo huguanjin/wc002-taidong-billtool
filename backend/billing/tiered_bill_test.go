@@ -217,9 +217,9 @@ func TestTieredBillSingleTierRowIsReproducible(t *testing.T) {
 	assert.Contains(t, s, "*7", "S 应当乘上汇率")
 	assert.NotContains(t, s, fmt.Sprint(agg.OfficialUSD), "S 不应出现硬编码的美金刊例")
 
-	// V = S × T，W = V ÷ 汇率，都必须是公式。
+	// V = S × T，W = 美金刊例 × T，都必须是公式。
 	assert.Equal(t, "S3*T3", formula(t, f, sheet, 22, 3), "V 应为 总金额 × 折扣")
-	assert.Equal(t, "V3/7", formula(t, f, sheet, 23, 3), "W 应为 结算人民币 ÷ 汇率")
+	assert.Equal(t, "(AC3+O3*10/1000)*T3", formula(t, f, sheet, 23, 3), "W 应为 美金刊例 × 折扣")
 
 	assert.Equal(t, "是", cell(t, f, sheet, 24, 3), "单价×用量可还原刊例，X 应为「是」")
 
@@ -621,7 +621,7 @@ func TestTieredPricesCoverExpressionModels(t *testing.T) {
 
 // TestBillFormulasReconcileAcrossRows 逐行核对账单的自洽性：
 //   - 单档行：Σ(单价 × 用量) / 1e6 == 官方刊例美金（容差 1e-6）
-//   - 任意行：V == S × T，W == V ÷ 汇率
+//   - 任意行：V == S × T，W == (AC + O×10/1000) × T
 //   - 跨档行：单价列留空且 X == "否"
 //
 // 失败时把行号与差额列出来，不靠肉眼看表。
@@ -680,11 +680,11 @@ func TestBillFormulasReconcileAcrossRows(t *testing.T) {
 			add("第 %d 行：可还原行的 S 不应写死美金刊例", r)
 		}
 
-		// 3. V == S × T，W == V ÷ 汇率。
+		// 3. V == S × T，W == 美金刊例 × T。
 		if got, want := formula(t, f, sheet, 22, r), fmt.Sprintf("S%d*T%d", r, r); got != want {
 			add("第 %d 行：V 公式为 %q，应为 %q", r, got, want)
 		}
-		if got, want := formula(t, f, sheet, 23, r), fmt.Sprintf("V%d/%s", r, formatFloat(exchangeRate)); got != want {
+		if got, want := formula(t, f, sheet, 23, r), fmt.Sprintf("(AC%d+O%d*10/1000)*T%d", r, r, r); got != want {
 			add("第 %d 行：W 公式为 %q，应为 %q", r, got, want)
 		}
 
