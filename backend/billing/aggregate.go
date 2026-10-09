@@ -189,6 +189,11 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 			groupKey := group
 			if ratioBucket != "" {
 				groupKey = group + "|" + ratioBucket
+				// 国产模型的折扣口径与海外不同（倍率本身 vs 倍率÷7），同一分组里若两类模型
+				// 共用一个桶键，折扣会被先出现的那类决定。单独成桶，各算各的。
+				if VendorFamily(model) != "" {
+					groupKey += "|cny"
+				}
 			}
 			agg = &AggRow{
 				Model: model, Group: groupKey, KeyGroup: group, GroupRatio: round(groupRatio, 4),
@@ -228,6 +233,9 @@ func AggregateFromRows(rows [][]string, headers []string, book *PriceBook, excha
 		agg.WebSearchCalls += pr.WebSearchCalls
 		agg.ImagePerCallCount += pr.ImagePerCallCount
 		agg.Rows++
+		if pr.SiteRatioList {
+			agg.SiteListRows++
+		}
 		rowCount++
 
 		if hasCreated {

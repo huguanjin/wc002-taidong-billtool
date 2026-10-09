@@ -41,6 +41,9 @@ type pricedRow struct {
 	PerCallCountUncertain bool
 	// HasCache 该行是否出现缓存用量
 	HasCache bool
+	// SiteRatioList 刊例是由日志自带的计费快照（表达式或 model_ratio）算出的，
+	// 即 quota = 刊例 × group_ratio 这条恒等式成立。国产模型据此直接按分组倍率结算。
+	SiteRatioList bool
 }
 
 // IsTaskQuotaAdjustment 该行是不是异步任务的额度调整行（退款或补扣结算），而不是一次消费。
@@ -216,6 +219,7 @@ func priceRow(model, other string, prompt, completion, cacheRead, cacheWrite5m, 
 			}
 			r.BillingExpr = exprStr
 			r.MatchedTier = res.MatchedTier
+			r.SiteRatioList = true
 			// 刊例由站内表达式算出，不是外部对标价：这一行不能参与折扣反推。
 			r.ListOrigin = ListOriginExpr
 		}
@@ -243,6 +247,7 @@ func priceRow(model, other string, prompt, completion, cacheRead, cacheWrite5m, 
 			listUSD += wsCalls * wsPrice / 1000.0
 		}
 		r.BillingMode = "token"
+		r.SiteRatioList = true
 		// ratio 快照的换算基准是官方锚点（ratio=1 → $2/MTok），算外部对标价。
 		r.ListOrigin = ListOriginExternal
 

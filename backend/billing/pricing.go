@@ -712,6 +712,27 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 		}
 	}
 
+	// 按倍率结算的行（站内表达式计费，以及国产模型的计费快照行）直接按「本次请求实际使用的倍率」结算：
+	// 站内 quota = 表达式USD × GroupRatio × QuotaPerCNY，而 OfficialUSD = 表达式USD，
+	// 于是 折扣 = GroupRatio / DiscountBaseFactor 时，
+	// 结算额 = OfficialUSD × 汇率 × 折扣 == quota / QuotaPerCNY，与实收逐行严格相等。
+	// 这是表达式行的正确口径，不需要（也不能）靠反推得到。
+	for _, agg := range rows {
+		if _, already := discounts[agg.Group]; already {
+			continue
+		}
+		if !agg.HasRatioDiscount() {
+			continue
+		}
+		discounts[agg.Group] = round(agg.RatioDiscount(), DiscountDecimals)
+		// 结算用未取整的精确比值，避免整表累计出 0.05 元量级的无意义偏差。
+		settleFactors[agg.Group] = agg.RatioDiscount()
+	}
+
+	// 这一步必须排在价表折扣之前：国产模型（DeepSeek/GLM/Qwen…）同时命中价表的厂商家族折扣，
+	// 但站点实收是按分组倍率扣的（0.75 倍率即 75 折），价表里的折扣不能压过它，
+	// 否则账单与站内实收对不上，且备注还写着「按分组倍率结算」。
+
 	// 价表优先：同一分组下若各模型的厂商家族折扣不一致，以先命中者为准，
 	// 并把该组记为「混合折扣」，由写账单时在备注里提示复核。
 	tableGroups := map[string]bool{}
@@ -730,23 +751,6 @@ func ComputeGroupDiscounts(rows []*AggRow, book *PriceBook, exchangeRate float64
 
 	derived := map[string]bool{}
 	underivable := map[string]string{}
-
-	// 站内表达式计费的行直接按「本次请求实际使用的倍率」结算：
-	// 站内 quota = 表达式USD × GroupRatio × QuotaPerCNY，而 OfficialUSD = 表达式USD，
-	// 于是 折扣 = GroupRatio / DiscountBaseFactor 时，
-	// 结算额 = OfficialUSD × 汇率 × 折扣 == quota / QuotaPerCNY，与实收逐行严格相等。
-	// 这是表达式行的正确口径，不需要（也不能）靠反推得到。
-	for _, agg := range rows {
-		if _, already := discounts[agg.Group]; already {
-			continue
-		}
-		if !agg.HasRatioDiscount() {
-			continue
-		}
-		discounts[agg.Group] = round(agg.RatioDiscount(), DiscountDecimals)
-		// 结算用未取整的精确比值，避免整表累计出 0.05 元量级的无意义偏差。
-		settleFactors[agg.Group] = agg.RatioDiscount()
-	}
 
 	// 剩下的走反推：分母只累加口径可信的行。
 	// 表达式行与倍率行不参与——它们的折扣已由上面的分支确定，且比值型口径

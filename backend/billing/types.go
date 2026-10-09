@@ -54,6 +54,9 @@ type AggRow struct {
 	// 渠道切换、GroupGroupRatio 变更、共享分组被多个套餐使用），而站内结算额是
 	// 「表达式美金 × 本次倍率」，用单一折扣无法把这组账算对。0 表示日志没给该字段。
 	GroupRatio float64
+	// SiteListRows 本桶中刊例来自日志计费快照（表达式 / model_ratio）的行数，
+	// 与 Rows 相等才说明整桶都满足 quota = 刊例 × group_ratio（见 HasRatioDiscount）。
+	SiteListRows int
 	// ListOrigin 本行 OfficialUSD 的来源（见 ListOrigin* 常量）。
 	// 只有外部对标价才能当折扣反推的分母；站内公式自算出来的数字反推不出商务折扣。
 	ListOrigin ListOrigin
@@ -109,16 +112,33 @@ func (a *AggRow) ExprUnitDivisor(exchangeRate float64) float64 {
 // 一边用 OfficialUSD，退款只会动 quota（净额变了而刊例没变），等式立刻不成立。
 // 硬按倍率结算会让这一桶少收/多收恰好等于退款额的钱，而且看起来一切正常。
 // 交回反推路径后，结算系数会由「净结算 / 刊例人民币」算出，账实重新相符。
+//
+// 国产模型（IsCNYListed）还多一条路：它们在站上按人民币报价，ratio 快照行同样满足
+// 上面的恒等式，所以只要整桶刊例都来自日志计费快照（表达式或 model_ratio），也按倍率结算。
 func (a *AggRow) HasRatioDiscount() bool {
-	if a.HasQuotaAdjustment {
+	if a.HasQuotaAdjustment || a.GroupRatio <= 0 {
 		return false
 	}
-	return a.GroupRatio > 0 && a.BillingMode == BillingModeTieredExpr && a.BillingExpr != ""
+	if a.BillingMode == BillingModeTieredExpr && a.BillingExpr != "" {
+		return true
+	}
+	return a.IsCNYListed() && a.Rows > 0 && a.SiteListRows == a.Rows
 }
 
-// RatioDiscount 本次请求实际使用倍率对应的折扣：倍率 / DiscountBaseFactor。
-// 与 group_ratio_source.md 的换算约定一致（倍率 1 对应折扣 1/7）。
+// IsCNYListed 该模型在站上按人民币报价（与 priceRow 里换算币种用同一个判据）。
+func (a *AggRow) IsCNYListed() bool {
+	return VendorFamily(a.Model) != ""
+}
+
+// RatioDiscount 本次请求实际使用倍率对应的折扣。
+//
+// 海外模型：倍率 / DiscountBaseFactor（倍率 1 对应折扣 1/7，见 group_ratio_source.md）。
+// 国产模型：倍率本身。配置价格时 1 倍率就是官方原价（人民币），所以 0.75 倍率
+// 显示给客户就是 75 折，不再除汇率基数。
 func (a *AggRow) RatioDiscount() float64 {
+	if a.IsCNYListed() {
+		return a.GroupRatio
+	}
 	return a.GroupRatio / DiscountBaseFactor
 }
 

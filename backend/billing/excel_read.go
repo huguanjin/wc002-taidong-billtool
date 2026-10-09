@@ -2,6 +2,7 @@ package billing
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -99,6 +100,72 @@ func DetectCSVEncoding(path, preferred string) (encoding string, content string,
 	return "", "", fmt.Errorf("无法识别 CSV/TSV 编码，可手动指定 encoding。已尝试: %v", candidates)
 }
 
+// repairEscapedOther 还原 other 列里被 mysql 批处理模式转义过的反斜杠。
+//
+// 「导出日志明细」按 mysql 客户端批处理格式写 TSV（见 mysqlBatchEscape）：值里的 `\` 写成 `\\`，
+// 所以库里 JSON 字符串内的 `\"` 到了文件里是 `\\"`。读回来若不还原，这一格就不是合法 JSON，
+// group_ratio / expr_b64 / model_ratio 等一律解析不出——该行会悄悄退回价表定价，而不报任何错。
+// 一份 9 月日志里这样的行有 5.4 万条（deepseek-v4.1-flash 近半数，其 billing_expr 带峰谷倍率，
+// 退回价表后刊例整体偏高 13%）。
+//
+// 只修「不是合法 JSON、还原后变成合法 JSON」的格子：非 mysql 导出的 CSV 里 `\\` 可能就是字面量，
+// 无条件还原会把本来合法的内容改坏。
+func repairEscapedOther(headers []string, rows [][]string) {
+	idx := -1
+	for i, h := range headers {
+		if h == "other" {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	for _, row := range rows {
+		if idx >= len(row) {
+			continue
+		}
+		cell := row[idx]
+		if !strings.Contains(cell, `\\`) || json.Valid([]byte(cell)) {
+			continue
+		}
+		if fixed := mysqlBatchUnescape(cell); json.Valid([]byte(fixed)) {
+			row[idx] = fixed
+		}
+	}
+}
+
+// mysqlBatchUnescape 是 mysqlBatchEscape 的逆：把 `\t` `\n` `\r` `\\` `\0` 还原成原字符。
+// 单遍扫描，`\\` 之后的字符不会被二次解释。
+func mysqlBatchUnescape(v string) string {
+	var b strings.Builder
+	b.Grow(len(v))
+	for i := 0; i < len(v); i++ {
+		if v[i] != '\\' || i+1 >= len(v) {
+			b.WriteByte(v[i])
+			continue
+		}
+		i++
+		switch v[i] {
+		case 't':
+			b.WriteByte('\t')
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case '\\':
+			b.WriteByte('\\')
+		case '0':
+			b.WriteByte(0)
+		default:
+			// 不是 mysqlBatchEscape 产出的序列：原样保留，不丢反斜杠。
+			b.WriteByte('\\')
+			b.WriteByte(v[i])
+		}
+	}
+	return b.String()
+}
+
 // LoadLogRows 读取日志 xlsx/csv/tsv，返回表头与数据行（不含表头）。
 func LoadLogRows(path, sheetName, encoding string) (headers []string, rows [][]string, err error) {
 	return readLogRows(path, sheetName, encoding)
@@ -130,6 +197,7 @@ func readLogRows(path, sheetName, encoding string) (headers []string, rows [][]s
 		for i, h := range all[0] {
 			headers[i] = strings.TrimSpace(h)
 		}
+		repairEscapedOther(headers, all[1:])
 		return headers, all[1:], nil
 	}
 

@@ -110,3 +110,36 @@ func TestDetectDelimiterMisnamedCSV(t *testing.T) {
 		t.Fatalf("数据行解析不符: %v", rows)
 	}
 }
+
+// TestLoadLogRowsRestoresMysqlEscapedOther 覆盖导出 TSV 里 `\\"` 的还原：
+// 库里 JSON 字符串内的 `\"` 经 mysqlBatchEscape 变成 `\\"`，读回来必须还原，
+// 否则 other 不是合法 JSON，group_ratio 等一律取不到。
+func TestLoadLogRowsRestoresMysqlEscapedOther(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "日志查询.tsv")
+	orig := `{"group_ratio":0.75,"request_rules":[{"cond":"hour(\"Asia/Shanghai\") \u003e= 9"}]}`
+	cell := mysqlBatchEscape(orig)
+	if cell == orig {
+		t.Fatal("测试前提不成立：转义后应与原文不同")
+	}
+	content := "model_name\tquota\tother\n" + "m\t100\t" + cell + "\n" +
+		"m\t100\t" + `{"group_ratio":1,"note":"a\b"}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("写入 tsv 失败: %v", err)
+	}
+
+	_, rows, err := LoadLogRows(path, "", "")
+	if err != nil {
+		t.Fatalf("LoadLogRows 失败: %v", err)
+	}
+	if rows[0][2] != orig {
+		t.Errorf("转义的 other 未还原:\n got %s\nwant %s", rows[0][2], orig)
+	}
+	if r, ok := GroupRatioFromOther(rows[0][2]); !ok || r != 0.75 {
+		t.Errorf("还原后应能取到 group_ratio=0.75，实际 %v %v", r, ok)
+	}
+	// 本来就是合法 JSON 的格子（`\` 是字面量转义）不能被改动。
+	if rows[1][2] != `{"group_ratio":1,"note":"a\b"}` {
+		t.Errorf("合法 JSON 不应被改动: %s", rows[1][2])
+	}
+}

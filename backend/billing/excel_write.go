@@ -444,10 +444,17 @@ func writeTemplateSheet(templatePath, outputPath string, rows []*AggRow, extras 
 			notes = appendNote(notes, "折扣为手工维护值（客户+分组维度，见「客户折扣」页）")
 		} else if agg.HasRatioDiscount() {
 			// 按本次请求倍率结算的行说明白，客户拿到表能自己复核这一行为什么金额刚好等于实收。
-			notes = appendNote(notes, fmt.Sprintf(
-				"折扣按本次请求实际使用的分组倍率结算（倍率 %s ÷ %s = %s），金额与站内实收一致",
-				trimRatio(agg.GroupRatio), trimRatio(DiscountBaseFactor),
-				trimRatio(round(agg.RatioDiscount(), DiscountDecimals))))
+			if agg.IsCNYListed() {
+				// 国产模型按人民币报价，倍率 1 即官方原价，倍率就是折扣。
+				notes = appendNote(notes, fmt.Sprintf(
+					"折扣按本次请求实际使用的分组倍率结算（国产模型倍率即折扣：%s），金额与站内实收一致",
+					trimRatio(round(agg.RatioDiscount(), DiscountDecimals))))
+			} else {
+				notes = appendNote(notes, fmt.Sprintf(
+					"折扣按本次请求实际使用的分组倍率结算（倍率 %s ÷ %s = %s），金额与站内实收一致",
+					trimRatio(agg.GroupRatio), trimRatio(DiscountBaseFactor),
+					trimRatio(round(agg.RatioDiscount(), DiscountDecimals))))
+			}
 		}
 		if reason, bad := underivable[agg.Group]; bad {
 			notes = appendNote(notes, reason+"；本行折扣取站点实际计费倍率，请人工确认合同折扣")

@@ -419,3 +419,35 @@ func TestAggregateRowsGroupedTogether(t *testing.T) {
 	assert.Equal(t, "claude-opus-4-7", aws[1].Model, "同倍率内按模型名排序")
 	assert.Equal(t, "claude-opus-4-8", aws[2].Model)
 }
+
+// TestDomesticModelSettlesAtGroupRatio 国产模型按分组倍率本身结算（0.75 倍率 = 75 折），
+// 且排在价表厂商折扣（DeepSeek 6 折）之前；海外模型仍是 倍率÷7。
+func TestDomesticModelSettlesAtGroupRatio(t *testing.T) {
+	headers := []string{"model_name", "group", "prompt_tokens", "completion_tokens", "quota", "other"}
+	// ratio 快照行：model_ratio=0.5 → 输入 $1/M（国产按人民币），输出 ×2。
+	// 站内 quota = 刊例(元) × 倍率 × 500000。
+	const gr = 0.75
+	listCNY := (1000.0*1 + 100.0*2) / 1e6 // 1000 输入 + 100 输出
+	quota := listCNY * gr * QuotaPerCNY
+	other := `{"group_ratio":0.75,"model_ratio":0.5,"completion_ratio":2,"cache_ratio":0.2}`
+	rows := [][]string{
+		{"deepseek-v4-flash", "阿里百炼", "1000", "100", trimRatio(quota), other},
+	}
+	book := NewPriceBook()
+	book.Discounts["DeepSeek"] = 0.6
+
+	agg, err := AggregateFromRows(rows, headers, book, 7.0, true, nil, false, nil)
+	require.NoError(t, err)
+	a := agg.Rows[0]
+	require.True(t, a.HasRatioDiscount(), "国产模型 ratio 快照行应按倍率结算")
+	assert.InDelta(t, gr, a.RatioDiscount(), 1e-12, "国产模型倍率即折扣，不除 7")
+
+	disc := ComputeGroupDiscounts(agg.Rows, book, 7.0, DiscountOverrides{}, nil)
+	assert.InDelta(t, gr, disc.SettleFactor(a.Group), 1e-12, "价表 6 折不能压过站点倍率")
+	assert.InDelta(t, a.Quota/QuotaPerCNY, OfficialListCNY(a, 7.0)*disc.SettleFactor(a.Group), 1e-9,
+		"结算额应与站内实收一致")
+
+	// 海外模型不受影响。
+	overseas := &AggRow{Model: "gpt-5.5", GroupRatio: 3.5, BillingMode: BillingModeTieredExpr, BillingExpr: testExprGpt55}
+	assert.InDelta(t, 0.5, overseas.RatioDiscount(), 1e-12)
+}
