@@ -388,6 +388,32 @@ await scenario('渠道页：草稿为空也不得抛异常', ChannelRatios, {
   ratioDraft: {}, ratioNotes: {}, domesticDraft: {},
 }, { has: ['渠道成本倍率维护'] })
 
+console.log('检查二：ChannelModelBilling.vue 各状态渲染')
+const ChannelModelBilling = await loadSfc('ChannelModelBilling.vue')
+
+await scenario('上游计费方式页：清单与核对结果（含未维护、混合草稿类型）', ChannelModelBilling, {
+  items: [
+    { channelId: 1, channelName: 'A', model: 'gpt-image-2', mode: 'per_call', perCallCny: 0.1, updatedAt: '2026-10-10T10:00:00Z' },
+    { channelId: 3, channelName: 'C', model: 'gpt-image-2', mode: 'per_token', perCallCny: 0, updatedAt: '2026-10-10T10:00:00Z' },
+  ],
+  logFiles: [{ name: '日志查询_x.tsv', path: '/d/x.tsv' }],
+  selectedLog: '/d/x.tsv',
+  status: {
+    pendingCount: 1, totalRows: 4,
+    items: [
+      { channelId: 2, channelName: 'B', model: 'gpt-image-2', status: 'none', rows: 1, units: 1, amountCny: 0.14, avgSiteCny: 0.14, groups: ['g'] },
+      { channelId: 1, channelName: 'A', model: 'gpt-image-2', status: 'per_call', perCallCny: 0.1, rows: 2, units: 2, amountCny: 0.2, avgSiteCny: 0.1, groups: [], estCostCny: 0.2 },
+    ],
+  },
+  draft: { '1|gpt-image-2': { mode: 'per_call', fee: 0.12 } }, // 单次费用草稿是 number（type=number 的 v-model）
+}, {
+  has: ['上游计费方式维护', '未维护 1 项', '未维护', '按次', '按量', '¥0.2', 'gpt-image-2'],
+})
+
+await scenario('上游计费方式页：空状态不得抛异常', ChannelModelBilling, { items: [], status: null }, {
+  has: ['还没有维护过'],
+})
+
 console.log('检查二：App.vue 各状态渲染')
 const App = await loadSfc('App.vue')
 
@@ -681,6 +707,45 @@ console.log('检查三：ChannelRatios.vue 交互逻辑')
   await vm.saveChannelRatios()
   same('保存的内容带 isDomestic', calls.find((c) => c.url === '/api/channel-ratios').body.items,
     [{ channelId: 1, upstreamRatio: 0.4, note: '', isDomestic: true }])
+}
+
+console.log('检查三：ChannelModelBilling.vue 交互逻辑')
+{
+  const calls = stubFetch({
+    '/api/save-channel-model-billing': { saved: 2, deleted: 0 },
+    '/api/channel-model-billing': { items: [] },
+  })
+  const vm = await mount(ChannelModelBilling, {
+    items: [
+      { channelId: 1, model: 'm', mode: 'per_call', perCallCny: 0.1 },
+      { channelId: 3, model: 'm', mode: 'per_token', perCallCny: 0 },
+    ],
+    status: { pendingCount: 1, totalRows: 3, items: [
+      { channelId: 2, model: 'm', status: 'none', units: 1, amountCny: 1, groups: [] },
+      { channelId: 1, model: 'm', status: 'per_call', perCallCny: 0.1, units: 1, amountCny: 1, groups: [] },
+    ] },
+    draft: {
+      '1|m': { mode: 'per_call', fee: '0.2' }, // 清单与核对里是同一项：只提交一次
+      '2|m': { mode: 'per_call', fee: '0.3' }, // 未维护 → 新补
+      '3|m': { mode: 'per_token', fee: '' }, // 没动
+    },
+  })
+  same('待保存数按键去重（同一项在两张表里只算一次）', vm.pendingCount, 2)
+  same('只提交有改动的；按量费用记 0', vm.saveItems().items, [
+    { channelId: 1, model: 'm', mode: 'per_call', perCallCny: 0.2 },
+    { channelId: 2, model: 'm', mode: 'per_call', perCallCny: 0.3 },
+  ])
+  vm.draft = { '2|m': { mode: 'per_call', fee: '0' } }
+  same('按次的单次费用为 0 会被拒绝（否则成本被读成上游免费）', typeof vm.saveItems().error, 'string')
+  vm.draft = { '2|m': { mode: '', fee: '' } }
+  same('未维护且没选方式 → 不提交', vm.saveItems().items, [])
+  vm.draft = { '2|m': { mode: 'per_token', fee: '' } }
+  same('未维护 → 选按量也算改动', vm.pendingCount, 1)
+
+  vm.draft = { '2|m': { mode: 'per_call', fee: '0.3' }, '1|m': { mode: 'per_call', fee: '0.2' } }
+  await vm.save()
+  same('保存请求发往 save 接口', calls[0].url, '/api/save-channel-model-billing')
+  same('保存后清空草稿', Object.keys(vm.draft).length, 0)
 }
 
 console.log('检查三：App.vue 交互逻辑')

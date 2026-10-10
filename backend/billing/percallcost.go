@@ -384,3 +384,145 @@ func ExtractRatioChannelIDs(headers []string, rows [][]string, strict *StrictPer
 	}
 	return out, nil
 }
+
+// PerCallStatusItem 一份日志里一个 (渠道, 模型) 的上游计费方式维护情况。
+type PerCallStatusItem struct {
+	ChannelID   int    `json:"channelId"`
+	ChannelName string `json:"channelName"`
+	Model       string `json:"model"`
+	// Status：none = 还没维护；per_call = 已维护成按次；per_token = 已维护成按量。
+	Status     string  `json:"status"`
+	PerCallCNY float64 `json:"perCallCny"`
+	// Rows / Units / AmountCNY / AvgSiteCNY 口径同 PerCallIssue。
+	Rows       int      `json:"rows"`
+	Units      float64  `json:"units"`
+	AmountCNY  float64  `json:"amountCny"`
+	AvgSiteCNY float64  `json:"avgSiteCny"`
+	Groups     []string `json:"groups"`
+	// EstCostCNY 按已维护的方式估出来的上游成本：按次 = 次数 × 单次费用；其余不估（按量要看倍率，未维护没有依据）。
+	EstCostCNY *float64 `json:"estCostCny,omitempty"`
+}
+
+// CollectPerCallStatus 扫日志，列出所有「按次候选」或「已被维护过」的 (渠道, 模型) 及其维护状态。
+//
+// 与 CollectPerCallIssues 的区别：后者只列待补的，这里**全列**，供维护页回看覆盖情况。
+// 只统计只经过单一渠道的行（多渠道行额度怎么分摊不明，与成本侧一致，不归属）。
+func CollectPerCallStatus(headers []string, rows [][]string, strict *StrictPerCall) []PerCallStatusItem {
+	if strict == nil {
+		return nil
+	}
+	idxChannel, hasChannelCol := columnIndex(headers, "channel_id")
+	idxOther, hasOtherCol := columnIndex(headers, "other")
+	idxModel, hasModel := columnIndex(headers, "model_name")
+	idxQuota, hasQuota := columnIndex(headers, "quota")
+	idxType, hasType := columnIndex(headers, "type")
+	idxGroup, hasGroup := columnIndex(headers, "group")
+	if !hasModel {
+		return nil
+	}
+
+	type acc struct {
+		item   *PerCallStatusItem
+		groups map[string]bool
+	}
+	byKey := map[ChannelModelKey]*acc{}
+
+	for _, row := range rows {
+		if len(row) == 0 {
+			continue
+		}
+		ids := rowChannelIDs(row, idxChannel, hasChannelCol, idxOther, hasOtherCol)
+		if len(ids) != 1 {
+			continue
+		}
+		other := ""
+		if hasOtherCol {
+			other = cellAt(row, idxOther)
+		}
+		delta := 0.0
+		if hasQuota {
+			delta = ToFloat(cellAt(row, idxQuota))
+		}
+		adjustment := IsTaskQuotaAdjustment(other)
+		if adjustment {
+			logType := ""
+			if hasType {
+				logType = cellAt(row, idxType)
+			}
+			d, ok := QuotaAdjustmentDelta(logType, delta)
+			if !ok {
+				continue
+			}
+			delta = -d
+		}
+		model := strings.TrimSpace(cellAt(row, idxModel))
+		state, cfg, price := strict.classify(ids[0], model, other, adjustment)
+		if state == pcNotApplicable {
+			continue
+		}
+		key := ChannelModelKey{ChannelID: ids[0], Model: model}
+		a, ok := byKey[key]
+		if !ok {
+			it := &PerCallStatusItem{ChannelID: ids[0], Model: model, Status: "none"}
+			switch state {
+			case pcPerCall:
+				it.Status, it.PerCallCNY = UpstreamModePerCall, cfg.PerCallCNY
+			case pcPerToken:
+				it.Status = UpstreamModePerToken
+			}
+			a = &acc{item: it, groups: map[string]bool{}}
+			byKey[key] = a
+		}
+		a.item.AmountCNY += delta / QuotaPerCNY
+		if adjustment {
+			continue
+		}
+		a.item.Rows++
+		gr, _ := GroupRatioFromOther(other)
+		units, _ := PerCallUnits(delta, price, gr, false)
+		a.item.Units += units
+		if hasGroup {
+			if g := strings.TrimSpace(cellAt(row, idxGroup)); g != "" {
+				a.groups[g] = true
+			}
+		}
+	}
+
+	out := make([]PerCallStatusItem, 0, len(byKey))
+	for _, a := range byKey {
+		it := a.item
+		for g := range a.groups {
+			it.Groups = append(it.Groups, g)
+		}
+		sort.Strings(it.Groups)
+		it.AmountCNY = round(it.AmountCNY, MoneyDecimals)
+		if it.Units > 0 {
+			it.AvgSiteCNY = round(it.AmountCNY/it.Units, 6)
+		}
+		if it.Status == UpstreamModePerCall {
+			c := round(it.Units*it.PerCallCNY, MoneyDecimals)
+			it.EstCostCNY = &c
+		}
+		out = append(out, *it)
+	}
+	// 未维护的排最前（要处理的），其次按金额降序。
+	rank := func(s string) int {
+		if s == "none" {
+			return 0
+		}
+		return 1
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if rank(out[i].Status) != rank(out[j].Status) {
+			return rank(out[i].Status) < rank(out[j].Status)
+		}
+		if out[i].AmountCNY != out[j].AmountCNY {
+			return out[i].AmountCNY > out[j].AmountCNY
+		}
+		if out[i].ChannelID != out[j].ChannelID {
+			return out[i].ChannelID < out[j].ChannelID
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}

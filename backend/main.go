@@ -111,6 +111,7 @@ func main() {
 	mux.HandleFunc("/api/channels", withCORS(requireAuth(handleChannels)))
 	mux.HandleFunc("/api/channel-ratios", withCORS(requireAuth(handleSaveChannelRatios)))
 	mux.HandleFunc("/api/channel-model-billing", withCORS(requireAuth(handleChannelModelBilling)))
+	mux.HandleFunc("/api/channel-model-billing-status", withCORS(requireAuth(handleChannelModelBillingStatus)))
 	mux.HandleFunc("/api/save-channel-model-billing", withCORS(requireAuth(handleSaveChannelModelBilling)))
 	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
 	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
@@ -1445,6 +1446,65 @@ func handleChannelModelBilling(w http.ResponseWriter, r *http.Request) {
 		out = append(out, row{it, name})
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"items": out})
+}
+
+// handleChannelModelBillingStatus 按一份已导出的日志核对上游计费方式的维护情况。
+//
+// 列出这份日志里所有「带按次迹象」或「已被维护过」的 (渠道, 模型)，每项标明
+// 未维护 / 按次（单次费用）/ 按量。与执行任务时的预检用同一套判据（NewStrictPerCall + classify），
+// 所以这里显示「全部已维护」就意味着严格出账不会再被拦。
+func handleChannelModelBillingStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+	sourcePath := strings.TrimSpace(r.URL.Query().Get("logPath"))
+	if sourcePath == "" {
+		httpError(w, http.StatusBadRequest, "请选择一份已导出的日志")
+		return
+	}
+	path, err := resolveInBrowseRoot(sourcePath)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	headers, rows, err := billing.LoadLogRows(path, "", "")
+	if err != nil {
+		httpError(w, http.StatusUnprocessableEntity, "读取日志失败: "+err.Error())
+		return
+	}
+	cfg, err := billing.ChannelModelBillingMap(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	strict := billing.NewStrictPerCall(true, cfg, headers, rows)
+	items := billing.CollectPerCallStatus(headers, rows, strict)
+
+	names := map[int]string{}
+	if channels, err := billing.ListChannels(*pgConfig); err == nil {
+		for _, c := range channels {
+			names[c.ChannelID] = c.Name
+		}
+	}
+	pending := 0
+	for i := range items {
+		if n := names[items[i].ChannelID]; n != "" {
+			items[i].ChannelName = n
+		} else {
+			items[i].ChannelName = fmt.Sprintf("渠道 %d", items[i].ChannelID)
+		}
+		if items[i].Status == "none" {
+			pending++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"items": items, "pendingCount": pending, "totalRows": len(rows),
+	})
 }
 
 // handleSaveChannelModelBilling 保存或删除上游计费方式。

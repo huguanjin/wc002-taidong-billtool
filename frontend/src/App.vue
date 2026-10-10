@@ -4,6 +4,7 @@ import ChannelRatios from './ChannelRatios.vue'
 import Customers from './Customers.vue'
 import BillTasks from './BillTasks.vue'
 import CustomerDiscounts from './CustomerDiscounts.vue'
+import ChannelModelBilling from './ChannelModelBilling.vue'
 import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
@@ -1042,6 +1043,11 @@ async function handleSubmit() {
         :class="{ active: activePage === 'discounts' }"
         @click="activePage = 'discounts'"
       >客户折扣</button>
+      <button
+        type="button"
+        :class="{ active: activePage === 'upstreamBilling' }"
+        @click="activePage = 'upstreamBilling'"
+      >上游计费方式</button>
     </div>
 
     <!-- 账单导出任务：独立页面 -->
@@ -1069,6 +1075,12 @@ async function handleSubmit() {
     <CustomerDiscounts
       v-if="activePage === 'discounts'"
       ref="customerDiscountsRef"
+      @unauthorized="authenticated = false"
+    />
+
+    <!-- 上游计费方式（按次 / 按量）：独立页面 -->
+    <ChannelModelBilling
+      v-if="activePage === 'upstreamBilling'"
       @unauthorized="authenticated = false"
     />
 

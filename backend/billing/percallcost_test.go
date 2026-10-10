@@ -376,3 +376,36 @@ func TestStrictManualPerCallAppliesWithoutEvidence(t *testing.T) {
 	assert.InDelta(t, 1, r.PerCallUnits, 1e-9, "只有渠道 1 那一行按次")
 	assert.InDelta(t, 0.3+2.0*DefaultExchangeRate*0.7/DiscountBaseFactor, *r.UpstreamCostCNY, 1e-4)
 }
+
+// 维护页的核对：未维护 / 按次 / 按量三种状态都列出来，未维护排最前，按渠道分行。
+func TestCollectPerCallStatus(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		imgRow("gpt-image-2", "g", "1", "50000"),
+		imgRow("gpt-image-2", "g", "1", "50000"),
+		imgRow("gpt-image-2", "g", "2", "70000"),
+		imgRow("gpt-image-2", "g", "3", "90000"),
+		tokenRow("text-model", "g", "1", "1800000"), // 不是候选，不出现
+	}
+	cfg := map[ChannelModelKey]UpstreamBilling{
+		{1, "gpt-image-2"}: {Mode: UpstreamModePerCall, PerCallCNY: 0.05},
+		{2, "gpt-image-2"}: {Mode: UpstreamModePerToken},
+	}
+	got := CollectPerCallStatus(headers, rows, strictCfg(cfg, headers, rows))
+	require.Len(t, got, 3)
+	assert.Equal(t, "none", got[0].Status, "未维护的排最前")
+	assert.Equal(t, 3, got[0].ChannelID)
+
+	byCh := map[int]PerCallStatusItem{}
+	for _, it := range got {
+		byCh[it.ChannelID] = it
+	}
+	assert.Equal(t, UpstreamModePerCall, byCh[1].Status)
+	assert.InDelta(t, 0.05, byCh[1].PerCallCNY, 1e-12)
+	require.NotNil(t, byCh[1].EstCostCNY)
+	assert.InDelta(t, 0.1, *byCh[1].EstCostCNY, 1e-9, "2 次 × 0.05")
+	assert.Equal(t, UpstreamModePerToken, byCh[2].Status)
+	assert.Nil(t, byCh[2].EstCostCNY)
+
+	assert.Nil(t, CollectPerCallStatus(headers, rows, nil))
+}
