@@ -17,7 +17,17 @@ import (
 //     没维护的会像缺倍率一样拦下让用户就地补录——静默按倍率估只会得出一个看似正常的错数；
 //  3. 维护成「按量」的走原来的倍率路径；维护成「按次」的，成本 = 次数 × 单次费用（人民币）。
 //
-// 判据只看站内：上游怎么收费日志里没有，只能由人来维护；而站内是否按次是日志自带的证据。
+// 哪些 (渠道, 模型) 要维护：
+//
+//   - 已经维护过的：只要维护成按次，这个渠道上该模型的**每一行**都按次估成本，
+//     不再要求站内也是按次——同一个模型站内按量、上游按次是常见的（如图片模型）；
+//   - 没维护过、但日志里有「按次」的迹象的：拦下让人补。迹象有两种：站内 model_price > 0，
+//     或者这是一次图片生成/编辑请求（other.request_conversion 为 openai_image，或请求路径在 /v1/images/ 下）；
+//   - 其余（按量文本模型等）不要求维护，仍走倍率。想把这类模型也指定成按次，
+//     在渠道倍率页的「上游计费方式」里手工添加即可。
+//
+// 单次费用的单位是**额度值**（= quota ÷ 500000，数值上等于人民币）。
+// 没有站内单次价可反推时，一行请求算 1 次。
 
 // 上游计费方式。
 const (
@@ -45,9 +55,21 @@ type StrictPerCall struct {
 	Config map[ChannelModelKey]UpstreamBilling
 	// SitePrice 模型 → 站内单次价（日志 model_price），取自本批日志的消费行。
 	//
-	// 任务的退款/补扣行 other 里常常没有 model_price，但它们属于同一个按次模型，
-	// 判断「这是不是按次行」只能靠同批日志里这个模型的消费行。
+	// 任务的退款/补扣行 other 里常常没有 model_price，反推次数只能借同批日志里该模型的消费行。
 	SitePrice map[string]float64
+	// Candidates 本批日志里带「按次」迹象的模型（见文件头说明），退款/补扣行靠它判断。
+	Candidates map[string]bool
+}
+
+// perCallEvidence 一行日志有没有「按次」的迹象，以及站内单次价（没有则为 0）。
+func perCallEvidence(other string) (price float64, ok bool) {
+	if p := ParseModelPrice(other); p > 0 {
+		return p, true
+	}
+	if strings.Contains(other, `"openai_image"`) || strings.Contains(other, `"request_path":"/v1/images/`) {
+		return 0, true
+	}
+	return 0, false
 }
 
 // NewStrictPerCall 建立严格模式的判定上下文；enabled 为假时返回 nil。
@@ -57,7 +79,7 @@ func NewStrictPerCall(enabled bool, cfg map[ChannelModelKey]UpstreamBilling,
 	if !enabled {
 		return nil
 	}
-	s := &StrictPerCall{Config: cfg, SitePrice: map[string]float64{}}
+	s := &StrictPerCall{Config: cfg, SitePrice: map[string]float64{}, Candidates: map[string]bool{}}
 	if s.Config == nil {
 		s.Config = map[ChannelModelKey]UpstreamBilling{}
 	}
@@ -71,8 +93,12 @@ func NewStrictPerCall(enabled bool, cfg map[ChannelModelKey]UpstreamBilling,
 		if IsTaskQuotaAdjustment(other) {
 			continue
 		}
-		if p := ParseModelPrice(other); p > 0 {
-			s.SitePrice[strings.TrimSpace(cellAt(row, idxModel))] = p
+		model := strings.TrimSpace(cellAt(row, idxModel))
+		if p, ok := perCallEvidence(other); ok {
+			s.Candidates[model] = true
+			if p > 0 {
+				s.SitePrice[model] = p
+			}
 		}
 	}
 	return s
@@ -98,21 +124,25 @@ func (s *StrictPerCall) classify(channelID int, model, other string, adjustment 
 		return pcNotApplicable, UpstreamBilling{}, 0
 	}
 	model = strings.TrimSpace(model)
-	price := ParseModelPrice(other)
-	if price <= 0 && adjustment {
-		price = s.SitePrice[model]
-	}
-	if price <= 0 {
-		return pcNotApplicable, UpstreamBilling{}, 0
+	price, evidence := perCallEvidence(other)
+	if adjustment {
+		// 退款/补扣行自己没有迹象，借同批日志里该模型的消费行。
+		if price <= 0 {
+			price = s.SitePrice[model]
+		}
+		evidence = evidence || s.Candidates[model]
 	}
 	cfg, ok := s.Config[ChannelModelKey{ChannelID: channelID, Model: model}]
 	switch {
-	case !ok:
-		return pcPending, UpstreamBilling{}, price
-	case cfg.Mode == UpstreamModePerCall:
+	case ok && cfg.Mode == UpstreamModePerCall:
+		// 维护成按次的，不再看站内是否按次：这一行就是按次。
 		return pcPerCall, cfg, price
-	default:
+	case ok:
 		return pcPerToken, cfg, price
+	case evidence:
+		return pcPending, UpstreamBilling{}, price
+	default:
+		return pcNotApplicable, UpstreamBilling{}, 0
 	}
 }
 
@@ -123,7 +153,15 @@ func (s *StrictPerCall) classify(channelID int, model, other string, adjustment 
 // 由调用方把这个不确定如实带出去。退款/补扣行（adjustment）不要求整数——
 // 它冲抵的可能只是一部分张数，按比例折算才对。
 func PerCallUnits(delta, sitePrice, groupRatio float64, adjustment bool) (units float64, certain bool) {
-	if sitePrice <= 0 || groupRatio <= 0 {
+	if sitePrice <= 0 {
+		// 站内不是按次卖的，没有单价可反推张数：一行消费请求算 1 次；
+		// 退款/补扣行没法知道冲抵了几次，不冲（0 次）并标不确定，宁可成本偏高也不猜。
+		if adjustment {
+			return 0, false
+		}
+		return 1, true
+	}
+	if groupRatio <= 0 {
 		return 1, false
 	}
 	est := delta / (sitePrice * QuotaPerCNY * groupRatio)
@@ -195,8 +233,11 @@ type PerCallIssue struct {
 	Units float64 `json:"units"`
 	// SitePrice 站内单次价（model_price，倍率前，人民币口径），填单次费用时的参考：
 	// 上游单次费用通常低于它，高于它说明可能填错。
-	SitePrice float64  `json:"sitePrice"`
-	Groups    []string `json:"groups"`
+	SitePrice float64 `json:"sitePrice"`
+	// AvgSiteCNY 站内每次均价（站内金额 ÷ 次数，已含分组倍率），填单次费用时的参考：
+	// 上游单次费用应当低于它，否则这个渠道是亏本的。
+	AvgSiteCNY float64  `json:"avgSiteCny"`
+	Groups     []string `json:"groups"`
 	// AmountCNY 该组合在本次日志里的站内金额（净额度 ÷ QuotaPerCNY），按金额降序排，先补影响大的。
 	AmountCNY float64 `json:"amountCny"`
 }
@@ -286,6 +327,9 @@ func CollectPerCallIssues(headers []string, rows [][]string, strict *StrictPerCa
 		}
 		sort.Strings(a.issue.Groups)
 		a.issue.AmountCNY = round(a.issue.AmountCNY, MoneyDecimals)
+		if a.issue.Units > 0 {
+			a.issue.AvgSiteCNY = round(a.issue.AmountCNY/a.issue.Units, 6)
+		}
 		out = append(out, *a.issue)
 	}
 	sort.Slice(out, func(i, j int) bool {

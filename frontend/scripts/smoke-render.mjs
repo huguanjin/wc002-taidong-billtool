@@ -255,7 +255,7 @@ await scenario('被拦：按次计费模型待维护上游计费方式（草稿�
       totalRows: 10, uncostableRows: { no_percall_config: 3 }, missing: [],
       missingPerCall: [
         { channelId: 925, channelName: 'OAI-925', model: 'vid-1', rows: 3, units: 3, sitePrice: 0.12,
-          groups: ['oai'], amountCny: 12.5 },
+          groups: ['oai'], amountCny: 12.5, avgSiteCny: 0.1 },
         { channelId: 940, channelName: '', model: 'vid-2', rows: 1, units: 1, sitePrice: 0.3,
           groups: [], amountCny: 1 },
       ],

@@ -1494,10 +1494,10 @@ defineExpose({ loadAll })
       <!-- 放在上面那条 v-if / v-else-if / v-else 链**之后**：链中间不能插别的元素，
            否则 v-else 会找不到它的 v-if。 -->
       <p class="hint" v-if="planForm.checkCost && planForm.strictPerCall && planForm.billTemplate === 'simple'">
-        站内<strong>按次计费</strong>的模型（日志 model_price &gt; 0），上游不一定也按次收费，用倍率估成本会偏。
+        站内按次计费（日志 model_price &gt; 0）或图片生成/编辑类的模型，上游不一定按量收费，用倍率估成本会偏。
         勾选后这类模型所在的「渠道 + 模型」必须先维护上游计费方式：
-        <strong>按次</strong>填单次调用费用（人民币），成本 = 调用次数 × 单次费用；
-        <strong>按量</strong>沿用倍率估算。没维护的会先拦下，可在本页就地补录后继续
+        <strong>按次</strong>填单次调用费用（额度值），成本 = 调用次数 × 单次费用；
+        <strong>按量</strong>沿用倍率估算。同一模型在不同渠道要分别维护，没维护的会先拦下，可在本页就地补录后继续
         （<strong>继续执行会重新导一次日志</strong>）。按次计费的渠道不再要求填上游倍率。
       </p>
       <p class="hint" v-if="planForm.checkCost && planForm.reviewUpstream">
@@ -1670,9 +1670,11 @@ defineExpose({ loadAll })
       <div v-for="sec in blockedPerCallSections" :key="'pc-' + sec.taskId" class="blocked-task">
         <strong>{{ sec.taskName }} — 按次计费模型的上游计费方式</strong>
         <p class="hint">
-          这些模型在站内是按次卖的。<strong>按次</strong>：填上游每次调用的实际费用（人民币），
-          成本 = 次数 × 单次费用；<strong>按量</strong>：沿用上游倍率估算。
-          「站内单次价」是站内标价（未乘分组倍率），可作参考——上游单次费用通常低于它。
+          这些是日志里带「按次」迹象的模型（站内按次计价，或图片生成/编辑请求）。
+          <strong>同一个模型在不同渠道上游的收费方式可能不同，请按渠道逐行选择</strong>：
+          <strong>按次</strong>填上游每次调用的实际费用（额度值，即 quota ÷ 500000，数值上等于人民币），
+          成本 = 次数 × 单次费用；<strong>按量</strong>沿用该渠道的上游倍率估算。
+          「站内每次均价」是站内收客户的平均每次金额，上游单次费用应当低于它。
         </p>
         <div class="blocked-group">
           <table>
@@ -1681,11 +1683,11 @@ defineExpose({ loadAll })
                 <th>渠道</th>
                 <th>模型</th>
                 <th>分组</th>
-                <th>站内单次价</th>
                 <th>次数</th>
                 <th>站内金额</th>
+                <th>站内每次均价</th>
                 <th>上游计费方式</th>
-                <th>单次费用（¥/次）</th>
+                <th>单次费用（额度/次）</th>
               </tr>
             </thead>
             <tbody>
@@ -1693,9 +1695,9 @@ defineExpose({ loadAll })
                 <td>{{ it.channelId }} {{ it.channelName }}</td>
                 <td class="left">{{ it.model }}</td>
                 <td>{{ (it.groups || []).join('、') }}</td>
-                <td>{{ it.sitePrice }}</td>
                 <td>{{ it.units }}</td>
                 <td>¥{{ it.amountCny }}</td>
+                <td>{{ it.avgSiteCny ? it.avgSiteCny : '—' }}</td>
                 <td>
                   <select
                     :value="perCallDraftOf(it).mode"

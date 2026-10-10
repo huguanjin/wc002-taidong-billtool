@@ -93,13 +93,13 @@ func TestStrictPerCallCostIsUnitsTimesFee(t *testing.T) {
 	assert.InDelta(t, 0.48, *r.OfficialListUSD, 1e-9)
 }
 
-// 同一模型同一渠道，按次行与按量行混在一起：按次的走单次费用，按量的走倍率，互不串。
-func TestStrictMixedPerCallAndPerTokenRows(t *testing.T) {
+// 维护成按次只管那个 (渠道, 模型)：同渠道上的其它模型仍走倍率，互不串。
+func TestStrictPerCallOnlyAffectsThatChannelModel(t *testing.T) {
 	headers := simpleCostLogHeaders()
-	// 站内按量的行：quota=1800000、group_ratio 1.8 → 刊例 2 USD
 	rows := [][]string{
 		pcRow("m", "g", "1", "1"),
-		tokenRow("m", "g", "1", "1800000"),
+		// 同一渠道另一个按量模型：站内 quota=1800000、group_ratio 1.8 → 刊例 2 USD
+		tokenRow("n", "g", "1", "1800000"),
 	}
 	cfg := map[ChannelModelKey]UpstreamBilling{
 		{1, "m"}: {Mode: UpstreamModePerCall, PerCallCNY: 0.5},
@@ -110,12 +110,15 @@ func TestStrictMixedPerCallAndPerTokenRows(t *testing.T) {
 		Strict:         strictCfg(cfg, headers, rows),
 	})
 	require.NoError(t, err)
-	r := got[0]
-	require.NotNil(t, r.UpstreamCostCNY)
-	// 按量那行站内非按次，不受严格模式影响，仍按倍率估；按次那行 1 次 × 0.5。
-	want := 0.5 + 2.0*DefaultExchangeRate*0.7/DiscountBaseFactor
-	assert.InDelta(t, want, *r.UpstreamCostCNY, 1e-4)
-	assert.InDelta(t, 0.5, r.PerCallCostCNY, 1e-9, "只有按次那行计入按次成本")
+	byModel := map[string]SimpleBillRow{}
+	for _, r := range got {
+		byModel[r.Model] = r
+	}
+	require.NotNil(t, byModel["m"].UpstreamCostCNY)
+	assert.InDelta(t, 0.5, *byModel["m"].UpstreamCostCNY, 1e-9)
+	require.NotNil(t, byModel["n"].UpstreamCostCNY)
+	assert.InDelta(t, 2.0*DefaultExchangeRate*0.7/DiscountBaseFactor, *byModel["n"].UpstreamCostCNY, 1e-4)
+	assert.Zero(t, byModel["n"].PerCallCostCNY, "模型 n 没维护成按次，不计入按次成本")
 }
 
 // 维护成按量：沿用倍率路径，结果与不开严格模式一致。
@@ -291,4 +294,85 @@ func TestSimpleBillSummaryMentionsPerCall(t *testing.T) {
 	totals := SumSimpleBill(got)
 	text := FormatSimpleBillSummary(got, totals, 2026, 9, nil)
 	assert.Contains(t, text, "其中按次计费：2 次，上游成本 ¥1")
+}
+
+// imgRow 造一行站内按量的图片请求：model_price=-1，但走 /v1/images/ 且 request_conversion 为 openai_image。
+func imgRow(model, group, channel, quota string) []string {
+	return []string{model, group, "1000", "100", quota,
+		`{"model_price":-1,"model_ratio":2.5,"group_ratio":0.75,"request_conversion":["openai_image"],"request_path":"/v1/images/edits"}`,
+		"2", channel}
+}
+
+// 站内按量的图片请求也属于「按次候选」：没维护就拦，列出来的是 (渠道, 模型)，同一模型在不同渠道分别列。
+func TestStrictImageRequestsAreCandidatesPerChannel(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		imgRow("gpt-image-2", "g", "10", "50000"),
+		imgRow("gpt-image-2", "g", "10", "50000"),
+		imgRow("gpt-image-2", "g", "20", "70000"),
+		imgRow("gpt-image-2", "g", "30", "90000"),
+		tokenRow("text-model", "g", "10", "1800000"), // 文本按量模型不是候选
+	}
+	issues := CollectPerCallIssues(headers, rows, strictCfg(nil, headers, rows))
+	require.Len(t, issues, 3, "渠道 10/20/30 上的 gpt-image-2 各一项")
+	byCh := map[int]PerCallIssue{}
+	for _, is := range issues {
+		assert.Equal(t, "gpt-image-2", is.Model)
+		byCh[is.ChannelID] = is
+	}
+	assert.Equal(t, 2, byCh[10].Rows)
+	assert.InDelta(t, 2, byCh[10].Units, 1e-9, "没有站内单价时一行算 1 次")
+	assert.InDelta(t, 0.2, byCh[10].AmountCNY, 1e-9)
+	assert.InDelta(t, 0.1, byCh[10].AvgSiteCNY, 1e-9, "站内每次均价 = 金额 ÷ 次数")
+	assert.Zero(t, byCh[10].SitePrice)
+}
+
+// 用户的场景：同一模型在渠道 A 按次 0.1、渠道 B 按次 0.2、渠道 C 按量，三者各算各的。
+func TestStrictSameModelDifferentChannelsDifferentModes(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		imgRow("gpt-image-2", "g", "1", "100000"), // A
+		imgRow("gpt-image-2", "g", "1", "100000"),
+		imgRow("gpt-image-2", "g", "2", "100000"),  // B
+		imgRow("gpt-image-2", "g", "3", "1800000"), // C：按量，站内 quota 1.8M、group_ratio 0.75 → 刊例 4.8 USD
+	}
+	cfg := map[ChannelModelKey]UpstreamBilling{
+		{1, "gpt-image-2"}: {Mode: UpstreamModePerCall, PerCallCNY: 0.1},
+		{2, "gpt-image-2"}: {Mode: UpstreamModePerCall, PerCallCNY: 0.2},
+		{3, "gpt-image-2"}: {Mode: UpstreamModePerToken},
+	}
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+		CostColumns:    true,
+		UpstreamRatios: map[int]float64{3: 0.7}, // A、B 不需要倍率
+		Strict:         strictCfg(cfg, headers, rows),
+	})
+	require.NoError(t, err)
+	r := got[0]
+	require.NotNil(t, r.UpstreamCostCNY)
+	wantTokenPart := 4.8 * DefaultExchangeRate * 0.7 / DiscountBaseFactor
+	assert.InDelta(t, 2*0.1+1*0.2+wantTokenPart, *r.UpstreamCostCNY, 1e-4)
+	assert.InDelta(t, 3, r.PerCallUnits, 1e-9)
+	assert.InDelta(t, 0.4, r.PerCallCostCNY, 1e-9)
+	assert.Equal(t, 4, r.CostRows)
+	assert.Zero(t, r.PerCallUncertainRows)
+
+	// 全部维护后不再有待补项。
+	assert.Empty(t, CollectPerCallIssues(headers, rows, strictCfg(cfg, headers, rows)))
+}
+
+// 手工指定成按次的 (渠道, 模型)，即使日志里没有任何按次迹象，该渠道上该模型的每一行也按次估。
+func TestStrictManualPerCallAppliesWithoutEvidence(t *testing.T) {
+	headers := simpleCostLogHeaders()
+	rows := [][]string{
+		tokenRow("text-model", "g", "1", "1800000"),
+		tokenRow("text-model", "g", "2", "1800000"),
+	}
+	cfg := map[ChannelModelKey]UpstreamBilling{{1, "text-model"}: {Mode: UpstreamModePerCall, PerCallCNY: 0.3}}
+	got, err := AggregateSimpleBill(rows, headers, SimpleBillOptions{
+		CostColumns: true, UpstreamRatios: map[int]float64{2: 0.7}, Strict: strictCfg(cfg, headers, rows),
+	})
+	require.NoError(t, err)
+	r := got[0]
+	assert.InDelta(t, 1, r.PerCallUnits, 1e-9, "只有渠道 1 那一行按次")
+	assert.InDelta(t, 0.3+2.0*DefaultExchangeRate*0.7/DiscountBaseFactor, *r.UpstreamCostCNY, 1e-4)
 }

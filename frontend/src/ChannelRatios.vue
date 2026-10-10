@@ -207,6 +207,52 @@ const perCallError = ref('')
 const perCallMessage = ref('')
 const savingPerCall = ref(false)
 
+// 手工添加：日志里没有按次迹象、但你知道某渠道上游对某模型按次收费时，直接在这里指定。
+const newPerCall = ref({ channelId: '', model: '', mode: 'per_call', fee: '' })
+
+async function addPerCall() {
+  perCallError.value = ''
+  perCallMessage.value = ''
+  const channelId = Number(String(newPerCall.value.channelId ?? '').trim())
+  const model = String(newPerCall.value.model ?? '').trim()
+  if (!Number.isInteger(channelId) || channelId <= 0 || model === '') {
+    perCallError.value = '请填写渠道号（正整数）与模型名'
+    return
+  }
+  let item
+  if (newPerCall.value.mode === 'per_call') {
+    const fee = Number(String(newPerCall.value.fee ?? '').trim())
+    if (!Number.isFinite(fee) || fee <= 0) {
+      perCallError.value = '按次的单次费用必须是大于 0 的数字'
+      return
+    }
+    item = { channelId, model, mode: 'per_call', perCallCny: fee }
+  } else {
+    item = { channelId, model, mode: 'per_token', perCallCny: 0 }
+  }
+  savingPerCall.value = true
+  try {
+    const resp = await fetch('/api/save-channel-model-billing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [item] }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      perCallError.value = data.error || `添加失败（${resp.status}）`
+      return
+    }
+    perCallMessage.value = '已添加'
+    newPerCall.value = { channelId: '', model: '', mode: newPerCall.value.mode, fee: '' }
+    await loadPerCall()
+  } catch (err) {
+    perCallError.value = '添加失败：' + err.message
+  } finally {
+    savingPerCall.value = false
+  }
+}
+
 function perCallKey(it) {
   return `${it.channelId}|${it.model}`
 }
@@ -429,9 +475,28 @@ defineExpose({ loadChannels })
     <h3 class="sub-title">按次计费模型的上游计费方式</h3>
     <p class="hint">
       账单任务勾了「成本严格区分按次计费模型」时，站内按次卖的模型需要在这里（或执行被拦下时就地）告诉我们上游怎么收费：
-      <strong>按次</strong>填上游每次调用的实际费用（人民币），成本 = 次数 × 单次费用；
-      <strong>按量</strong>沿用上面的上游倍率估算。按渠道 + 模型分别维护。
+      <strong>按次</strong>填上游每次调用的实际费用（额度值，即 quota ÷ 500000，数值上等于人民币），成本 = 次数 × 单次费用；
+      <strong>按量</strong>沿用上面的上游倍率估算。<strong>同一个模型在不同渠道要分别维护</strong>
+      （例如渠道 A 每次 0.1、渠道 B 每次 0.2、渠道 C 按量）。维护成按次后，该渠道上这个模型的每一行都按次估算。
     </p>
+    <div class="path-row">
+      <input v-model="newPerCall.channelId" type="number" min="1" placeholder="渠道号" class="ratio-input" />
+      <input v-model="newPerCall.model" type="text" placeholder="模型名，如 gpt-image-2" />
+      <select v-model="newPerCall.mode">
+        <option value="per_call">按次</option>
+        <option value="per_token">按量</option>
+      </select>
+      <input
+        v-if="newPerCall.mode === 'per_call'"
+        v-model="newPerCall.fee"
+        type="number"
+        step="0.0001"
+        min="0"
+        placeholder="单次费用（额度/次）"
+        class="ratio-input"
+      />
+      <button type="button" class="btn-browse" @click="addPerCall" :disabled="savingPerCall">添加</button>
+    </div>
     <div class="path-row">
       <button type="button" class="btn-browse" @click="savePerCall" :disabled="savingPerCall || perCallPending === 0">
         {{ savingPerCall ? '保存中…' : `保存${perCallPending > 0 ? `（${perCallPending}）` : ''}` }}
@@ -445,7 +510,7 @@ defineExpose({ loadChannels })
           <th>渠道</th>
           <th>模型</th>
           <th>上游计费方式</th>
-          <th>单次费用（¥/次）</th>
+          <th>单次费用（额度/次）</th>
           <th>操作</th>
         </tr>
       </thead>
