@@ -439,14 +439,13 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		for _, c := range cfg.channels {
 			params.ChannelKnownIDs[c.ChannelID] = true
 		}
-		// 渠道名与渠道信息只有模板一写成本利润表时才用得上。
-		if !IsSimpleBillTemplate(task.BillTemplate) {
-			params.ChannelNames = make(map[int]string, len(cfg.channels))
-			params.ChannelInfos = make(map[int]ChannelInfo, len(cfg.channels))
-			for _, c := range cfg.channels {
-				params.ChannelNames[c.ChannelID] = c.Name
-				params.ChannelInfos[c.ChannelID] = c.ChannelInfo
-			}
+		// 渠道名：模板一的成本利润表与模板二成本表的渠道明细都要显示；
+		// 渠道信息（ChannelInfos）只有模板一做倍率检查时用得上。
+		params.ChannelNames = make(map[int]string, len(cfg.channels))
+		params.ChannelInfos = make(map[int]ChannelInfo, len(cfg.channels))
+		for _, c := range cfg.channels {
+			params.ChannelNames[c.ChannelID] = c.Name
+			params.ChannelInfos[c.ChannelID] = c.ChannelInfo
 		}
 	}
 

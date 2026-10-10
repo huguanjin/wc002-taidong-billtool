@@ -224,8 +224,9 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		// 严格模式只在算成本时有意义；与出账前的预检用同一份配置与同一套判据。
 		Strict: NewStrictPerCall(params.StrictPerCall && params.CheckCost,
 			params.ChannelModelBilling, headers, rows),
+		ChannelNames: params.ChannelNames,
 	}
-	summaryRows, err := AggregateSimpleBill(rows, headers, opts)
+	summaryRows, channelRows, err := AggregateSimpleBillDetailed(rows, headers, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +271,7 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 	var costPath string
 	if params.CheckCost {
 		costPath = filepath.Join(outputDir, withCustomerSuffix(simpleCostName(stem), params.CustomerName)+".xlsx")
-		if err := WriteSimpleBill(costPath, summaryRows, "成本表", SimpleBillWriteOptions{CostTable: true}); err != nil {
+		if err := WriteSimpleBill(costPath, summaryRows, "成本表", SimpleBillWriteOptions{CostTable: true, ChannelRows: channelRows}); err != nil {
 			return nil, fmt.Errorf("写出成本表失败: %w", err)
 		}
 	}

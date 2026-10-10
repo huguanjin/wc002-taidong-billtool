@@ -155,6 +155,8 @@ type SimpleBillOptions struct {
 	ExchangeRate float64
 	// Strict 严格区分按次计费的判定上下文，nil = 关闭（见 StrictPerCall）。
 	Strict *StrictPerCall
+	// ChannelNames 渠道号 → 渠道名，只用于渠道明细的展示，可为 nil。
+	ChannelNames map[int]string
 }
 
 // Rate 取汇率，未设置时回退默认值。导出是因为调用方记录「本次实际用的汇率」
@@ -352,6 +354,16 @@ func DescribeSkipReasons(reasons map[string]int) string {
 // 这个汇总行的官方刊例（要的输入更少）照写，成本与利润则整体留空：
 // 报一个「部分渠道算了、部分没算」的成本比不报更危险，它看着像完整的。
 func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptions) ([]SimpleBillRow, error) {
+	out, _, err := AggregateSimpleBillDetailed(rows, headers, opts)
+	return out, err
+}
+
+// AggregateSimpleBillDetailed 同 AggregateSimpleBill，另按 (分组, 模型, 渠道) 再拆一层返回。
+//
+// 渠道明细在**同一个循环里**与汇总行一起累加，不是事后另算一遍：
+// 两处各算一遍迟早会因为某个分支漏改而对不上，同一个循环里累加则各渠道行之和必然等于汇总行。
+// 只在 opts.CostColumns 时才有渠道明细（没开成本核算就没有渠道维度的意义）。
+func AggregateSimpleBillDetailed(rows [][]string, headers []string, opts SimpleBillOptions) ([]SimpleBillRow, []SimpleBillChannelRow, error) {
 	col := map[string]int{}
 	for i, h := range headers {
 		if h != "" {
@@ -366,7 +378,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("日志缺少列: %v；实际列: %v（简易账单需要 model_name/group/prompt_tokens/completion_tokens/quota）", missing, headers)
+		return nil, nil, fmt.Errorf("日志缺少列: %v；实际列: %v（简易账单需要 model_name/group/prompt_tokens/completion_tokens/quota）", missing, headers)
 	}
 
 	idxModel := col["model_name"]
@@ -413,6 +425,14 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 	costs := map[key]*costAcc{}
 	rate := opts.rateOr()
 
+	// 渠道维度的累加器（见 simplebill_channel.go）。
+	type chKey struct {
+		group, model string
+		channel      int
+	}
+	chBuckets := map[chKey]*simpleChannelAcc{}
+	var chOrder []chKey
+
 	for _, row := range rows {
 		if len(row) == 0 {
 			continue
@@ -441,6 +461,26 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		}
 		ca := costs[k]
 
+		// 渠道维度：只在算成本时才拆。取不到渠道号记 0，一行经多个渠道记 -1。
+		var cha *simpleChannelAcc
+		if opts.CostColumns {
+			chID := 0
+			switch ids := rowChannelIDs(row, idxChannel, hasChannel, idxOther, hasOther); {
+			case len(ids) == 1:
+				chID = ids[0]
+			case len(ids) > 1:
+				chID = -1
+			}
+			ck := chKey{group, model, chID}
+			cha = chBuckets[ck]
+			if cha == nil {
+				cha = &simpleChannelAcc{row: SimpleBillChannelRow{ChannelID: chID, Group: group, Model: model}}
+				chBuckets[ck] = cha
+				chOrder = append(chOrder, ck)
+			}
+			cha.row.TotalRows++
+		}
+
 		// 这一行的净额度增量。退款行拿它去**减**，
 		// 与 AggRow.SiteCNY 同一符号约定；消费行就是它本身。
 		delta := quota
@@ -459,6 +499,9 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			}
 			delta = -d
 			r.TotalQuota += delta
+			if cha != nil {
+				cha.row.TotalQuota += delta
+			}
 		} else {
 			r.HitCount++
 			r.TotalPrompt += ToFloat(cellAt(row, idxPrompt))
@@ -470,6 +513,14 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			cacheRead, cacheWrite5m, cacheWrite1h := rowCacheTokens(row, col, other)
 			r.TotalCacheRead += cacheRead
 			r.TotalCacheCreation += cacheWrite5m + cacheWrite1h
+			if cha != nil {
+				cha.row.HitCount++
+				cha.row.TotalPrompt += ToFloat(cellAt(row, idxPrompt))
+				cha.row.TotalCompletion += ToFloat(cellAt(row, idxCompletion))
+				cha.row.TotalQuota += quota
+				cha.row.TotalCacheRead += cacheRead
+				cha.row.TotalCacheCreation += cacheWrite5m + cacheWrite1h
+			}
 		}
 
 		if !opts.CostColumns {
@@ -488,6 +539,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		if reason != SkipNone {
 			// zero_delta 不计入缺失：额度为 0 的行本来就不影响成本，
 			// 把它算进去会让用户去补一堆无关的倍率。
+			cha.skip(reason, delta)
 			if reason != SkipZeroDelta {
 				ca.skippedQuota += delta
 				if ca.skipReasons == nil {
@@ -502,6 +554,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		if !ok || costRatio <= 0 {
 			// RowCostReason 只判渠道与倍率，group_ratio 在它之后判：
 			// 反推刊例需要 group_ratio，没有它就把这一行算作缺分组倍率。
+			cha.skip(SkipNoGroupRatio, delta)
 			ca.skippedQuota += delta
 			if ca.skipReasons == nil {
 				ca.skipReasons = map[string]int{}
@@ -512,6 +565,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		upstream := opts.UpstreamRatios[ids[0]]
 		domestic := opts.DomesticChannels[ids[0]]
 		ca.rows++
+		cha.rows++
 
 		// 反推出来的刊例，仍是 quota 量纲（分组倍率这一个因子已除掉，见 officialQuota 的说明）。
 		// 净额口径与 TotalQuota 一致（退款行为负），否则同一条退款在
@@ -527,6 +581,7 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			listQuota /= rate
 		}
 		ca.officialQuota += listQuota
+		cha.officialQuota += listQuota
 		// 成本逐行算再累加，而不是「汇总刊例 × 某个倍率」：
 		// 一个 (分组, 模型) 横跨多个渠道时，各渠道倍率不同，只有逐行加权才对。
 		//
@@ -553,9 +608,24 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			if !certain {
 				ca.perCallUncertain++
 			}
+			cha.upstreamC += cost
+			cha.perCallUnits += units
+			cha.perCallCNY += cost
+			cha.perCallRows++
+			cha.perCallDelta += delta
+			cha.fee = plan.FeeCNY
+			if !certain {
+				cha.perCallUncertain++
+			}
 			continue
 		}
-		ca.upstreamCNY += listQuota / QuotaPerCNY * rate * UpstreamDiscountFor(upstream, domestic)
+		rowCost := listQuota / QuotaPerCNY * rate * UpstreamDiscountFor(upstream, domestic)
+		ca.upstreamCNY += rowCost
+		cha.upstreamC += rowCost
+		cha.ratioRows++
+		cha.ratioDelta += delta
+		cha.ratioListRaw += delta / costRatio
+		cha.ratioListAdj += listQuota
 	}
 
 	out := make([]SimpleBillRow, 0, len(buckets))
@@ -593,6 +663,14 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		out = append(out, *r)
 	}
 
+	// 渠道明细收口。
+	var chOut []SimpleBillChannelRow
+	if opts.CostColumns {
+		for _, ck := range chOrder {
+			chOut = append(chOut, chBuckets[ck].finalize(opts, rate))
+		}
+	}
+
 	// 分组按首次出现顺序（与日志里各分组的自然顺序一致），组内按次数降序——
 	// 与示例 SQL 的 ORDER BY `group`, hit_count DESC 对齐，客户对账时行序不用重新找。
 	groupRank := map[string]int{}
@@ -610,7 +688,21 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		}
 		return out[i].Model < out[j].Model
 	})
-	return out, nil
+	// 渠道明细：分组按首次出现顺序、组内按模型名、同模型内按金额降序（亏损的渠道不会被埋在后面）。
+	sort.SliceStable(chOut, func(i, j int) bool {
+		a, b := chOut[i], chOut[j]
+		if a.Group != b.Group {
+			return groupRank[a.Group] < groupRank[b.Group]
+		}
+		if a.Model != b.Model {
+			return a.Model < b.Model
+		}
+		if a.TotalCostCNY != b.TotalCostCNY {
+			return a.TotalCostCNY > b.TotalCostCNY
+		}
+		return a.ChannelID < b.ChannelID
+	})
+	return out, chOut, nil
 }
 
 // rowUpstreamRatio 取这一行适用的上游倍率。
@@ -692,6 +784,9 @@ func columnIndex(headers []string, name string) (int, bool) {
 
 // SimpleBillWriteOptions 写出模板二时的开关。
 type SimpleBillWriteOptions struct {
+	// ChannelRows 非空时，成本表里追加「渠道明细」「渠道汇总」两张附表（只对 CostTable 有效，
+	// 客户版文件里不会出现采购倍率与单笔毛利）。
+	ChannelRows []SimpleBillChannelRow
 	// CostTable 写出成本表（汇总表的全部列 + 成本三列）而不是客户版账单。
 	//
 	// **只有成本表为 true**。成本三列是站点的内部数据（采购价与单笔毛利），
@@ -950,6 +1045,12 @@ func WriteSimpleBill(path string, rows []SimpleBillRow, sheetName string, opts S
 		letter, _ := excelize.ColumnNumberToName(col + 1)
 		if err := f.SetColWidth(sheet, letter, letter, w); err != nil {
 			return err
+		}
+	}
+
+	if opts.CostTable && len(opts.ChannelRows) > 0 {
+		if err := writeChannelSheets(f, opts.ChannelRows); err != nil {
+			return fmt.Errorf("写出渠道明细失败: %w", err)
 		}
 	}
 
