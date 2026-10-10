@@ -320,6 +320,11 @@ type Params struct {
 	// 命中的 (模型,分组) 不参与折扣反推——模型名推厂商家族覆盖不全，识别不到时
 	// 会静默按海外处理、折扣悄悄算错，这里给用户一个显式兜底。
 	DomesticMarkers []string
+
+	// StrictPerCall 严格区分按次计费（见 percallcost.go），目前只对模板二的成本三列生效。
+	// ChannelModelBilling 是 (渠道, 模型) → 上游计费方式，由调用方从本地 PG 读好传入。
+	StrictPerCall       bool
+	ChannelModelBilling map[ChannelModelKey]UpstreamBilling
 }
 
 // RowDetails 脱敏日志需要额外展开的单行明细，全部来自日志 other 字段

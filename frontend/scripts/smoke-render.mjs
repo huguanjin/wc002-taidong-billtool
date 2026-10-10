@@ -232,6 +232,41 @@ await scenario('计划表单：成本核算关闭 → 核对开关禁用且不�
   regex: [[/<input[^>]*type="checkbox"[^>]*disabled[^>]*>\s*执行时核对/, '成本核算关闭时核对开关应为禁用']],
 })
 
+await scenario('计划表单：简易模板 + 严格区分按次计费 → 说明出现', BillTasks, {
+  showPlanForm: true,
+  customers: [{ id: 1, name: '龙树', usernames: 'longshu' }],
+  planForm: { id: 0, customerId: 1, name: '', startAt: '', endAt: '', generateSanitized: true,
+    generateCost: true, checkCost: true, reviewUpstream: false, strictPerCall: true,
+    useManualDiscount: false, billTemplate: 'simple' },
+}, { has: ['成本严格区分按次计费模型', '单次调用费用'] })
+
+await scenario('计划表单：标准模板不显示严格按次开关', BillTasks, {
+  showPlanForm: true,
+  customers: [{ id: 1, name: '龙树', usernames: 'longshu' }],
+  planForm: { id: 0, customerId: 1, name: '', startAt: '', endAt: '', generateSanitized: true,
+    generateCost: true, checkCost: true, reviewUpstream: false, strictPerCall: true,
+    useManualDiscount: false, billTemplate: '' },
+}, { hasNot: ['成本严格区分按次计费模型'] })
+
+await scenario('被拦：按次计费模型待维护上游计费方式（草稿混着已选/未选）', BillTasks, {
+  tasks: [task()],
+  runResults: [blockedResult({
+    channelCheck: {
+      totalRows: 10, uncostableRows: { no_percall_config: 3 }, missing: [],
+      missingPerCall: [
+        { channelId: 925, channelName: 'OAI-925', model: 'vid-1', rows: 3, units: 3, sitePrice: 0.12,
+          groups: ['oai'], amountCny: 12.5 },
+        { channelId: 940, channelName: '', model: 'vid-2', rows: 1, units: 1, sitePrice: 0.3,
+          groups: [], amountCny: 1 },
+      ],
+    },
+  })],
+  blockedPerCallDraft: { '925|vid-1': { mode: 'per_call', fee: '0.5' } },
+}, {
+  has: ['按次计费模型的上游计费方式', 'vid-1', 'vid-2', 'OAI-925', '按次计费模型未维护上游计费方式'],
+  notRegex: [[/执行失败 \d+ 条/, '被拦下不是失败']],
+})
+
 await scenario('核对窗口打开', BillTasks, {
   tasks: [task()],
   runResults: [reviewResult()],
@@ -445,6 +480,35 @@ const same = (label, got, want) => {
 }
 
 console.log('检查三：BillTasks.vue 交互逻辑')
+{
+  const vm = await mount(BillTasks, {
+    runResults: [blockedResult({
+      channelCheck: {
+        missing: [],
+        missingPerCall: [
+          { channelId: 925, model: 'a', groups: [] },
+          { channelId: 940, model: 'b', groups: [] },
+        ],
+      },
+    }), blockedResult({
+      taskId: 9,
+      channelCheck: { missing: [], missingPerCall: [{ channelId: 925, model: 'a', groups: [] }] },
+    })],
+    blockedPerCallDraft: {
+      '925|a': { mode: 'per_call', fee: '0.5' },
+      '940|b': { mode: 'per_token', fee: '' },
+    },
+  })
+  same('按次草稿整理：同一 (渠道,模型) 跨计划只提交一次，按量费用记 0', vm.blockedPerCallItems().items, [
+    { channelId: 925, model: 'a', mode: 'per_call', perCallCny: 0.5 },
+    { channelId: 940, model: 'b', mode: 'per_token', perCallCny: 0 },
+  ])
+  vm.blockedPerCallDraft = { '925|a': { mode: 'per_call', fee: '0' }, '940|b': { mode: '', fee: '' } }
+  same('按次的单次费用为 0 会被拒绝（否则成本被读成上游免费）', typeof vm.blockedPerCallItems().error, 'string')
+  vm.blockedPerCallDraft = { '925|a': { mode: '', fee: '' } }
+  same('一个都没选 → 没有可提交项', vm.blockedPerCallItems().items, [])
+}
+
 
 {
   const vm = await mount(BillTasks, {

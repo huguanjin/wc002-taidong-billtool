@@ -72,6 +72,9 @@ func main() {
 		if err := billing.EnsureChannelSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化渠道倍率表失败，成本估算功能可能不可用: %v", err)
 		}
+		if err := billing.EnsureChannelModelBillingSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化上游计费方式表失败，严格区分按次计费功能可能不可用: %v", err)
+		}
 		if err := billing.EnsureCustomerSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化客户信息表失败，客户管理与账单任务功能可能不可用: %v", err)
 		}
@@ -107,6 +110,8 @@ func main() {
 	mux.HandleFunc("/api/pull-channels", withCORS(requireAuth(handlePullChannels)))
 	mux.HandleFunc("/api/channels", withCORS(requireAuth(handleChannels)))
 	mux.HandleFunc("/api/channel-ratios", withCORS(requireAuth(handleSaveChannelRatios)))
+	mux.HandleFunc("/api/channel-model-billing", withCORS(requireAuth(handleChannelModelBilling)))
+	mux.HandleFunc("/api/save-channel-model-billing", withCORS(requireAuth(handleSaveChannelModelBilling)))
 	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
 	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
 	mux.HandleFunc("/api/delete-customer", withCORS(requireAuth(handleDeleteCustomer)))
@@ -817,6 +822,9 @@ type taskInput struct {
 	// 「没传」与「传了 false」必须区分——老版本前端编辑一次计划不带这个字段，
 	// 用值类型的话会把用户勾上的核对开关悄悄取消。与 CheckCost 同一个理由。
 	ReviewUpstream *bool `json:"reviewUpstream"`
+	// StrictPerCall 用指针：false 是有效值，「没传」与「传了 false」必须区分
+	// （老前端编辑一次计划不该悄悄取消已勾的开关）。与 ReviewUpstream 同一个理由。
+	StrictPerCall *bool `json:"strictPerCall"`
 	// BillTemplate 用指针：空串是**有效值**（= 标准模板），所以「没传这个字段」
 	// 与「传了空串」必须区分开。否则老版本前端编辑一次计划，就会把用户选的
 	// 简易模板重置成标准模板——而且不会有任何提示。
@@ -876,6 +884,9 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	if in.ReviewUpstream != nil {
 		task.ReviewUpstream = *in.ReviewUpstream
 	}
+	if in.StrictPerCall != nil {
+		task.StrictPerCall = *in.StrictPerCall
+	}
 	if in.BillTemplate != nil {
 		task.BillTemplate = strings.TrimSpace(*in.BillTemplate)
 	}
@@ -928,7 +939,7 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 	}
 	// 模板同理：没传就保留库里的值，别把用户选的简易模板悄悄重置成标准模板。
 	// 成本核算开关一起处理：没传时若走默认值 true，会把用户明确取消的勾选又打开。
-	if in.BillTemplate == nil || in.CheckCost == nil || in.UseManualDiscount == nil || in.ReviewUpstream == nil {
+	if in.BillTemplate == nil || in.CheckCost == nil || in.UseManualDiscount == nil || in.ReviewUpstream == nil || in.StrictPerCall == nil {
 		if existing, err := billing.GetBillTask(*pgConfig, in.ID); err == nil {
 			if in.BillTemplate == nil {
 				task.BillTemplate = existing.BillTemplate
@@ -941,6 +952,9 @@ func handleSaveBillTask(w http.ResponseWriter, r *http.Request) {
 			}
 			if in.ReviewUpstream == nil {
 				task.ReviewUpstream = existing.ReviewUpstream
+			}
+			if in.StrictPerCall == nil {
+				task.StrictPerCall = existing.StrictPerCall
 			}
 		}
 	}
@@ -1394,6 +1408,87 @@ func handleChannels(w http.ResponseWriter, r *http.Request) {
 		// 页面算「折合官方折扣」用，见 handleRunBillTasks 里同名字段的说明。
 		"discountBaseFactor": billing.DiscountBaseFactor,
 	})
+}
+
+// handleChannelModelBilling 读出全部已维护的上游计费方式（渠道 + 模型维度）。
+func handleChannelModelBilling(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+	items, err := billing.ListChannelModelBilling(*pgConfig)
+	if err != nil {
+		httpError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// 带上渠道名，页面不用再去对渠道清单。
+	names := map[int]string{}
+	if channels, err := billing.ListChannels(*pgConfig); err == nil {
+		for _, c := range channels {
+			names[c.ChannelID] = c.Name
+		}
+	}
+	type row struct {
+		billing.ChannelModelBillingRow
+		ChannelName string `json:"channelName"`
+	}
+	out := make([]row, 0, len(items))
+	for _, it := range items {
+		name := names[it.ChannelID]
+		if name == "" {
+			name = fmt.Sprintf("渠道 %d", it.ChannelID)
+		}
+		out = append(out, row{it, name})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"items": out})
+}
+
+// handleSaveChannelModelBilling 保存或删除上游计费方式。
+//
+// delete 为真时删除该项（回到「未维护」）；否则按 mode 保存。
+// 按次的单次费用必须大于 0（见 ChannelModelBillingInput.Validate）。
+func handleSaveChannelModelBilling(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*）")
+		return
+	}
+	var body struct {
+		Items []struct {
+			billing.ChannelModelBillingInput
+			Delete bool `json:"delete"`
+		} `json:"items"`
+	}
+	if !decodeJSONBody(w, r, &body) {
+		return
+	}
+	if len(body.Items) == 0 {
+		httpError(w, http.StatusBadRequest, "没有要保存的项")
+		return
+	}
+	var saves []billing.ChannelModelBillingInput
+	for _, it := range body.Items {
+		if it.Delete {
+			if err := billing.DeleteChannelModelBilling(*pgConfig, it.ChannelID, it.Model); err != nil {
+				httpError(w, http.StatusBadGateway, err.Error())
+				return
+			}
+			continue
+		}
+		saves = append(saves, it.ChannelModelBillingInput)
+	}
+	if err := billing.UpsertChannelModelBilling(*pgConfig, saves); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"saved": len(saves), "deleted": len(body.Items) - len(saves)})
 }
 
 // handleSaveChannelRatios 批量保存渠道上游倍率。

@@ -223,6 +223,21 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 	// 用户已经填好计划参数，硬报错会让他白填一遍。页面拿到 blocked 结果后就地补录，
 	// 保存后重新执行即可。
 	var blocked *ChannelCheckResult
+
+	// 严格区分按次计费：目前只对简易账单的成本三列生效，且需要开着成本核算。
+	// 上游计费方式的配置只读一次，预检与出账共用（同 loadUpstream 的理由）。
+	strictOn := task.StrictPerCall && task.CheckCost && IsSimpleBillTemplate(task.BillTemplate)
+	var perCallCfg map[ChannelModelKey]UpstreamBilling
+	if strictOn {
+		var perr error
+		perCallCfg, perr = ChannelModelBillingMap(deps.PG)
+		if perr != nil {
+			// 读失败不能静默降级成「不严格」：那样会照常出一张把按次模型按倍率估的成本，
+			// 数字看着正常却是错的，比直接失败危险。
+			return nil, fmt.Errorf("读取上游计费方式失败: %w", perr)
+		}
+	}
+
 	if task.CheckCost || task.GenerateCost {
 		headers, rows, rerr := loadForCheck()
 		if rerr != nil {
@@ -245,7 +260,18 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		// 「没有渠道号的行」直接跳过。于是这些行对预检完全隐形，预检放行，
 		// 出账时它们却被判为缺失——用户看到「预检通过」却在账单上读到
 		// 「392 行缺少渠道倍率或分组倍率」，而且重跑再也不会弹出补录界面。
-		counts, missingRatios, rowsPerChannel := CountRowCostReasons(headers, rows, ratios)
+		strict := NewStrictPerCall(strictOn, perCallCfg, headers, rows)
+		counts, missingRatios, rowsPerChannel := CountRowCostReasonsStrict(headers, rows, ratios, strict)
+
+		// 站内按次、上游计费方式还没维护的 (渠道, 模型)：和缺倍率一样拦下让用户就地补录。
+		perCallIssues := CollectPerCallIssues(headers, rows, strict)
+		for i := range perCallIssues {
+			if info, ok := infoMap[perCallIssues[i].ChannelID]; ok {
+				perCallIssues[i].ChannelName = info.Name
+			} else {
+				perCallIssues[i].ChannelName = fmt.Sprintf("渠道 %d（不在渠道清单里）", perCallIssues[i].ChannelID)
+			}
+		}
 
 		// 用同一份行级统计填结果，无论走不走 CheckChannelRatios 都是这几个数——
 		// 免得同一个「缺多少行」在两条分支上有两个来源。
@@ -267,6 +293,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 
 		check := ChannelCheckResult{}
 		fill(&check)
+		check.MissingPerCall = perCallIssues
 
 		// 渠道观测事实（行数、金额、分组、模型）：核对弹窗与待补录面板都要，只扫一次。
 		var obs map[int]*ChannelObservation
@@ -300,6 +327,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 			usage, _ := ExtractChannelUsage(headers, rows)
 			check = CheckChannelRatios(usage, ratios, domestic, infoMap, rowsPerChannel)
 			fill(&check)
+			check.MissingPerCall = perCallIssues
 			// 补录面板里填倍率的同时要能判断「这是不是国模渠道」，所以带上模型信息。
 			EnrichIssues(check.Missing, observe())
 		}
@@ -314,7 +342,7 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		// 清单里没有的渠道照样能填。从前把清单外的渠道归成"补不了"而不拦，
 		// 结果是一批新渠道永远算不出成本、页面上还没地方可填——
 		// 用户只看到账单上那句「392 行…」，却找不到任何入口。
-		if len(check.Missing) > 0 {
+		if len(check.Missing) > 0 || len(check.MissingPerCall) > 0 {
 			blocked = &check
 		}
 		if blocked != nil {
@@ -377,6 +405,8 @@ func RunBillExportTask(deps TaskRunDeps) (*TaskRunResult, error) {
 		DomesticMarkers:      settings.DomesticMarkerList(),
 		GenerateCost:         task.GenerateCost,
 		CheckCost:            task.CheckCost,
+		StrictPerCall:        strictOn,
+		ChannelModelBilling:  perCallCfg,
 		BillTemplate:         task.BillTemplate,
 		SummaryHeader:        summaryHeader(customer, start, end),
 		// 产物文件名带上客户名：一个 job 目录里可能同时躺着好几个客户的表，

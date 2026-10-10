@@ -57,6 +57,12 @@ type BillTask struct {
 	// 默认**不勾**：它会打断每一次执行，只有需要逐期核对上游数据的计划才开。
 	// 它依附于成本核算：既没开成本核算、也没勾生成成本利润表时没有上游成本可核对，此时它不生效。
 	ReviewUpstream bool `json:"reviewUpstream"`
+	// StrictPerCall 成本估算时严格区分按次计费的模型（见 percallcost.go）。
+	//
+	// 默认**不勾**：勾上后站内按次计费的 (渠道, 模型) 必须先维护上游计费方式，
+	// 没维护的会拦下执行让用户就地补，这会改变执行流程，不该替老计划悄悄开启。
+	// 目前只对简易账单（模板二）的成本三列生效。
+	StrictPerCall bool `json:"strictPerCall"`
 	// UseManualDiscount 是否应用该客户手工维护的「分组 → 折扣」。
 	//
 	// 手工折扣指线下谈定、没同步到 new-api 分组倍率里的那些（见 CustomerGroupDiscountMap）。
@@ -201,6 +207,7 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 			generate_cost BOOLEAN NOT NULL DEFAULT true,
 			check_cost BOOLEAN NOT NULL DEFAULT true,
 			review_upstream BOOLEAN NOT NULL DEFAULT false,
+			strict_per_call BOOLEAN NOT NULL DEFAULT false,
 			use_manual_discount BOOLEAN NOT NULL DEFAULT false,
 			bill_template TEXT NOT NULL DEFAULT '',
 			settle_cny DOUBLE PRECISION,
@@ -243,6 +250,8 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 		// 执行时核对上游倍率与国模标识：默认 false。与上面两个开关不同，
 		// 这个是「额外多一道人工确认」，老计划升级后不该突然开始每次弹窗打断执行。
 		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS review_upstream BOOLEAN NOT NULL DEFAULT false`,
+		// 严格区分按次计费：默认 false，老计划升级后行为不变。
+		`ALTER TABLE bill_export_tasks ADD COLUMN IF NOT EXISTS strict_per_call BOOLEAN NOT NULL DEFAULT false`,
 		// 自定义折扣开关。**迁移默认值取 true，而新建时的默认值是 false**，两者刻意不同：
 		//
 		//   迁移（老计划）：加这列之前，手工折扣是无条件生效的（taskrun 每次都读）。
@@ -313,12 +322,12 @@ func CreateBillTask(cfg PGConfig, t BillTask) (BillTask, error) {
 		INSERT INTO bill_export_tasks
 			(customer_id, customer_name, name, period_year, period_month,
 			 start_time, end_time, generate_sanitized, generate_cost, check_cost,
-			 use_manual_discount, bill_template, review_upstream)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			 use_manual_discount, bill_template, review_upstream, strict_per_call)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id, generated_at
 	`, t.CustomerID, t.CustomerName, t.Name, t.PeriodYear, t.PeriodMonth,
 		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost,
-		t.UseManualDiscount, t.BillTemplate, t.ReviewUpstream,
+		t.UseManualDiscount, t.BillTemplate, t.ReviewUpstream, t.StrictPerCall,
 	).Scan(&t.ID, &t.GeneratedAt)
 	if err != nil {
 		return BillTask{}, fmt.Errorf("新建账单计划失败: %w", err)
@@ -356,11 +365,12 @@ func UpdateBillTask(cfg PGConfig, t BillTask) error {
 			check_cost = $9,
 			use_manual_discount = $10,
 			bill_template = $11,
-			review_upstream = $12
+			review_upstream = $12,
+			strict_per_call = $13
 		WHERE id = $1
 	`, t.ID, t.Name, t.PeriodYear, t.PeriodMonth,
 		t.StartTime, t.EndTime, t.GenerateSanitized, t.GenerateCost, t.CheckCost,
-		t.UseManualDiscount, t.BillTemplate, t.ReviewUpstream)
+		t.UseManualDiscount, t.BillTemplate, t.ReviewUpstream, t.StrictPerCall)
 	if err != nil {
 		return fmt.Errorf("保存账单计划失败: %w", err)
 	}
@@ -427,7 +437,7 @@ func GetBillTask(cfg PGConfig, id int64) (BillTask, error) {
 const billTaskColumns = `
 	id, customer_id, customer_name, name, period_year, period_month,
 	start_time, end_time, generate_sanitized, generate_cost, check_cost,
-	use_manual_discount, bill_template, review_upstream,
+	use_manual_discount, bill_template, review_upstream, strict_per_call,
 	settle_cny, list_cny, overall_discount,
 	costed_settle_cny, cost_cny, profit_cny, cost_complete, summary_text,
 	priced_rows, total_cost_rows, row_count,
@@ -444,7 +454,7 @@ func scanBillTasks(rows *sql.Rows) ([]BillTask, error) {
 		if err := rows.Scan(
 			&t.ID, &t.CustomerID, &t.CustomerName, &t.Name, &t.PeriodYear, &t.PeriodMonth,
 			&start, &end, &t.GenerateSanitized, &t.GenerateCost, &t.CheckCost,
-			&t.UseManualDiscount, &t.BillTemplate, &t.ReviewUpstream,
+			&t.UseManualDiscount, &t.BillTemplate, &t.ReviewUpstream, &t.StrictPerCall,
 			&settle, &list, &discount,
 			&costedSettle, &cost, &profit, &t.CostComplete, &t.SummaryText,
 			&t.PricedRows, &t.TotalCostRows, &t.RowCount,

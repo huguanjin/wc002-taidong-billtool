@@ -49,6 +49,9 @@ const planForm = ref({
   // 默认不勾：它会打断每一次执行，只有需要逐期核对上游数据的计划才开。
   // 依附于 checkCost——没开成本核算就没有上游成本可核对。
   reviewUpstream: false,
+  // 严格区分按次计费（见 BillTask.StrictPerCall）：站内按次计费的模型，
+  // 上游怎么收费要单独维护。默认不勾，目前只对简易账单的成本三列生效。
+  strictPerCall: false,
   // 是否套用该客户手工维护的「分组 → 折扣」（线下谈定、没同步到 new-api 的）。
   // 默认不勾：折扣直接决定收客户多少钱，不该在用户没表态时自动套用人工数值。
   useManualDiscount: false,
@@ -254,6 +257,7 @@ function resetPlanForm() {
     generateCost: planForm.value.generateCost,
     checkCost: planForm.value.checkCost,
     reviewUpstream: planForm.value.reviewUpstream,
+    strictPerCall: planForm.value.strictPerCall,
     useManualDiscount: planForm.value.useManualDiscount,
     billTemplate: planForm.value.billTemplate,
   }
@@ -277,6 +281,7 @@ function startEditPlan(t) {
     checkCost: t.checkCost === undefined || t.checkCost === null ? true : !!t.checkCost,
     // 核对开关是后加的，老计划没有这个字段：按未勾选算（与后端迁移的默认 false 一致）。
     reviewUpstream: !!t.reviewUpstream,
+    strictPerCall: !!t.strictPerCall,
     // 这个字段相反：老计划迁移时默认 true（保住既有口径），新建默认 false。
     // 但后端已经把这个默认值落在库里了，页面只需原样反映，不再自己兜底——
     // 兜底成 false 会让已在用线下折扣的老计划显示成未勾选，而实际出账仍生效。
@@ -315,6 +320,7 @@ async function savePlan() {
         generateCost: planForm.value.generateCost,
         checkCost: planForm.value.checkCost,
         reviewUpstream: planForm.value.reviewUpstream,
+        strictPerCall: planForm.value.strictPerCall,
         useManualDiscount: planForm.value.useManualDiscount,
         billTemplate: planForm.value.billTemplate,
       }),
@@ -564,6 +570,102 @@ async function saveBlockedDiscounts() {
   return true
 }
 
+// ---- 严格区分按次计费：就地补录上游计费方式 ----
+//
+// 草稿键是「渠道号|模型」，值是 { mode: '' | 'per_call' | 'per_token', fee: '' }。
+// mode 初值留空而不是默认某一项：按次与按量的成本差很大，必须由人明确选，
+// 默认值会让没看清的人直接点继续就把成本估歪。全局一份（同一批里两条计划可能共用同一组合）。
+const blockedPerCallDraft = ref({})
+
+function perCallKey(it) {
+  return `${it.channelId}|${it.model}`
+}
+
+// perCallDraftOf 取草稿，不存在时给空草稿。模板渲染期调用，必须带兜底、不能抛异常。
+function perCallDraftOf(it) {
+  return blockedPerCallDraft.value[perCallKey(it)] || { mode: '', fee: '' }
+}
+
+function setPerCallMode(it, mode) {
+  const k = perCallKey(it)
+  blockedPerCallDraft.value = { ...blockedPerCallDraft.value, [k]: { ...perCallDraftOf(it), mode } }
+}
+
+function setPerCallFee(it, fee) {
+  const k = perCallKey(it)
+  blockedPerCallDraft.value = { ...blockedPerCallDraft.value, [k]: { ...perCallDraftOf(it), fee } }
+}
+
+// blockedPerCallSections 每个被拦任务里待维护上游计费方式的 (渠道, 模型)。
+const blockedPerCallSections = computed(() =>
+  runBlocked.value
+    .filter((r) => (r.channelCheck?.missingPerCall || []).length > 0)
+    .map((r) => ({
+      taskId: r.taskId,
+      taskName: r.taskName || r.task?.name || `任务 ${r.taskId}`,
+      items: r.channelCheck.missingPerCall,
+    }))
+)
+const blockedHasPerCallWork = computed(() => blockedPerCallSections.value.length > 0)
+
+// blockedPerCallItems 把草稿整理成接口要的形态，顺手校验。
+// 没选计费方式的跳过（用户可能只想先补其中几个）；选了按次就必须填大于 0 的单次费用，
+// 0 会被读成「上游免费」，成本虚低而不报任何错。
+function blockedPerCallItems() {
+  const seen = new Set()
+  const items = []
+  for (const sec of blockedPerCallSections.value) {
+    for (const it of sec.items) {
+      const k = perCallKey(it)
+      if (seen.has(k)) continue
+      seen.add(k)
+      const d = perCallDraftOf(it)
+      if (d.mode === '') continue
+      if (d.mode === 'per_call') {
+        const fee = Number(String(d.fee ?? '').trim())
+        if (!Number.isFinite(fee) || fee <= 0) {
+          return { error: `渠道 ${it.channelId} 的模型 ${it.model} 选了按次计费，单次费用必须是大于 0 的数字` }
+        }
+        items.push({ channelId: it.channelId, model: it.model, mode: 'per_call', perCallCny: fee })
+      } else {
+        items.push({ channelId: it.channelId, model: it.model, mode: 'per_token', perCallCny: 0 })
+      }
+    }
+  }
+  return { items }
+}
+
+// saveBlockedPerCall 保存上游计费方式。成功返回 true。
+async function saveBlockedPerCall() {
+  const { items, error: err } = blockedPerCallItems()
+  if (err) {
+    blockedError.value = err
+    return false
+  }
+  if (items.length === 0) {
+    blockedError.value = '请先为至少一个按次计费的模型选择上游计费方式'
+    return false
+  }
+  try {
+    const resp = await fetch('/api/save-channel-model-billing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      blockedError.value = data.error || `保存上游计费方式失败（${resp.status}）`
+      return false
+    }
+    blockedPerCallDraft.value = {}
+    return true
+  } catch (e) {
+    blockedError.value = '保存上游计费方式失败：' + e.message
+    return false
+  }
+}
+
 // blockedHasDiscountWork 被拦任务里是否有待填的折扣分组。
 const blockedHasDiscountWork = computed(() => blockedDiscountGroups.value.length > 0)
 
@@ -692,6 +794,7 @@ const SKIP_REASON_LABELS = {
   no_channel: '日志里取不到渠道号',
   multi_channel: '一行经多个渠道无法分摊',
   no_group_ratio: '缺分组倍率（group_ratio）',
+  no_percall_config: '按次计费模型未维护上游计费方式',
 }
 
 // blockedSkipReasons 把各任务的原因表合并成一个列表，按固定顺序展示。
@@ -701,6 +804,7 @@ function skipReasonText(rowReasons) {
     'no_channel',
     'multi_channel',
     'no_group_ratio',
+    'no_percall_config',
   ]
   const parts = []
   for (const k of order) {
@@ -807,6 +911,7 @@ async function continueAfterFix() {
   // 重跑一定还会被同一批缺口拦下，白导一次日志。
   const discountWork = blockedHasDiscountWork.value
   const ratioWork = blockedMissingChannels.value.length > 0
+  const perCallWork = blockedHasPerCallWork.value
 
   if (discountWork) {
     if (!(await saveBlockedDiscounts())) return
@@ -814,7 +919,10 @@ async function continueAfterFix() {
   if (ratioWork) {
     if (!(await saveBlockedRatios())) return
   }
-  if (!discountWork && !ratioWork) {
+  if (perCallWork) {
+    if (!(await saveBlockedPerCall())) return
+  }
+  if (!discountWork && !ratioWork && !perCallWork) {
     blockedError.value = '没有需要保存的补录内容'
     return
   }
@@ -1354,6 +1462,11 @@ defineExpose({ loadAll })
           <input v-model="planForm.reviewUpstream" type="checkbox" :disabled="!planForm.checkCost" />
           执行时核对上游倍率与国模标识
         </label>
+        <!-- 严格区分按次计费同样依附于成本核算，且目前只对简易账单的成本三列生效。 -->
+        <label v-if="planForm.billTemplate === 'simple'" :class="{ muted: !planForm.checkCost }">
+          <input v-model="planForm.strictPerCall" type="checkbox" :disabled="!planForm.checkCost" />
+          成本严格区分按次计费模型
+        </label>
         <!-- 折扣与成本是两个方向：折扣决定**收客户多少钱**（客户侧），
              上游倍率决定**我们花多少钱**（成本侧）。所以并排放在同一层，
              而不是谁套谁——两者可以任意组合。 -->
@@ -1380,6 +1493,13 @@ defineExpose({ loadAll })
       </p>
       <!-- 放在上面那条 v-if / v-else-if / v-else 链**之后**：链中间不能插别的元素，
            否则 v-else 会找不到它的 v-if。 -->
+      <p class="hint" v-if="planForm.checkCost && planForm.strictPerCall && planForm.billTemplate === 'simple'">
+        站内<strong>按次计费</strong>的模型（日志 model_price &gt; 0），上游不一定也按次收费，用倍率估成本会偏。
+        勾选后这类模型所在的「渠道 + 模型」必须先维护上游计费方式：
+        <strong>按次</strong>填单次调用费用（人民币），成本 = 调用次数 × 单次费用；
+        <strong>按量</strong>沿用倍率估算。没维护的会先拦下，可在本页就地补录后继续
+        （<strong>继续执行会重新导一次日志</strong>）。按次计费的渠道不再要求填上游倍率。
+      </p>
       <p class="hint" v-if="planForm.checkCost && planForm.reviewUpstream">
         每次执行都会在导出日志后停下来，弹出本次日志用到的渠道及其上游倍率、国模标识，
         确认无误（或改完）再出账。<strong>国模渠道的倍率按折扣理解（0.4 = 4 折），
@@ -1456,6 +1576,11 @@ defineExpose({ loadAll })
           <span class="name">线下折扣没维护全</span>
           <span class="reason">勾了「使用自定义折扣」，但日志里的分组还有没填的。
             不填会变成一半按线下折扣、一半按反推，客户核对时会问为什么不一致。</span>
+        </li>
+        <li v-if="blockedHasPerCallWork">
+          <span class="name">按次计费模型的上游计费方式没维护</span>
+          <span class="reason">勾了「成本严格区分按次计费模型」。上游按次还是按量要由你告诉我们，
+            不填会按倍率估一个看着正常、实际可能很偏的成本。</span>
         </li>
         <li v-if="blockedMissingChannels.length > 0">
           <span class="name">上游倍率没维护全</span>
@@ -1534,6 +1659,65 @@ defineExpose({ loadAll })
                     class="tag hint-tag"
                     :class="h.kind"
                   >{{ h.text }}</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 按次计费模型的上游计费方式：按「渠道 + 模型」填。 -->
+      <div v-for="sec in blockedPerCallSections" :key="'pc-' + sec.taskId" class="blocked-task">
+        <strong>{{ sec.taskName }} — 按次计费模型的上游计费方式</strong>
+        <p class="hint">
+          这些模型在站内是按次卖的。<strong>按次</strong>：填上游每次调用的实际费用（人民币），
+          成本 = 次数 × 单次费用；<strong>按量</strong>：沿用上游倍率估算。
+          「站内单次价」是站内标价（未乘分组倍率），可作参考——上游单次费用通常低于它。
+        </p>
+        <div class="blocked-group">
+          <table>
+            <thead>
+              <tr>
+                <th>渠道</th>
+                <th>模型</th>
+                <th>分组</th>
+                <th>站内单次价</th>
+                <th>次数</th>
+                <th>站内金额</th>
+                <th>上游计费方式</th>
+                <th>单次费用（¥/次）</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="it in sec.items" :key="sec.taskId + '-' + it.channelId + '-' + it.model">
+                <td>{{ it.channelId }} {{ it.channelName }}</td>
+                <td class="left">{{ it.model }}</td>
+                <td>{{ (it.groups || []).join('、') }}</td>
+                <td>{{ it.sitePrice }}</td>
+                <td>{{ it.units }}</td>
+                <td>¥{{ it.amountCny }}</td>
+                <td>
+                  <select
+                    :value="perCallDraftOf(it).mode"
+                    @change="setPerCallMode(it, $event.target.value)"
+                  >
+                    <option value="">请选择</option>
+                    <option value="per_call">按次</option>
+                    <option value="per_token">按量</option>
+                  </select>
+                </td>
+                <td>
+                  <input
+                    v-if="perCallDraftOf(it).mode === 'per_call'"
+                    :value="perCallDraftOf(it).fee"
+                    @input="setPerCallFee(it, $event.target.value)"
+                    type="number"
+                    step="0.0001"
+                    min="0"
+                    placeholder="必填"
+                    class="ratio-input"
+                  />
+                  <span v-else class="hint inline">—</span>
                 </td>
               </tr>
             </tbody>

@@ -197,8 +197,132 @@ async function saveChannelRatios() {
   }
 }
 
+// ---- 按次计费模型的上游计费方式（任务勾了「成本严格区分按次计费模型」时才会用到）----
+//
+// 平时由任务被拦下时就地补录；这里用来回看、改单次费用、或删掉重填。
+// 草稿键是「渠道号|模型」，值是 { mode, fee }。
+const perCallItems = ref([])
+const perCallDraft = ref({})
+const perCallError = ref('')
+const perCallMessage = ref('')
+const savingPerCall = ref(false)
+
+function perCallKey(it) {
+  return `${it.channelId}|${it.model}`
+}
+
+// 渲染期调用，必须带兜底、不能抛异常。
+function perCallDraftOf(it) {
+  return perCallDraft.value[perCallKey(it)] || { mode: it.mode || 'per_token', fee: String(it.perCallCny ?? '') }
+}
+
+function setPerCall(it, patch) {
+  perCallDraft.value = { ...perCallDraft.value, [perCallKey(it)]: { ...perCallDraftOf(it), ...patch } }
+}
+
+function perCallDirty(it) {
+  const d = perCallDraftOf(it)
+  if (d.mode !== it.mode) return true
+  return d.mode === 'per_call' && Number(String(d.fee ?? '').trim()) !== Number(it.perCallCny)
+}
+
+const perCallPending = computed(() => perCallItems.value.filter((it) => perCallDirty(it)).length)
+
+async function loadPerCall() {
+  perCallError.value = ''
+  try {
+    const resp = await fetch('/api/channel-model-billing')
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      perCallError.value = data.error || `读取失败（${resp.status}）`
+      return
+    }
+    perCallItems.value = data.items || []
+    perCallDraft.value = {}
+  } catch (err) {
+    perCallError.value = '读取失败：' + err.message
+  }
+}
+
+// perCallSaveItems 只提交有改动的；按次的单次费用必须大于 0（0 会被读成上游免费）。
+function perCallSaveItems() {
+  const items = []
+  for (const it of perCallItems.value) {
+    if (!perCallDirty(it)) continue
+    const d = perCallDraftOf(it)
+    if (d.mode === 'per_call') {
+      const fee = Number(String(d.fee ?? '').trim())
+      if (!Number.isFinite(fee) || fee <= 0) {
+        return { error: `渠道 ${it.channelId} 的模型 ${it.model}：按次的单次费用必须是大于 0 的数字` }
+      }
+      items.push({ channelId: it.channelId, model: it.model, mode: 'per_call', perCallCny: fee })
+    } else {
+      items.push({ channelId: it.channelId, model: it.model, mode: 'per_token', perCallCny: 0 })
+    }
+  }
+  return { items }
+}
+
+async function savePerCall() {
+  perCallError.value = ''
+  perCallMessage.value = ''
+  const { items, error } = perCallSaveItems()
+  if (error) {
+    perCallError.value = error
+    return
+  }
+  if (items.length === 0) return
+  savingPerCall.value = true
+  try {
+    const resp = await fetch('/api/save-channel-model-billing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      perCallError.value = data.error || `保存失败（${resp.status}）`
+      return
+    }
+    perCallMessage.value = `已保存 ${data.saved} 项`
+    await loadPerCall()
+  } catch (err) {
+    perCallError.value = '保存失败：' + err.message
+  } finally {
+    savingPerCall.value = false
+  }
+}
+
+async function deletePerCall(it) {
+  if (!window.confirm(`删除渠道 ${it.channelId} 的模型 ${it.model} 的上游计费方式？\n（删除后，下次严格出账会再次要求维护）`)) return
+  perCallError.value = ''
+  perCallMessage.value = ''
+  try {
+    const resp = await fetch('/api/save-channel-model-billing', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: [{ channelId: it.channelId, model: it.model, delete: true }] }),
+    })
+    const data = await resp.json()
+    if (!resp.ok) {
+      if (resp.status === 401) emit('unauthorized')
+      perCallError.value = data.error || `删除失败（${resp.status}）`
+      return
+    }
+    perCallMessage.value = '已删除'
+    await loadPerCall()
+  } catch (err) {
+    perCallError.value = '删除失败：' + err.message
+  }
+}
+
 // 首次进入该页时自动读一次本地清单；没拉取过会提示去拉取。
-onMounted(loadChannels)
+onMounted(() => {
+  loadChannels()
+  loadPerCall()
+})
 
 // 从出账页跳过来时刷新一次，保证看到的是最新状态。
 defineExpose({ loadChannels })
@@ -301,6 +425,57 @@ defineExpose({ loadChannels })
     <span class="hint" v-else-if="!channelsLoaded">
       正在读取本地渠道清单…
     </span>
+
+    <h3 class="sub-title">按次计费模型的上游计费方式</h3>
+    <p class="hint">
+      账单任务勾了「成本严格区分按次计费模型」时，站内按次卖的模型需要在这里（或执行被拦下时就地）告诉我们上游怎么收费：
+      <strong>按次</strong>填上游每次调用的实际费用（人民币），成本 = 次数 × 单次费用；
+      <strong>按量</strong>沿用上面的上游倍率估算。按渠道 + 模型分别维护。
+    </p>
+    <div class="path-row">
+      <button type="button" class="btn-browse" @click="savePerCall" :disabled="savingPerCall || perCallPending === 0">
+        {{ savingPerCall ? '保存中…' : `保存${perCallPending > 0 ? `（${perCallPending}）` : ''}` }}
+      </button>
+    </div>
+    <p class="error" v-if="perCallError">{{ perCallError }}</p>
+    <span class="hint" v-if="perCallMessage">{{ perCallMessage }}</span>
+    <table v-if="perCallItems.length > 0">
+      <thead>
+        <tr>
+          <th>渠道</th>
+          <th>模型</th>
+          <th>上游计费方式</th>
+          <th>单次费用（¥/次）</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="it in perCallItems" :key="it.channelId + '|' + it.model" :class="{ 'row-unsaved': perCallDirty(it) }">
+          <td>{{ it.channelId }} {{ it.channelName }}</td>
+          <td>{{ it.model }}</td>
+          <td>
+            <select :value="perCallDraftOf(it).mode" @change="setPerCall(it, { mode: $event.target.value })">
+              <option value="per_call">按次</option>
+              <option value="per_token">按量</option>
+            </select>
+          </td>
+          <td>
+            <input
+              v-if="perCallDraftOf(it).mode === 'per_call'"
+              :value="perCallDraftOf(it).fee"
+              @input="setPerCall(it, { fee: $event.target.value })"
+              type="number"
+              step="0.0001"
+              min="0"
+              class="ratio-input"
+            />
+            <span v-else class="hint inline">—</span>
+          </td>
+          <td class="center"><button type="button" class="btn-browse" @click="deletePerCall(it)">删除</button></td>
+        </tr>
+      </tbody>
+    </table>
+    <span class="hint" v-else>还没有维护过。</span>
   </div>
 </template>
 
@@ -396,6 +571,11 @@ input {
 
 td.center {
   text-align: center;
+}
+
+.sub-title {
+  margin: 24px 0 4px;
+  font-size: 15px;
 }
 
 /* 说明里的两条口径是并列的要点，不要被全局的 .hint 压成一行。 */

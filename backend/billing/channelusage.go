@@ -189,6 +189,10 @@ const (
 	// 只为 SkipNoUpstreamRatio 收集渠道号），预检因此永不拦下、页面永不提示。
 	// 渠道名缺失与否由 ChannelIssue.Known 表达，与"要不要补录"无关。
 	SkipNoUpstreamRatio CostSkipReason = "no_upstream_ratio"
+	// SkipNoPerCallConfig 严格区分按次计费时：站内按次的 (渠道, 模型) 还没维护上游计费方式。
+	//
+	// 和缺倍率一样靠补录解决，所以预检同样会拦；但补的是另一张表，单列一类以便页面分开提示。
+	SkipNoPerCallConfig CostSkipReason = "no_percall_config"
 	// SkipZeroDelta 这一行不改动额度（补扣/退款但金额为 0），对成本没有影响。
 	//
 	// 单列一类而不是并进上面几类：它不该被算作"缺成本"。任务行常常记
@@ -233,6 +237,13 @@ func RowCostReason(row []string, idxChannel int, hasChannelCol bool,
 // 只报渠道会让用户以为补了倍率就万事大吉，实际还有别的行因别的原因算不出来。
 func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float64) (
 	counts map[CostSkipReason]int, missingChannels []int, rowsPerChannel map[int]int) {
+	return CountRowCostReasonsStrict(headers, rows, ratios, nil)
+}
+
+// CountRowCostReasonsStrict 同 CountRowCostReasons，另按「严格区分按次计费」判定：
+// strict 为 nil 时两者完全一致。维护成按次的行不需要渠道倍率，不计入缺倍率。
+func CountRowCostReasonsStrict(headers []string, rows [][]string, ratios map[int]float64, strict *StrictPerCall) (
+	counts map[CostSkipReason]int, missingChannels []int, rowsPerChannel map[int]int) {
 
 	col := map[string]int{}
 	for i, h := range headers {
@@ -244,6 +255,7 @@ func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float
 	idxOther, hasOtherCol := col["other"]
 	idxQuota, hasQuota := col["quota"]
 	idxType, hasType := col["type"]
+	idxModel, hasModel := col["model_name"]
 
 	counts = map[CostSkipReason]int{}
 	rowsPerChannel = map[int]int{}
@@ -270,7 +282,8 @@ func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float
 		if hasQuota {
 			delta = ToFloat(cellAt(row, idxQuota))
 		}
-		if IsTaskQuotaAdjustment(other) {
+		adjustment := IsTaskQuotaAdjustment(other)
+		if adjustment {
 			logType := ""
 			if hasType {
 				logType = cellAt(row, idxType)
@@ -282,8 +295,9 @@ func CountRowCostReasons(headers []string, rows [][]string, ratios map[int]float
 			delta = -d
 		}
 
-		reason, ids := RowCostReason(row, idxChannel, hasChannelCol,
-			idxOther, hasOtherCol, ratios, delta)
+		plan := PlanRowCost(row, idxChannel, hasChannelCol, idxOther, hasOtherCol,
+			idxModel, hasModel, ratios, delta, adjustment, strict)
+		reason, ids := plan.Reason, plan.IDs
 		if reason == SkipNoUpstreamRatio && len(ids) == 1 {
 			rowsPerChannel[ids[0]]++
 			if !missingByChannel[ids[0]] {
@@ -427,6 +441,9 @@ type ChannelCheckResult struct {
 	// UnknownChannelIDs 渠道表里查不到的（多半已在业务库被硬删除）——补不了，
 	// 只能如实报出，让用户知道这些渠道的成本算不全。
 	UnknownChannelIDs []int `json:"unknownChannelIds"`
+	// MissingPerCall 严格区分按次计费时，站内按次但尚未维护上游计费方式的 (渠道, 模型)。
+	// 非空表示本次被拦下，补录后重跑即可。
+	MissingPerCall []PerCallIssue `json:"missingPerCall,omitempty"`
 	// MissingGroupRatioRows group_ratio 缺失、无法反推官方刊例的行数。
 	// 大于 0 时这些行的成本同样算不出来（见 AggregateSimpleBill）。
 	MissingGroupRatioRows int `json:"missingGroupRatioRows"`

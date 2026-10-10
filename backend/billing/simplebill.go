@@ -84,6 +84,17 @@ type SimpleBillRow struct {
 	//
 	// 分类而不是一个总数：缺倍率要补、缺渠道号要查日志，去处完全不同。
 	SkipReasons map[string]int `json:"skipReasons,omitempty"`
+
+	// ---- 严格区分按次计费（SimpleBillOptions.Strict 非 nil）时才有值 ----
+
+	// PerCallUnits 上游按次计费的调用次数合计（含退款冲抵，可为负），
+	// PerCallCostCNY 是其中按「次数 × 单次费用」算出的上游成本，已计入 UpstreamCostCNY。
+	// 单列出来是为了让人看得出成本里有多少是按次估的、有多少是按倍率估的。
+	PerCallUnits   float64 `json:"perCallUnits,omitempty"`
+	PerCallCostCNY float64 `json:"perCallCostCny,omitempty"`
+	// PerCallUncertainRows 按次行里反推不出整数次数、已按 1 次计的行数。
+	// 与 priceRow 的 PerCallCountUncertain 同一个意思：不猜，但要说。
+	PerCallUncertainRows int `json:"perCallUncertainRows,omitempty"`
 }
 
 // SimpleBillColumns 模板二**汇总表**的列名：账单与成本表的前九列都用它。
@@ -142,6 +153,8 @@ type SimpleBillOptions struct {
 	// 模板一的成本也是「刊例USD × 汇率 × 上游折扣」，两边用不同的汇率，
 	// 同一份日志的两张表会给出两个成本数。
 	ExchangeRate float64
+	// Strict 严格区分按次计费的判定上下文，nil = 关闭（见 StrictPerCall）。
+	Strict *StrictPerCall
 }
 
 // Rate 取汇率，未设置时回退默认值。导出是因为调用方记录「本次实际用的汇率」
@@ -293,6 +306,7 @@ func DescribeSkipReasons(reasons map[string]int) string {
 		{SkipNoChannel, "日志里取不到渠道号"},
 		{SkipMultiChannel, "一行经多个渠道无法分摊"},
 		{SkipNoGroupRatio, "缺分组倍率（group_ratio）"},
+		{SkipNoPerCallConfig, "按次计费模型未维护上游计费方式"},
 	}
 	parts := []string{}
 	for _, o := range order {
@@ -392,6 +406,9 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		upstreamCNY float64
 		rows        int // 参与成本核算的行数
 
+		// 按次部分：次数、成本、按 1 次兜底的行数（见 SimpleBillRow 同名字段）。
+		perCallUnits, perCallCNY float64
+		perCallUncertain         int
 	}
 	costs := map[key]*costAcc{}
 	rate := opts.rateOr()
@@ -464,8 +481,10 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		// 成本与金额对不上——金额冲抵了、成本没冲抵，利润凭空变高。
 		// 判据与预检共用 RowCostReason：两边各写一套的话，会出现
 		// 「预检说没问题、账单说 392 行缺倍率」这种自相矛盾（那是修这个 bug 的起因）。
-		reason, ids := RowCostReason(row, idxChannel, hasChannel, idxOther, hasOther,
-			opts.UpstreamRatios, delta)
+		adjustment := IsTaskQuotaAdjustment(other)
+		plan := PlanRowCost(row, idxChannel, hasChannel, idxOther, hasOther,
+			idxModel, true, opts.UpstreamRatios, delta, adjustment, opts.Strict)
+		reason, ids := plan.Reason, plan.IDs
 		if reason != SkipNone {
 			// zero_delta 不计入缺失：额度为 0 的行本来就不影响成本，
 			// 把它算进去会让用户去补一堆无关的倍率。
@@ -523,6 +542,19 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 		// 旧口径对所有渠道都是「刊例 × 汇率 × 倍率 ÷ 7」，汇率为 7 时国模渠道的成本数
 		// 碰巧与新口径相同，变的只有官方刊例那一列的币种（原先把人民币当美金写，现在归一了）。
 		// 汇率不是 7 时旧口径的国模成本会偏 汇率/7 倍，新口径不再有这个偏差。
+		if plan.PerCall {
+			// 上游按次：成本 = 次数 × 单次费用，不经倍率与折扣换算。
+			// 退款行 delta 为负，次数随之为负，成本同比例冲抵（与按倍率路径的冲抵方向一致）。
+			units, certain := PerCallUnits(delta, plan.SitePrice, costRatio, adjustment)
+			cost := units * plan.FeeCNY
+			ca.upstreamCNY += cost
+			ca.perCallUnits += units
+			ca.perCallCNY += cost
+			if !certain {
+				ca.perCallUncertain++
+			}
+			continue
+		}
 		ca.upstreamCNY += listQuota / QuotaPerCNY * rate * UpstreamDiscountFor(upstream, domestic)
 	}
 
@@ -537,6 +569,9 @@ func AggregateSimpleBill(rows [][]string, headers []string, opts SimpleBillOptio
 			r.CostRows = ca.rows
 			r.SkippedQuota = round(ca.skippedQuota, MoneyDecimals)
 			r.SkipReasons = ca.skipReasons
+			r.PerCallUnits = round(ca.perCallUnits, 4)
+			r.PerCallCostCNY = round(ca.perCallCNY, MoneyDecimals)
+			r.PerCallUncertainRows = ca.perCallUncertain
 			// 覆盖率不足但**不是零**时照样给数：504100 行里 392 行算不出来，
 			// 拿剩下的 503708 行算出来的成本远比一片空白有用。把 CostPartial
 			// 标出来，页面上说明「未覆盖 N 行、差 ¥X」，让用户自己判断够不够用。
@@ -954,6 +989,11 @@ type SimpleBillTotals struct {
 	// 所以两者不等有两种情形：有行算不出来，或者整表根本没开成本核算。
 	// 后者两个 Missing* 都是 0——调用方据此区分「算不全」与「没开」。
 	Cost SimpleBillCostStat
+
+	// 按次计费部分（严格区分按次计费时才有值），口径见 SimpleBillRow 同名字段。
+	PerCallUnits         float64
+	PerCallCostCNY       float64
+	PerCallUncertainRows int
 }
 
 // SumSimpleBill 把各行加总。金额单独累加各行（而不是用总额度再算一次），
@@ -975,6 +1015,9 @@ func SumSimpleBill(rows []SimpleBillRow) SimpleBillTotals {
 		t.TotalCacheCreation += r.TotalCacheCreation
 		t.TotalQuota += r.TotalQuota
 		t.TotalCostCNY += r.TotalCostCNY
+		t.PerCallUnits += r.PerCallUnits
+		t.PerCallCostCNY += r.PerCallCostCNY
+		t.PerCallUncertainRows += r.PerCallUncertainRows
 
 		// 覆盖情况对**每一行**都累计，包括没算出成本的那些——
 		// 只在有成本的行上累加的话，「有 2 行没算成本」这件事根本进不了合计，

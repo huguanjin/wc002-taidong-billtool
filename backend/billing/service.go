@@ -221,6 +221,9 @@ func generateSimpleBill(inputPath, outputDir string, params Params) (*GenerateRe
 		CostColumns:      params.CheckCost,
 		// 汇率与模板一同一来源：两边的成本都经这一步换算，用不同的汇率会得出两个成本数。
 		ExchangeRate: params.ExchangeRate,
+		// 严格模式只在算成本时有意义；与出账前的预检用同一份配置与同一套判据。
+		Strict: NewStrictPerCall(params.StrictPerCall && params.CheckCost,
+			params.ChannelModelBilling, headers, rows),
 	}
 	summaryRows, err := AggregateSimpleBill(rows, headers, opts)
 	if err != nil {
@@ -402,6 +405,14 @@ func FormatSimpleBillSummary(rows []SimpleBillRow, totals SimpleBillTotals, year
 		// 毛利率单独用逗号收尾，不套括号——与 FormatCostSummary 同一写法。
 		fmt.Fprintf(&b, "利润：¥%s，毛利率 %s%%\n",
 			trimMoney(*totals.ProfitCNY), trimPercent(margin))
+		// 严格区分按次计费：把按次估的那部分单独说明，读的人才知道成本里有多少不是按倍率估的。
+		if totals.PerCallUnits != 0 || totals.PerCallCostCNY != 0 {
+			fmt.Fprintf(&b, "其中按次计费：%s 次，上游成本 ¥%s\n",
+				trimFixed(totals.PerCallUnits, 2), trimMoney(totals.PerCallCostCNY))
+			if totals.PerCallUncertainRows > 0 {
+				fmt.Fprintf(&b, "按次行中有 %d 行次数无法确认，已按 1 次计\n", totals.PerCallUncertainRows)
+			}
+		}
 		if skipped := totals.Cost.SkippedRows(); skipped > 0 {
 			// 上面的毛利率分母只是「有成本的那部分金额」，所以它是**这部分**的，
 			// 不是整张账单的。这条说明必须紧跟其后，否则会被当成整体毛利。
