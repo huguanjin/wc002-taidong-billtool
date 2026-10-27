@@ -94,8 +94,51 @@ const settingsDraft = ref({
 const hasCustomers = computed(() => customers.value.length > 0)
 const isEditingPlan = computed(() => planForm.value.id > 0)
 
+// ---- 计划列表分页 ----
+//
+// 任务一多，整页一张表既难找也难读。分页在**前端**做而不是后端分页：
+// 「按月汇总」是按当前结果集算的（见 handleBillTasks），后端一旦分页，
+// 汇总就会只剩当前页的数字，跟用户看到的表格对不上。计划列表的规模是
+// 几百条这个量级，整份拉回来再切页完全够用。
+const PAGE_SIZES = [20, 50, 100]
+const page = ref(1)
+const pageSize = ref(20)
+
+// 列表再按创建时间倒序排一遍：后端已经 ORDER BY generated_at DESC 了，
+// 这里不依赖它的顺序，是因为分页切片必须建立在**确定的**顺序上——
+// 前后端任何一方的排序被改动，翻页就会出现同一条计划出现在两页、或某条被跳过。
+const sortedTasks = computed(() =>
+  [...tasks.value].sort((a, b) => {
+    const ta = Date.parse(a.generatedAt || '') || 0
+    const tb = Date.parse(b.generatedAt || '') || 0
+    if (tb !== ta) return tb - ta
+    return (b.id || 0) - (a.id || 0)
+  })
+)
+const pageCount = computed(() => Math.max(1, Math.ceil(sortedTasks.value.length / pageSize.value)))
+// 当前页兜底：删掉最后一页的最后一条后，page 会短暂大于总页数。
+// 用计算属性夹住而不是 watch 回写，是为了不在渲染期改状态。
+const currentPage = computed(() => Math.min(Math.max(1, page.value), pageCount.value))
+const pagedTasks = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value
+  return sortedTasks.value.slice(start, start + pageSize.value)
+})
+const pageRangeText = computed(() => {
+  if (sortedTasks.value.length === 0) return '共 0 条计划'
+  const start = (currentPage.value - 1) * pageSize.value + 1
+  const end = Math.min(currentPage.value * pageSize.value, sortedTasks.value.length)
+  return `共 ${sortedTasks.value.length} 条计划，第 ${start}–${end} 条`
+})
+
+function goPage(p) {
+  page.value = Math.min(Math.max(1, p), pageCount.value)
+}
+
+// 全选只作用于**当前页**。表头那个勾选框在分页之后不能代表全部任务：
+// 用户勾了它、翻页后看到别的计划没被勾，会以为勾选丢了；
+// 更要紧的是「删除选中」——勾一个框删掉全部计划是灾难。
 const allSelected = computed(
-  () => tasks.value.length > 0 && selectedTasks.value.length === tasks.value.length
+  () => pagedTasks.value.length > 0 && pagedTasks.value.every((t) => selectedTasks.value.includes(t.id))
 )
 
 // 有勾选但还没执行过的计划数——用它提示「先执行再下载」。
@@ -370,8 +413,17 @@ async function deletePlan(t) {
 
 // ---- 勾选与执行 ----
 
+// 表头勾选框：勾上 = 选中当前页全部，取消 = 只取消当前页的（别的页保持原样）。
+// 混在其它页里的已选项必须留住——用户可能先在第 1 页勾了几条、再翻到第 2 页勾。
 function toggleAll(checked) {
-  selectedTasks.value = checked ? tasks.value.map((t) => t.id) : []
+  const ids = pagedTasks.value.map((t) => t.id)
+  if (checked) {
+    const set = new Set([...selectedTasks.value, ...ids])
+    selectedTasks.value = [...set]
+  } else {
+    const drop = new Set(ids)
+    selectedTasks.value = selectedTasks.value.filter((id) => !drop.has(id))
+  }
 }
 
 async function validateSelected() {
@@ -1321,6 +1373,16 @@ function fmtTime(v) {
   return new Date(v).toLocaleString('zh-CN')
 }
 
+// 计划创建时间。generated_at 是 TIMESTAMPTZ，序列化成 RFC3339，
+// 由浏览器按用户本地时区显示——与「时段」不同，后者存的是墙上时间字符串、不能解析成 Date。
+function fmtCreatedAt(v) {
+  if (!v) return '-'
+  const d = new Date(v)
+  if (Number.isNaN(d.getTime())) return '-'
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 onMounted(loadAll)
 
 defineExpose({ loadAll })
@@ -1832,6 +1894,7 @@ defineExpose({ loadAll })
           </th>
           <th>计划</th>
           <th>客户</th>
+          <th>创建时间</th>
           <th>模板</th>
           <th>成本核算</th>
           <th>时段</th>
@@ -1849,13 +1912,15 @@ defineExpose({ loadAll })
              若把 v-for 写在第一行上，第二行就是它的兄弟节点，
              拿不到循环变量 t —— 访问 t.id 会在渲染期抛异常，整页白屏。
              这也正是上一版的实际故障。 -->
-        <template v-for="t in tasks" :key="t.id">
+        <template v-for="t in pagedTasks" :key="t.id">
           <tr :class="{ 'row-unrun': taskState(t) === 'unrun' }">
           <td class="pick">
             <input type="checkbox" v-model="selectedTasks" :value="t.id" />
           </td>
           <td class="name">{{ t.name || '（未命名）' }}</td>
           <td>{{ t.customerName }}</td>
+          <!-- 创建时间：列表按它倒序，用户能从上往下看出「哪条是新加的」 -->
+          <td class="created-at">{{ fmtCreatedAt(t.generatedAt) }}</td>
           <td>{{ t.billTemplate === 'simple' ? '简易汇总' : '标准明细' }}</td>
           <td>
             <span v-if="t.checkCost" class="ok">开</span>
@@ -1896,7 +1961,7 @@ defineExpose({ loadAll })
              否则多行的摘要会把那一列的宽度撑得没法看。
              它与上面那行同处一个 <template v-for> 里，所以 t 在作用域内。 -->
         <tr v-if="storedSummaries[t.id] && expandedSummary === t.id">
-          <td colspan="12" class="stored-summary-cell">
+          <td colspan="13" class="stored-summary-cell">
             <div class="cost-summary">
               <div class="cost-summary-head">
                 <strong>{{ t.name || t.customerName }} 摘要</strong>
@@ -1911,6 +1976,25 @@ defineExpose({ loadAll })
         </template>
       </tbody>
     </table>
+    <div class="pager" v-if="sortedTasks.length > 0">
+      <span class="pager-info">{{ pageRangeText }}</span>
+      <div class="pager-controls">
+        <label class="pager-size">
+          每页
+          <select v-model.number="pageSize" @change="goPage(1)">
+            <option v-for="n in PAGE_SIZES" :key="n" :value="n">{{ n }}</option>
+          </select>
+          条
+        </label>
+        <button type="button" class="btn-browse" :disabled="currentPage <= 1" @click="goPage(currentPage - 1)">
+          上一页
+        </button>
+        <span class="pager-page">{{ currentPage }} / {{ pageCount }}</span>
+        <button type="button" class="btn-browse" :disabled="currentPage >= pageCount" @click="goPage(currentPage + 1)">
+          下一页
+        </button>
+      </div>
+    </div>
     <span class="hint" v-else-if="!loading">
       还没有计划，先在上面新建一条。
       <template v-if="!hasCustomers">（需要先到「客户信息」页新增客户并填好业务库账号）</template>
@@ -2468,6 +2552,38 @@ td.ops {
 }
 td.negative {
   color: #d92626;
+}
+td.created-at {
+  text-align: left;
+  white-space: nowrap;
+  color: #666;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 13px;
+  color: #555;
+}
+.pager-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.pager-size select {
+  margin: 0 4px;
+  padding: 3px 6px;
+  border: 1px solid #d8d8d8;
+  border-radius: 4px;
+}
+.pager-page {
+  min-width: 56px;
+  text-align: center;
+  color: #333;
 }
 .row-unrun {
   background: #fbfbfc;

@@ -287,6 +287,13 @@ func EnsureBillTaskSchema(cfg PGConfig) error {
 	`); err != nil {
 		return fmt.Errorf("创建 bill_export_tasks 索引失败: %w", err)
 	}
+	// 列表按创建时间倒序分页（见 ListBillTasks），老库补的列也要有索引。
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_bill_export_tasks_created
+		ON bill_export_tasks (generated_at DESC, id DESC)
+	`); err != nil {
+		return fmt.Errorf("创建 bill_export_tasks 创建时间索引失败: %w", err)
+	}
 	return nil
 }
 
@@ -543,7 +550,11 @@ type BillTaskFilter struct {
 	CustomerID int64
 }
 
-// ListBillTasks 计划列表，按账期倒序、同账期按客户名与时段排序。
+// ListBillTasks 计划列表，按**创建时间倒序**（新计划在最上面），同秒创建时用 id 兜底
+// ——id 是 BIGSERIAL，自增顺序就是创建顺序，两者不会打架。
+//
+// 以前按账期倒序：计划一多，新建的计划被埋在几个月前的账期里，用户建完看不见。
+// 账期筛选由 filter 负责，排序按创建时间更符合「刚建的那条在哪」的直觉。
 func ListBillTasks(cfg PGConfig, f BillTaskFilter) ([]BillTask, error) {
 	db, err := sql.Open("pgx", cfg.dsn())
 	if err != nil {
@@ -571,7 +582,7 @@ func ListBillTasks(cfg PGConfig, f BillTaskFilter) ([]BillTask, error) {
 	}
 
 	rows, err := db.Query(`SELECT `+billTaskColumns+` FROM bill_export_tasks `+where+`
-		ORDER BY period_year DESC, period_month DESC, customer_name, start_time NULLS LAST, id`,
+		ORDER BY generated_at DESC, id DESC`,
 		args...)
 	if err != nil {
 		return nil, fmt.Errorf("查询账单计划失败: %w", err)

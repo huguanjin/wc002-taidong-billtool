@@ -214,6 +214,20 @@ await scenario('计划列表（含摘要展开行，v-for 作用域）', BillTas
   regex: [[/class="tag"[^>]*>核对<\/span>/, '勾了核对的计划应带「核对」标记']],
 })
 
+// 分页：25 条计划 + 每页 20 → 第 1 页 20 行、分页条给出总数，且**只渲染当前页**。
+const manyTasks = Array.from({ length: 25 }, (_, i) =>
+  task({ id: i + 1, name: '计划' + (i + 1), generatedAt: `2026-10-${String(i + 1).padStart(2, '0')}T10:00:00Z` })
+)
+await scenario('计划列表：分页只渲染当前页', BillTasks, { tasks: manyTasks, pageSize: 20, page: 1 }, {
+  has: ['共 25 条计划，第 1–20 条', '1 / 2', '计划25'],
+  // 第 25 条不在第一页：它创建于 10 月 25 日，倒序后排在最后。
+  hasNot: ['>计划1<'],
+})
+
+await scenario('计划列表：翻到第二页只剩 5 条', BillTasks, { tasks: manyTasks, pageSize: 20, page: 2 }, {
+  has: ['共 25 条计划，第 21–25 条', '2 / 2', '计划1'],
+})
+
 await scenario('计划表单：勾了核对 → 说明文字出现', BillTasks, {
   showPlanForm: true,
   customers: [{ id: 1, name: '龙树', usernames: 'longshu' }],
@@ -510,6 +524,29 @@ const same = (label, got, want) => {
 }
 
 console.log('检查三：BillTasks.vue 交互逻辑')
+{
+  // 分页与勾选：全选只作用于当前页，别的页上的勾选不能被冲掉，
+  // 否则「勾一个表头框 → 删除选中」会把几百条计划一起删掉。
+  const many = Array.from({ length: 25 }, (_, i) => task({ id: i + 1, generatedAt: `2026-10-${String(i + 1).padStart(2, '0')}T10:00:00Z` }))
+  const vm = await mount(BillTasks, { tasks: many, pageSize: 20, page: 1, selectedTasks: [1] })
+  same('第 1 页条数', vm.pagedTasks.length, 20)
+  same('总页数', vm.pageCount, 2)
+  // 倒序：25 号创建最晚，排第一。
+  same('按创建时间倒序（新的在最上面）', vm.pagedTasks[0].id, 25)
+  vm.toggleAll(true)
+  // 预置勾的是第 2 页的 1 号：全选当前页后应是 20 条 + 保留的 1 条。
+  same('表头勾选框只选中当前页，并保留其它页已有的勾选', vm.selectedTasks.length, 21)
+  same('第 2 页的 1 号仍在勾选里', vm.selectedTasks.includes(1), true)
+  vm.toggleAll(false)
+  same('取消只取消当前页的，第 2 页那条留着', vm.selectedTasks, [1])
+
+  // 删到最后一页清空后，页码要夹回有效范围，不能渲染出一张空表。
+  vm.page = 5
+  same('页码越界时夹到最后一页', vm.currentPage, 2)
+  vm.tasks = many.slice(0, 3)
+  same('计划变少后页码自动夹回', vm.currentPage, 1)
+}
+
 {
   const vm = await mount(BillTasks, {
     runResults: [blockedResult({
