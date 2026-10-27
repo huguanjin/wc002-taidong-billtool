@@ -993,26 +993,49 @@ async function handleSubmit() {
 </script>
 
 <template>
-  <div class="page" v-if="authChecked && !authenticated">
-    <h1>钛动账单工具</h1>
-    <form class="card login-card" @submit.prevent="handleLogin">
-      <h2>登录</h2>
-      <div class="field">
-        <label>用户名</label>
-        <input v-model="loginForm.username" type="text" autocomplete="username" />
+  <div class="login-page" v-if="authChecked && !authenticated">
+    <div class="login-panel">
+      <div class="login-brand">
+        <div class="login-logo" aria-hidden="true">WC</div>
+        <h1 class="login-title">WCNB账单系统</h1>
+        <p class="login-tagline">日志上传 · 账单生成 · 成本核算</p>
       </div>
-      <div class="field">
-        <label>密码</label>
-        <input v-model="loginForm.password" type="password" autocomplete="current-password" />
-      </div>
-      <button type="submit" :disabled="loginLoading">{{ loginLoading ? '登录中…' : '登录' }}</button>
-      <p class="error" v-if="loginError">{{ loginError }}</p>
-    </form>
+      <form class="login-card" @submit.prevent="handleLogin" novalidate>
+        <h2>欢迎登录</h2>
+        <p class="login-desc">请使用管理员分配的账号登录</p>
+        <div class="login-field">
+          <label for="login-username">用户名</label>
+          <input
+            id="login-username"
+            v-model="loginForm.username"
+            type="text"
+            autocomplete="username"
+            placeholder="请输入用户名"
+            autofocus
+          />
+        </div>
+        <div class="login-field">
+          <label for="login-password">密码</label>
+          <input
+            id="login-password"
+            v-model="loginForm.password"
+            type="password"
+            autocomplete="current-password"
+            placeholder="请输入密码"
+          />
+        </div>
+        <p class="login-error" v-if="loginError">{{ loginError }}</p>
+        <button type="submit" class="login-submit" :disabled="loginLoading">
+          {{ loginLoading ? '登录中…' : '登 录' }}
+        </button>
+      </form>
+      <p class="login-footer">WCNB账单系统</p>
+    </div>
   </div>
 
   <div class="page" v-else-if="authChecked">
     <div class="topbar">
-      <h1>钛动账单工具</h1>
+      <h1>WCNB账单系统</h1>
       <button type="button" class="btn-logout" @click="handleLogout">退出登录</button>
     </div>
     <p class="subtitle">上传日志（xlsx / csv / tsv），生成账单与脱敏日志</p>
@@ -1835,9 +1858,146 @@ async function handleSubmit() {
   cursor: pointer;
   font-size: 13px;
 }
+/* ---------- 登录页 ---------- */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  box-sizing: border-box;
+  font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  color: #1f2328;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #dbe7ff 0%, rgba(219, 231, 255, 0) 60%),
+    radial-gradient(900px 500px at 110% 110%, #e6f0ff 0%, rgba(230, 240, 255, 0) 60%),
+    linear-gradient(180deg, #f6f8fc 0%, #eef2f9 100%);
+}
+.login-panel {
+  width: 100%;
+  max-width: 400px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+.login-brand {
+  text-align: center;
+  margin-bottom: 28px;
+}
+.login-logo {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 14px;
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #fff;
+  background: linear-gradient(135deg, #3b82f6 0%, #2c6ef2 55%, #1d4ed8 100%);
+  box-shadow: 0 8px 20px rgba(44, 110, 242, 0.3);
+}
+.login-title {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #1f2328;
+}
+.login-tagline {
+  margin: 8px 0 0;
+  font-size: 13px;
+  color: #6b7280;
+  letter-spacing: 1px;
+}
 .login-card {
-  max-width: 360px;
-  margin: 60px auto 0;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 32px 32px 28px;
+  background: #fff;
+  border: 1px solid #e5e9f2;
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(31, 35, 40, 0.08);
+}
+.login-card h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+.login-desc {
+  margin: 6px 0 22px;
+  font-size: 13px;
+  color: #8a94a6;
+}
+.login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.login-field label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #4b5563;
+}
+.login-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 11px 14px;
+  font-size: 14px;
+  color: #1f2328;
+  background: #f8fafc;
+  border: 1px solid #d9dfe8;
+  border-radius: 10px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.login-field input::placeholder {
+  color: #a3adbd;
+}
+.login-field input:focus {
+  background: #fff;
+  border-color: #2c6ef2;
+  box-shadow: 0 0 0 3px rgba(44, 110, 242, 0.15);
+}
+.login-error {
+  margin: -4px 0 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #b42318;
+  background: #fef3f2;
+  border: 1px solid #fecdca;
+  border-radius: 8px;
+}
+.login-submit {
+  width: 100%;
+  margin-top: 6px;
+  padding: 12px 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #3b82f6 0%, #2c6ef2 100%);
+  box-shadow: 0 6px 16px rgba(44, 110, 242, 0.28);
+  transition: transform 0.1s, box-shadow 0.15s, filter 0.15s;
+}
+.login-submit:hover:not(:disabled) {
+  filter: brightness(1.05);
+  box-shadow: 0 8px 20px rgba(44, 110, 242, 0.35);
+}
+.login-submit:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.login-submit:disabled {
+  background: #9db8ee;
+  box-shadow: none;
+}
+.login-footer {
+  margin: 22px 0 0;
+  font-size: 12px;
+  color: #a3adbd;
 }
 .source-switch {
   margin-bottom: 12px;

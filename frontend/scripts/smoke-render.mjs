@@ -417,10 +417,14 @@ await scenario('上游计费方式页：空状态不得抛异常', ChannelModelB
 console.log('检查二：App.vue 各状态渲染')
 const App = await loadSfc('App.vue')
 
+await scenario('登录页：未登录状态', App, { authChecked: true, authenticated: false, loginError: '用户名或密码错误' }, {
+  has: ['WCNB账单系统', '欢迎登录', '用户名', '密码', '用户名或密码错误'],
+})
+
 await scenario('出账页：登录后空状态', App, { authChecked: true, authenticated: true }, {
   // 没有 has 会让「什么都没渲染」也算通过（authChecked 不置位时就是这样），
   // 所以必须断言页面骨架真的出来了。
-  has: ['钛动账单工具', '生成账单'],
+  has: ['WCNB账单系统', '生成账单'],
 })
 
 await scenario('出账页：渠道检查结果里的国模列', App, {
@@ -454,7 +458,7 @@ await scenario('出账页：渠道检查数据缺字段 → 不得抛异常', Ap
   checkChannelsDone: true,
   usedChannels: [{ channelId: 1 }, { channelId: 2, upstreamRatio: 'x' }],
   usedRatioDraft: {}, usedDomesticDraft: {}, usedReviewById: {},
-}, { has: ['钛动账单工具'] })
+}, { has: ['WCNB账单系统'] })
 
 // ---------------------------------------------------------------------------
 // 检查三：交互逻辑。
