@@ -384,14 +384,6 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	if err != nil {
 		return nil, err
 	}
-	query, args := buildLogExportQuery(table, params, hasChannelID)
-
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("查询 %s 表失败: %w", table, err)
-	}
-	defer rows.Close()
-
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建输出目录失败: %w", err)
 	}
@@ -418,19 +410,28 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 		return nil, fmt.Errorf("写入表头失败: %w", err)
 	}
 
+	// 按时间窗口分段查询，而不是一条 SQL 查整个账期：
+	// ORDER BY created_at, id 配合 type IN (2, 6) 通常走不了索引顺序，MySQL 要先把
+	// 整个区间内**所有用户**的候选行 filesort 完才开始返回第一行。账期大时这一步
+	// 远超 readTimeout，驱动读不到任何包就报 i/o timeout，连接随即被标记失效，
+	// 表现为「查询 logs 表失败: invalid connection」。
+	// 窗口按时间顺序依次执行，每个窗口内再按 (created_at, id) 排序，拼起来的
+	// 整体顺序与单条 SQL 完全一致。
 	var count int64
-	for rows.Next() {
-		record, err := scanLogRecord(rows, params.IncludeUserID, hasChannelID)
+	startUnix, endUnix := params.StartTime.Unix(), params.ExportQueryEnd().Unix()
+	for ws := startUnix; ws < endUnix; ws += logExportWindowSeconds {
+		we := ws + logExportWindowSeconds
+		if we > endUnix {
+			we = endUnix
+		}
+		window := params
+		window.StartTime = time.Unix(ws, 0)
+		window.EndTime = time.Unix(we-1, 0)
+		n, err := exportLogWindow(db, w, table, window, hasChannelID, count)
 		if err != nil {
-			return nil, fmt.Errorf("读取第 %d 行失败: %w", count+1, err)
+			return nil, err
 		}
-		if err := writeTSVRecord(w, record); err != nil {
-			return nil, fmt.Errorf("写入第 %d 行失败: %w", count+1, err)
-		}
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("读取 %s 表数据失败: %w", table, err)
+		count = n
 	}
 	if err := w.Flush(); err != nil {
 		return nil, fmt.Errorf("刷新输出缓冲失败: %w", err)
@@ -450,6 +451,34 @@ func ExportLogsFromDB(cfg DBConfig, outDir string, params LogExportParams) (*Log
 	return &LogExportResult{
 		Path: finalPath, RowCount: count, StartedAt: started, FinishedAt: time.Now(),
 	}, nil
+}
+
+// logExportWindowSeconds 单次查询覆盖的时间跨度（6 小时）。
+const logExportWindowSeconds int64 = 6 * 3600
+
+// exportLogWindow 查询一个时间窗口并把结果写入 w，返回累计行数。
+func exportLogWindow(db *sql.DB, w *bufio.Writer, table string, params LogExportParams, hasChannelID bool, count int64) (int64, error) {
+	query, args := buildLogExportQuery(table, params, hasChannelID)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return count, fmt.Errorf("查询 %s 表失败: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		record, err := scanLogRecord(rows, params.IncludeUserID, hasChannelID)
+		if err != nil {
+			return count, fmt.Errorf("读取第 %d 行失败: %w", count+1, err)
+		}
+		if err := writeTSVRecord(w, record); err != nil {
+			return count, fmt.Errorf("写入第 %d 行失败: %w", count+1, err)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return count, fmt.Errorf("读取 %s 表数据失败: %w", table, err)
+	}
+	return count, nil
 }
 
 // scanLogRecord 读取一行并按导出列顺序返回单元格文本。
