@@ -693,7 +693,11 @@ func handleSaveGroupDiscounts(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		CustomerID int64 `json:"customerId"`
-		Items      []struct {
+		// Merge 为真时只增补/修改提交的分组，不动该客户其它已维护的折扣。
+		// 出账时的「就地补录」只提交缺的那几个分组，若走覆盖式保存，
+		// 会把之前维护好的分组全部清掉，下一轮又缺它们，来回反复。
+		Merge bool `json:"merge"`
+		Items []struct {
 			GroupKey string  `json:"groupKey"`
 			Discount *string `json:"discount"` // 前端提交的是原始文本，如「6折」
 			Note     string  `json:"note"`
@@ -726,6 +730,15 @@ func handleSaveGroupDiscounts(w http.ResponseWriter, r *http.Request) {
 		}
 		// 提交了空折扣 = 撤销该分组的手工值，回到自动折扣（in.Discount 保持 nil）。
 		items = append(items, in)
+	}
+
+	if body.Merge {
+		existing, err := billing.ListCustomerGroupDiscounts(*pgConfig, body.CustomerID)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		items = billing.MergeGroupDiscountInputs(existing, items)
 	}
 
 	if err := billing.UpsertCustomerGroupDiscounts(*pgConfig, body.CustomerID, items); err != nil {

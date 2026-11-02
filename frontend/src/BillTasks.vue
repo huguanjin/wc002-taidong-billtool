@@ -606,7 +606,7 @@ async function saveBlockedDiscounts() {
       const resp = await fetch('/api/save-group-discounts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customerId: c.customerId, items }),
+        body: JSON.stringify({ customerId: c.customerId, items, merge: true }),
       })
       const data = await resp.json()
       if (!resp.ok) {

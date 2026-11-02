@@ -120,6 +120,24 @@ func UpsertCustomerGroupDiscounts(cfg PGConfig, customerID int64, items []GroupD
 	return nil
 }
 
+// MergeGroupDiscountInputs 把已有折扣与本次提交合并成一份完整的覆盖式提交：
+// 提交里同名分组覆盖已有值（含 nil = 撤销），其余已有分组原样保留。
+func MergeGroupDiscountInputs(existing []GroupDiscountRow, submitted []GroupDiscountInput) []GroupDiscountInput {
+	touched := make(map[string]bool, len(submitted))
+	for _, it := range submitted {
+		touched[strings.TrimSpace(it.GroupKey)] = true
+	}
+	out := make([]GroupDiscountInput, 0, len(existing)+len(submitted))
+	for _, r := range existing {
+		if touched[r.GroupKey] {
+			continue
+		}
+		d := r.Discount
+		out = append(out, GroupDiscountInput{GroupKey: r.GroupKey, Discount: &d, Note: r.Note})
+	}
+	return append(out, submitted...)
+}
+
 // ListCustomerGroupDiscounts 读一个客户已维护的手工折扣，按分组名排序。
 func ListCustomerGroupDiscounts(cfg PGConfig, customerID int64) ([]GroupDiscountRow, error) {
 	rows := []GroupDiscountRow{}
