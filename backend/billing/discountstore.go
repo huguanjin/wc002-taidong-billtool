@@ -3,6 +3,8 @@ package billing
 import (
 	"database/sql"
 	"fmt"
+	"net"
+	"net/url"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -29,8 +31,15 @@ func (c PGConfig) dsn() string {
 	if sslMode == "" {
 		sslMode = "disable"
 	}
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s",
-		c.User, c.Password, c.Host, port, c.DBName, sslMode)
+	// 用户名/密码必须经 url 转义：密码里含 @ : / # ? 等字符时直接拼接会让连接串被错误切分。
+	u := url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(c.User, c.Password),
+		Host:     net.JoinHostPort(c.Host, port),
+		Path:     "/" + c.DBName,
+		RawQuery: "sslmode=" + url.QueryEscape(sslMode),
+	}
+	return u.String()
 }
 
 // EnsureUserDiscountSchema 建表（幂等），启动时调用一次。
