@@ -86,6 +86,9 @@ func main() {
 		if err := billing.EnsureCustomerGroupDiscountSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化客户手工折扣表失败，手工折扣功能可能不可用: %v", err)
 		}
+		if err := billing.EnsureKeyResourceSchema(*pgConfig); err != nil {
+			log.Printf("警告: 初始化上 key 资源整理表失败，上 key 资源整理功能可能不可用: %v", err)
+		}
 		if err := billing.EnsureSettingsSchema(*pgConfig); err != nil {
 			log.Printf("警告: 初始化默认出账参数表失败，账单任务功能可能不可用: %v", err)
 		}
@@ -116,6 +119,10 @@ func main() {
 	mux.HandleFunc("/api/check-channels", withCORS(requireAuth(handleCheckChannels)))
 	mux.HandleFunc("/api/customers", withCORS(requireAuth(handleCustomers)))
 	mux.HandleFunc("/api/delete-customer", withCORS(requireAuth(handleDeleteCustomer)))
+	mux.HandleFunc("/api/key-stages", withCORS(requireAuth(handleKeyStages)))
+	mux.HandleFunc("/api/delete-key-stage", withCORS(requireAuth(handleDeleteKeyStage)))
+	mux.HandleFunc("/api/key-sources", withCORS(requireAuth(handleKeySources)))
+	mux.HandleFunc("/api/delete-key-source", withCORS(requireAuth(handleDeleteKeySource)))
 	mux.HandleFunc("/api/group-discounts", withCORS(requireAuth(handleGroupDiscounts)))
 	mux.HandleFunc("/api/save-group-discounts", withCORS(requireAuth(handleSaveGroupDiscounts)))
 	mux.HandleFunc("/api/bill-tasks", withCORS(requireAuth(handleBillTasks)))

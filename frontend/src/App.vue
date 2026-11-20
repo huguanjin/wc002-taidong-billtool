@@ -5,6 +5,7 @@ import Customers from './Customers.vue'
 import BillTasks from './BillTasks.vue'
 import CustomerDiscounts from './CustomerDiscounts.vue'
 import ChannelModelBilling from './ChannelModelBilling.vue'
+import KeyResources from './KeyResources.vue'
 import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
@@ -1071,6 +1072,11 @@ async function handleSubmit() {
         :class="{ active: activePage === 'upstreamBilling' }"
         @click="activePage = 'upstreamBilling'"
       >上游计费方式</button>
+      <button
+        type="button"
+        :class="{ active: activePage === 'keyResources' }"
+        @click="activePage = 'keyResources'"
+      >上key资源整理</button>
     </div>
 
     <!-- 账单导出任务：独立页面 -->
@@ -1104,6 +1110,12 @@ async function handleSubmit() {
     <!-- 上游计费方式（按次 / 按量）：独立页面 -->
     <ChannelModelBilling
       v-if="activePage === 'upstreamBilling'"
+      @unauthorized="authenticated = false"
+    />
+
+    <!-- 上 key 资源整理：台子管理 + 货源整理 -->
+    <KeyResources
+      v-if="activePage === 'keyResources'"
       @unauthorized="authenticated = false"
     />
 
