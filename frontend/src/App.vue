@@ -5,13 +5,49 @@ import Customers from './Customers.vue'
 import BillTasks from './BillTasks.vue'
 import CustomerDiscounts from './CustomerDiscounts.vue'
 import ChannelModelBilling from './ChannelModelBilling.vue'
-import KeyResources from './KeyResources.vue'
+import KeyStages from './KeyStages.vue'
+import KeySources from './KeySources.vue'
 import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
 // 用标签页而不是 vue-router：整站就这么几块内容，装一个路由不划算
 // （而且后端把 dist 当静态目录直接托管，没有 SPA fallback，深链会 404）。
 const activePage = ref('bill')
+
+// 侧边栏菜单：两个一级菜单，各带子菜单。page 对应 activePage 的取值。
+const menu = [
+  {
+    key: 'billing',
+    label: '账单管理',
+    items: [
+      { page: 'bill', label: '生成账单' },
+      { page: 'tasks', label: '账单任务' },
+      { page: 'customers', label: '客户信息' },
+      { page: 'channels', label: '渠道成本倍率' },
+      { page: 'discounts', label: '客户折扣' },
+      { page: 'upstreamBilling', label: '上游计费方式' },
+    ],
+  },
+  {
+    key: 'keys',
+    label: '上key资源整理',
+    items: [
+      { page: 'keyStages', label: '台子管理' },
+      { page: 'keySources', label: '上key货源整理' },
+    ],
+  },
+]
+const openGroups = ref({ billing: true, keys: true })
+function toggleGroup(key) {
+  openGroups.value[key] = !openGroups.value[key]
+}
+const currentTitle = computed(() => {
+  for (const g of menu) {
+    const hit = g.items.find((i) => i.page === activePage.value)
+    if (hit) return hit.label
+  }
+  return 'WCNB账单系统'
+})
 const channelRatiosRef = ref(null)
 const customersRef = ref(null)
 const customerDiscountsRef = ref(null)
@@ -1034,50 +1070,40 @@ async function handleSubmit() {
     </div>
   </div>
 
-  <div class="page" v-else-if="authChecked">
-    <div class="topbar">
-      <h1>WCNB账单系统</h1>
-      <button type="button" class="btn-logout" @click="handleLogout">退出登录</button>
-    </div>
-    <p class="subtitle">上传日志（xlsx / csv / tsv），生成账单与脱敏日志</p>
+  <div class="layout" v-else-if="authChecked">
+    <aside class="sidebar">
+      <div class="sidebar-brand">WCNB账单系统</div>
+      <nav class="sidebar-nav">
+        <div class="menu-group" v-for="g in menu" :key="g.key">
+          <button
+            type="button"
+            class="menu-group-title"
+            :class="{ 'has-active': g.items.some((i) => i.page === activePage) }"
+            @click="toggleGroup(g.key)"
+          >
+            <span>{{ g.label }}</span>
+            <span class="chevron" :class="{ open: openGroups[g.key] }">›</span>
+          </button>
+          <div class="menu-items" v-show="openGroups[g.key]">
+            <button
+              type="button"
+              class="menu-item"
+              v-for="item in g.items"
+              :key="item.page"
+              :class="{ active: activePage === item.page }"
+              @click="activePage = item.page"
+            >{{ item.label }}</button>
+          </div>
+        </div>
+      </nav>
+      <button type="button" class="btn-logout sidebar-logout" @click="handleLogout">退出登录</button>
+    </aside>
 
-    <div class="page-tabs">
-      <button
-        type="button"
-        :class="{ active: activePage === 'bill' }"
-        @click="activePage = 'bill'"
-      >生成账单</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'tasks' }"
-        @click="activePage = 'tasks'"
-      >账单任务</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'customers' }"
-        @click="activePage = 'customers'"
-      >客户信息</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'channels' }"
-        @click="activePage = 'channels'"
-      >渠道成本倍率</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'discounts' }"
-        @click="activePage = 'discounts'"
-      >客户折扣</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'upstreamBilling' }"
-        @click="activePage = 'upstreamBilling'"
-      >上游计费方式</button>
-      <button
-        type="button"
-        :class="{ active: activePage === 'keyResources' }"
-        @click="activePage = 'keyResources'"
-      >上key资源整理</button>
+    <main class="page">
+    <div class="topbar">
+      <h1>{{ currentTitle }}</h1>
     </div>
+    <p class="subtitle" v-if="activePage === 'bill'">上传日志（xlsx / csv / tsv），生成账单与脱敏日志</p>
 
     <!-- 账单导出任务：独立页面 -->
     <BillTasks
@@ -1113,9 +1139,13 @@ async function handleSubmit() {
       @unauthorized="authenticated = false"
     />
 
-    <!-- 上 key 资源整理：台子管理 + 货源整理 -->
-    <KeyResources
-      v-if="activePage === 'keyResources'"
+    <!-- 上 key 资源整理：台子管理、货源整理 -->
+    <KeyStages
+      v-if="activePage === 'keyStages'"
+      @unauthorized="authenticated = false"
+    />
+    <KeySources
+      v-if="activePage === 'keySources'"
       @unauthorized="authenticated = false"
     />
 
@@ -1841,16 +1871,117 @@ async function handleSubmit() {
       </div>
     </div>
     </template>
+    </main>
   </div>
 </template>
 
 <style scoped>
-.page {
-  max-width: 1080px;
-  margin: 0 auto;
-  padding: 24px;
+.layout {
+  display: flex;
+  min-height: 100vh;
   font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', sans-serif;
   color: #1f2328;
+}
+.sidebar {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: 100vh;
+  width: 220px;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 12px 16px;
+  background: #fff;
+  border-right: 1px solid #e3e6eb;
+  overflow-y: auto;
+}
+.sidebar-brand {
+  font-size: 18px;
+  font-weight: 700;
+  padding: 0 8px 18px;
+}
+.sidebar-nav {
+  flex: 1;
+}
+.menu-group {
+  margin-bottom: 8px;
+}
+.menu-group-title {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: none;
+  border: none;
+  padding: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #444;
+  cursor: pointer;
+  border-radius: 6px;
+  text-align: left;
+}
+.menu-group-title:hover {
+  background: #f5f7fa;
+}
+.menu-group-title.has-active {
+  color: #2c6ef2;
+}
+.chevron {
+  display: inline-block;
+  transition: transform 0.15s;
+  color: #999;
+}
+.chevron.open {
+  transform: rotate(90deg);
+}
+.menu-item {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  text-align: left;
+  padding: 8px 8px 8px 24px;
+  margin-top: 2px;
+  font-size: 14px;
+  color: #555;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.menu-item:hover {
+  background: #f5f7fa;
+}
+.menu-item.active {
+  background: #eaf1ff;
+  color: #2c6ef2;
+  font-weight: 600;
+}
+.sidebar-logout {
+  margin-top: 12px;
+}
+.page {
+  flex: 1;
+  min-width: 0;
+  max-width: 1280px;
+  box-sizing: border-box;
+  padding: 24px 32px;
+}
+@media (max-width: 768px) {
+  .layout {
+    flex-direction: column;
+  }
+  .sidebar {
+    position: static;
+    width: auto;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid #e3e6eb;
+  }
+  .page {
+    padding: 16px;
+  }
 }
 .subtitle {
   color: #666;
