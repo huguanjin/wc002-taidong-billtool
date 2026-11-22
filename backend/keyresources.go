@@ -87,6 +87,43 @@ func handleDeleteKeySource(w http.ResponseWriter, r *http.Request) {
 	handleDeleteKeyRow(w, r, "货源", billing.DeleteKeySource)
 }
 
+// handleKeyRecords 上 key 记录：GET 列表，POST 新增或更新。
+func handleKeyRecords(w http.ResponseWriter, r *http.Request) {
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），上 key 资源整理不可用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		records, err := billing.ListKeyRecords(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"records": records})
+
+	case http.MethodPost:
+		var in billing.KeyRecord
+		if !decodeJSONBody(w, r, &in) {
+			return
+		}
+		saved, err := billing.UpsertKeyRecord(*pgConfig, in)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"record": saved})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleDeleteKeyRecord 删除上 key 记录。
+func handleDeleteKeyRecord(w http.ResponseWriter, r *http.Request) {
+	handleDeleteKeyRow(w, r, "记录", billing.DeleteKeyRecord)
+}
+
 func handleDeleteKeyRow(w http.ResponseWriter, r *http.Request, label string, del func(billing.PGConfig, int64) error) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

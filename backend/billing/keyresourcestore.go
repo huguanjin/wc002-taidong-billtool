@@ -82,6 +82,30 @@ func EnsureKeyResourceSchema(cfg PGConfig) error {
 	`); err != nil {
 		return fmt.Errorf("创建 key_sources 表失败: %w", err)
 	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS key_records (
+			id BIGSERIAL PRIMARY KEY,
+			stage_id BIGINT NOT NULL DEFAULT 0,
+			stage_address TEXT NOT NULL DEFAULT '',
+			stage_contact TEXT NOT NULL DEFAULT '',
+			channel_id TEXT NOT NULL DEFAULT '',
+			supplier TEXT NOT NULL DEFAULT '',
+			consumption NUMERIC(20,6) NOT NULL DEFAULT 0,
+			cost_unit_price NUMERIC(20,6) NOT NULL DEFAULT 0,
+			cost_cny NUMERIC(20,6) NOT NULL DEFAULT 0,
+			fx_rate NUMERIC(20,6) NOT NULL DEFAULT 0,
+			cost_usdt NUMERIC(20,6) NOT NULL DEFAULT 0,
+			stage_unit_price NUMERIC(20,6) NOT NULL DEFAULT 0,
+			settle_cny NUMERIC(20,6) NOT NULL DEFAULT 0,
+			settle_usdt NUMERIC(20,6) NOT NULL DEFAULT 0,
+			alive TEXT NOT NULL DEFAULT '',
+			notes TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("创建 key_records 表失败: %w", err)
+	}
 	return nil
 }
 

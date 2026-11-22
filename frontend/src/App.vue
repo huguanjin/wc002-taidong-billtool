@@ -7,6 +7,7 @@ import CustomerDiscounts from './CustomerDiscounts.vue'
 import ChannelModelBilling from './ChannelModelBilling.vue'
 import KeyStages from './KeyStages.vue'
 import KeySources from './KeySources.vue'
+import KeyRecords from './KeyRecords.vue'
 import { copyText, selectElementText } from './clipboard'
 
 // 顶层页面切换：出账（默认）、账单任务、客户信息、渠道成本倍率。
@@ -34,6 +35,7 @@ const menu = [
     items: [
       { page: 'keyStages', label: '台子管理' },
       { page: 'keySources', label: '上key货源整理' },
+      { page: 'keyRecords', label: '上key记录管理' },
     ],
   },
 ]
@@ -1146,6 +1148,10 @@ async function handleSubmit() {
     />
     <KeySources
       v-if="activePage === 'keySources'"
+      @unauthorized="authenticated = false"
+    />
+    <KeyRecords
+      v-if="activePage === 'keyRecords'"
       @unauthorized="authenticated = false"
     />
 
