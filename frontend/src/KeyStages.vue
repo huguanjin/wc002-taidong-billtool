@@ -15,6 +15,9 @@ const deleting = ref(false)
 const error = ref('')
 const message = ref('')
 const keyword = ref('')
+// 表单弹窗：新增和编辑共用；表单内的错误单独显示，避免被弹窗遮住的列表区域吞掉。
+const showForm = ref(false)
+const formError = ref('')
 
 const emptyDraft = () => ({ id: 0, address: '', contact: '', models: [{ model: '', price: '' }], notes: '' })
 const draft = ref(emptyDraft())
@@ -59,9 +62,22 @@ function resetDraft() {
   draft.value = emptyDraft()
 }
 
-function startEdit(s) {
-  error.value = ''
+function openCreate() {
   message.value = ''
+  formError.value = ''
+  resetDraft()
+  showForm.value = true
+}
+
+function closeForm() {
+  showForm.value = false
+  formError.value = ''
+  resetDraft()
+}
+
+function startEdit(s) {
+  message.value = ''
+  formError.value = ''
   draft.value = {
     id: s.id,
     address: s.address,
@@ -69,7 +85,7 @@ function startEdit(s) {
     models: s.models.length > 0 ? s.models.map((m) => ({ ...m })) : [{ model: '', price: '' }],
     notes: s.notes || '',
   }
-  window.scrollTo && window.scrollTo({ top: 0, behavior: 'smooth' })
+  showForm.value = true
 }
 
 function addModelRow() {
@@ -82,10 +98,9 @@ function removeModelRow(i) {
 }
 
 async function saveStage() {
-  error.value = ''
-  message.value = ''
+  formError.value = ''
   if (!draft.value.address.trim()) {
-    error.value = '台子地址不能为空'
+    formError.value = '台子地址不能为空'
     return
   }
   saving.value = true
@@ -96,10 +111,10 @@ async function saveStage() {
       body: JSON.stringify(draft.value),
     })
     message.value = isEditing.value ? '已更新台子' : '已新增台子'
-    resetDraft()
+    closeForm()
     await loadStages()
   } catch (err) {
-    error.value = '保存失败：' + err.message
+    formError.value = '保存失败：' + err.message
   } finally {
     saving.value = false
   }
@@ -117,7 +132,6 @@ async function deleteStage(s) {
       body: JSON.stringify({ id: s.id }),
     })
     message.value = `已删除台子 #${s.id}`
-    if (draft.value.id === s.id) resetDraft()
     await loadStages()
   } catch (err) {
     error.value = '删除失败：' + err.message
@@ -132,38 +146,8 @@ defineExpose({ loadStages })
 
 <template>
   <div class="card">
-    <h2>台子管理</h2>
-    <p class="hint">维护收 key 的台子：地址、对接人、需求模型及对应价格、注意事项。台子 ID 由系统自动生成。</p>
-
-    <div class="form-grid">
-      <label class="full">
-        <span>台子地址<em class="req">*</em></span>
-        <input v-model="draft.address" type="text" placeholder="例如：https://example.com" />
-      </label>
-      <label class="full">
-        <span>对接人信息</span>
-        <textarea v-model="draft.contact" rows="2" placeholder="姓名、微信/QQ/电话等"></textarea>
-      </label>
-      <div class="full models-box">
-        <span class="label">需求模型及对应价格</span>
-        <div class="model-row" v-for="(m, i) in draft.models" :key="i">
-          <input v-model="m.model" type="text" placeholder="模型，例如：claude-opus-4" />
-          <input v-model="m.price" type="text" placeholder="价格，例如：0.8 元/刀" />
-          <button type="button" class="btn-link danger" @click="removeModelRow(i)">删除</button>
-        </div>
-        <button type="button" class="btn-browse small" @click="addModelRow">+ 添加模型</button>
-      </div>
-      <label class="full">
-        <span>注意事项</span>
-        <textarea v-model="draft.notes" rows="3" placeholder="例如：结算周期、限制条件"></textarea>
-      </label>
-    </div>
-
-    <div class="path-row">
-      <button type="button" class="btn-primary" @click="saveStage" :disabled="saving">
-        {{ saving ? '保存中…' : isEditing ? `保存修改（#${draft.id}）` : '新增台子' }}
-      </button>
-      <button type="button" class="btn-browse" @click="resetDraft" v-if="isEditing">取消编辑</button>
+    <div class="toolbar">
+      <button type="button" class="btn-primary" @click="openCreate">+ 新增台子</button>
       <button type="button" class="btn-browse" @click="loadStages" :disabled="loading">
         {{ loading ? '读取中…' : '刷新' }}
       </button>
@@ -185,7 +169,7 @@ defineExpose({ loadStages })
         </tr>
       </thead>
       <tbody>
-        <tr v-for="s in filtered" :key="s.id" :class="{ 'row-editing': draft.id === s.id }">
+        <tr v-for="s in filtered" :key="s.id">
           <td>{{ s.id }}</td>
           <td class="wrap">{{ s.address }}</td>
           <td class="wrap pre">{{ s.contact }}</td>
@@ -204,8 +188,51 @@ defineExpose({ loadStages })
       </tbody>
     </table>
     <span class="hint" v-else-if="loaded && stages.length > 0">没有匹配的台子。</span>
-    <span class="hint" v-else-if="!loading && loaded">还没有台子，先在上面新增一个。</span>
+    <span class="hint" v-else-if="!loading && loaded">还没有台子，点击上方「新增台子」添加。</span>
     <span class="hint" v-else-if="!loaded">正在读取台子列表…</span>
+
+    <div class="modal-mask" v-if="showForm">
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-head">
+          <h3>{{ isEditing ? `编辑台子 #${draft.id}` : '新增台子' }}</h3>
+          <button type="button" class="modal-close" @click="closeForm" aria-label="关闭">×</button>
+        </div>
+
+        <div class="modal-body">
+          <div class="form-grid">
+            <label class="full">
+              <span>台子地址<em class="req">*</em></span>
+              <input v-model="draft.address" type="text" placeholder="例如：https://example.com" />
+            </label>
+            <label class="full">
+              <span>对接人信息</span>
+              <textarea v-model="draft.contact" rows="2" placeholder="姓名、微信/QQ/电话等"></textarea>
+            </label>
+            <div class="full models-box">
+              <span class="label">需求模型及对应价格</span>
+              <div class="model-row" v-for="(m, i) in draft.models" :key="i">
+                <input v-model="m.model" type="text" placeholder="模型，例如：claude-opus-4" />
+                <input v-model="m.price" type="text" placeholder="价格，例如：0.8 元/刀" />
+                <button type="button" class="btn-link danger" @click="removeModelRow(i)">删除</button>
+              </div>
+              <button type="button" class="btn-browse small" @click="addModelRow">+ 添加模型</button>
+            </div>
+            <label class="full">
+              <span>注意事项</span>
+              <textarea v-model="draft.notes" rows="3" placeholder="例如：结算周期、限制条件"></textarea>
+            </label>
+          </div>
+          <p class="error" v-if="formError">{{ formError }}</p>
+        </div>
+
+        <div class="modal-foot">
+          <button type="button" class="btn-browse" @click="closeForm" :disabled="saving">取消</button>
+          <button type="button" class="btn-primary" @click="saveStage" :disabled="saving">
+            {{ saving ? '保存中…' : '保存' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -238,6 +265,63 @@ defineExpose({ loadStages })
 }
 .full {
   grid-column: 1 / -1;
+}
+.toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 1000;
+}
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  width: 100%;
+  max-width: 640px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid #eee;
+}
+.modal-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  line-height: 1;
+  color: #888;
+  cursor: pointer;
+}
+.modal-body {
+  padding: 4px 20px 12px;
+  overflow-y: auto;
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid #eee;
 }
 .req {
   color: #d92626;
