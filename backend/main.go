@@ -123,6 +123,8 @@ func main() {
 	mux.HandleFunc("/api/delete-key-stage", withCORS(requireAuth(handleDeleteKeyStage)))
 	mux.HandleFunc("/api/key-sources", withCORS(requireAuth(handleKeySources)))
 	mux.HandleFunc("/api/delete-key-source", withCORS(requireAuth(handleDeleteKeySource)))
+	mux.HandleFunc("/api/key-categories", withCORS(requireAuth(handleKeyCategories)))
+	mux.HandleFunc("/api/delete-key-category", withCORS(requireAuth(handleDeleteKeyCategory)))
 	mux.HandleFunc("/api/key-records", withCORS(requireAuth(handleKeyRecords)))
 	mux.HandleFunc("/api/delete-key-record", withCORS(requireAuth(handleDeleteKeyRecord)))
 	mux.HandleFunc("/api/group-discounts", withCORS(requireAuth(handleGroupDiscounts)))

@@ -87,6 +87,43 @@ func handleDeleteKeySource(w http.ResponseWriter, r *http.Request) {
 	handleDeleteKeyRow(w, r, "货源", billing.DeleteKeySource)
 }
 
+// handleKeyCategories 资源类别：GET 列表，POST 新增或更新。
+func handleKeyCategories(w http.ResponseWriter, r *http.Request) {
+	if pgConfig == nil {
+		httpError(w, http.StatusBadRequest, "未配置 PostgreSQL（BILL_PG_*），上 key 资源整理不可用")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cats, err := billing.ListKeyCategories(*pgConfig)
+		if err != nil {
+			httpError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"categories": cats})
+
+	case http.MethodPost:
+		var in billing.KeyCategory
+		if !decodeJSONBody(w, r, &in) {
+			return
+		}
+		saved, err := billing.UpsertKeyCategory(*pgConfig, in)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"category": saved})
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleDeleteKeyCategory 删除资源类别，并解除台子上对它的绑定。
+func handleDeleteKeyCategory(w http.ResponseWriter, r *http.Request) {
+	handleDeleteKeyRow(w, r, "资源类别", billing.DeleteKeyCategory)
+}
+
 // handleKeyRecords 上 key 记录：GET 列表，POST 新增或更新。
 func handleKeyRecords(w http.ResponseWriter, r *http.Request) {
 	if pgConfig == nil {

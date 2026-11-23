@@ -20,13 +20,14 @@ type KeyStageModel struct {
 
 // KeyStage 一个台子。ID 由数据库自增，作为台子编号展示。
 type KeyStage struct {
-	ID        int64           `json:"id"`
-	Address   string          `json:"address"`
-	Contact   string          `json:"contact"`
-	Models    []KeyStageModel `json:"models"`
-	Notes     string          `json:"notes"`
-	CreatedAt time.Time       `json:"createdAt"`
-	UpdatedAt time.Time       `json:"updatedAt"`
+	ID          int64           `json:"id"`
+	Address     string          `json:"address"`
+	Contact     string          `json:"contact"`
+	Models      []KeyStageModel `json:"models"`
+	CategoryIDs []int64         `json:"categoryIds"` // 绑定的资源类别（可多选）
+	Notes       string          `json:"notes"`
+	CreatedAt   time.Time       `json:"createdAt"`
+	UpdatedAt   time.Time       `json:"updatedAt"`
 }
 
 // KeySource 一条上 key 货源。ID 即货源序号。
@@ -65,6 +66,21 @@ func EnsureKeyResourceSchema(cfg PGConfig) error {
 		)
 	`); err != nil {
 		return fmt.Errorf("创建 key_stages 表失败: %w", err)
+	}
+	// 老库上的 key_stages 没有类别列，补上（幂等）。
+	if _, err := db.Exec(`ALTER TABLE key_stages ADD COLUMN IF NOT EXISTS category_ids JSONB NOT NULL DEFAULT '[]'`); err != nil {
+		return fmt.Errorf("为 key_stages 增加 category_ids 列失败: %w", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS key_categories (
+			id BIGSERIAL PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			description TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("创建 key_categories 表失败: %w", err)
 	}
 	if _, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS key_sources (
@@ -132,7 +148,7 @@ func ListKeyStages(cfg PGConfig) ([]KeyStage, error) {
 	defer db.Close()
 
 	rows, err := db.Query(`
-		SELECT id, address, contact, models, notes, created_at, updated_at
+		SELECT id, address, contact, models, category_ids::text, notes, created_at, updated_at
 		FROM key_stages ORDER BY id
 	`)
 	if err != nil {
@@ -143,13 +159,16 @@ func ListKeyStages(cfg PGConfig) ([]KeyStage, error) {
 	out := []KeyStage{}
 	for rows.Next() {
 		var s KeyStage
-		var models string
-		if err := rows.Scan(&s.ID, &s.Address, &s.Contact, &models, &s.Notes, &s.CreatedAt, &s.UpdatedAt); err != nil {
+		var models, cats string
+		if err := rows.Scan(&s.ID, &s.Address, &s.Contact, &models, &cats, &s.Notes, &s.CreatedAt, &s.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("读取台子列表失败: %w", err)
 		}
 		// 解析失败按空列表处理：一行坏数据不应让整张台账打不开。
 		if err := json.Unmarshal([]byte(models), &s.Models); err != nil || s.Models == nil {
 			s.Models = []KeyStageModel{}
+		}
+		if err := json.Unmarshal([]byte(cats), &s.CategoryIDs); err != nil || s.CategoryIDs == nil {
+			s.CategoryIDs = []int64{}
 		}
 		out = append(out, s)
 	}
@@ -172,6 +191,11 @@ func UpsertKeyStage(cfg PGConfig, s KeyStage) (KeyStage, error) {
 	if err != nil {
 		return KeyStage{}, fmt.Errorf("序列化需求模型失败: %w", err)
 	}
+	s.CategoryIDs = cleanCategoryIDs(s.CategoryIDs)
+	cats, err := json.Marshal(s.CategoryIDs)
+	if err != nil {
+		return KeyStage{}, fmt.Errorf("序列化资源类别失败: %w", err)
+	}
 
 	db, err := sql.Open("pgx", cfg.dsn())
 	if err != nil {
@@ -181,17 +205,17 @@ func UpsertKeyStage(cfg PGConfig, s KeyStage) (KeyStage, error) {
 
 	if s.ID == 0 {
 		err = db.QueryRow(`
-			INSERT INTO key_stages (address, contact, models, notes)
-			VALUES ($1, $2, $3, $4)
+			INSERT INTO key_stages (address, contact, models, category_ids, notes)
+			VALUES ($1, $2, $3, $4::jsonb, $5)
 			RETURNING id, created_at, updated_at
-		`, s.Address, s.Contact, string(raw), s.Notes).Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt)
+		`, s.Address, s.Contact, string(raw), string(cats), s.Notes).Scan(&s.ID, &s.CreatedAt, &s.UpdatedAt)
 	} else {
 		err = db.QueryRow(`
 			UPDATE key_stages
-			SET address = $2, contact = $3, models = $4, notes = $5, updated_at = now()
+			SET address = $2, contact = $3, models = $4, category_ids = $5::jsonb, notes = $6, updated_at = now()
 			WHERE id = $1
 			RETURNING created_at, updated_at
-		`, s.ID, s.Address, s.Contact, string(raw), s.Notes).Scan(&s.CreatedAt, &s.UpdatedAt)
+		`, s.ID, s.Address, s.Contact, string(raw), string(cats), s.Notes).Scan(&s.CreatedAt, &s.UpdatedAt)
 		if err == sql.ErrNoRows {
 			return KeyStage{}, fmt.Errorf("台子不存在（可能已被删除）")
 		}

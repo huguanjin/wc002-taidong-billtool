@@ -19,15 +19,41 @@ const keyword = ref('')
 const showForm = ref(false)
 const formError = ref('')
 
-const emptyDraft = () => ({ id: 0, address: '', contact: '', models: [{ model: '', price: '' }], notes: '' })
+const emptyDraft = () => ({
+  id: 0,
+  address: '',
+  contact: '',
+  models: [{ model: '', price: '' }],
+  categoryIds: [],
+  notes: '',
+})
 const draft = ref(emptyDraft())
 const isEditing = computed(() => draft.value.id > 0)
+
+// 资源类别：台子上只存类别 ID，名称现查，类别改名后这里自动跟着变。
+const categories = ref([])
+const catOpen = ref(false)
+
+function categoryName(id) {
+  const hit = categories.value.find((c) => c.id === id)
+  return hit ? hit.name : ''
+}
+
+// 已被删除的类别（名称查不到）不展示。
+function categoryNames(s) {
+  return (s.categoryIds || []).map(categoryName).filter((n) => n !== '')
+}
+
+// 焦点移出下拉区域（含点到页面其它地方）时收起；在区域内部切换焦点不收起。
+function onCatFocusOut(e) {
+  if (!e.currentTarget.contains(e.relatedTarget)) catOpen.value = false
+}
 
 const filtered = computed(() => {
   const k = keyword.value.trim().toLowerCase()
   if (!k) return stages.value
   return stages.value.filter((s) =>
-    [String(s.id), s.address, s.contact, s.notes, ...s.models.map((m) => m.model)]
+    [String(s.id), s.address, s.contact, s.notes, ...s.models.map((m) => m.model), ...categoryNames(s)]
       .join('\n')
       .toLowerCase()
       .includes(k),
@@ -42,6 +68,15 @@ async function api(url, options) {
     throw new Error(data.error || `请求失败（${resp.status}）`)
   }
   return data
+}
+
+async function loadCategories() {
+  try {
+    const data = await api('/api/key-categories')
+    categories.value = data.categories || []
+  } catch (err) {
+    error.value = '读取资源类别失败：' + err.message
+  }
 }
 
 async function loadStages() {
@@ -60,6 +95,7 @@ async function loadStages() {
 
 function resetDraft() {
   draft.value = emptyDraft()
+  catOpen.value = false
 }
 
 function openCreate() {
@@ -67,6 +103,7 @@ function openCreate() {
   formError.value = ''
   resetDraft()
   showForm.value = true
+  loadCategories()
 }
 
 function closeForm() {
@@ -83,9 +120,12 @@ function startEdit(s) {
     address: s.address,
     contact: s.contact || '',
     models: s.models.length > 0 ? s.models.map((m) => ({ ...m })) : [{ model: '', price: '' }],
+    categoryIds: [...(s.categoryIds || [])],
     notes: s.notes || '',
   }
+  catOpen.value = false
   showForm.value = true
+  loadCategories()
 }
 
 function addModelRow() {
@@ -140,7 +180,10 @@ async function deleteStage(s) {
   }
 }
 
-onMounted(loadStages)
+onMounted(() => {
+  loadStages()
+  loadCategories()
+})
 defineExpose({ loadStages })
 </script>
 
@@ -148,10 +191,10 @@ defineExpose({ loadStages })
   <div class="card">
     <div class="toolbar">
       <button type="button" class="btn-primary" @click="openCreate">+ 新增台子</button>
-      <button type="button" class="btn-browse" @click="loadStages" :disabled="loading">
+      <button type="button" class="btn-browse" @click="loadStages(); loadCategories()" :disabled="loading">
         {{ loading ? '读取中…' : '刷新' }}
       </button>
-      <input v-model="keyword" type="text" class="search" placeholder="搜索 ID / 地址 / 对接人 / 模型 / 注意事项" />
+      <input v-model="keyword" type="text" class="search" placeholder="搜索 ID / 地址 / 对接人 / 模型 / 类别 / 注意事项" />
     </div>
 
     <p class="error" v-if="error">{{ error }}</p>
@@ -163,6 +206,7 @@ defineExpose({ loadStages })
           <th>台子ID</th>
           <th>台子地址</th>
           <th>对接人</th>
+          <th>资源类别</th>
           <th>需求模型 / 价格</th>
           <th>注意事项</th>
           <th>操作</th>
@@ -173,6 +217,9 @@ defineExpose({ loadStages })
           <td>{{ s.id }}</td>
           <td class="wrap">{{ s.address }}</td>
           <td class="wrap pre">{{ s.contact }}</td>
+          <td>
+            <span v-for="n in categoryNames(s)" :key="n" class="tag cat">{{ n }}</span>
+          </td>
           <td>
             <div v-for="(m, i) in s.models" :key="i" class="model-line">
               <span class="tag">{{ m.model }}</span>
@@ -208,6 +255,28 @@ defineExpose({ loadStages })
               <span>对接人信息</span>
               <textarea v-model="draft.contact" rows="2" placeholder="姓名、微信/QQ/电话等"></textarea>
             </label>
+            <div class="full cat-box" @focusout="onCatFocusOut">
+              <span class="label">资源类别（可多选）</span>
+              <button type="button" class="cat-trigger" @click="catOpen = !catOpen">
+                <span class="placeholder" v-if="draft.categoryIds.length === 0">请选择资源类别</span>
+                <template v-else>
+                  <span v-for="cid in draft.categoryIds" :key="cid" class="tag cat">{{ categoryName(cid) || '（已删除）' }}</span>
+                </template>
+                <span class="caret">▾</span>
+              </button>
+              <ul class="cat-list" v-if="catOpen">
+                <li v-for="c in categories" :key="c.id">
+                  <label>
+                    <input type="checkbox" :value="c.id" v-model="draft.categoryIds" />
+                    <span>{{ c.name }}</span>
+                    <span class="cat-desc" v-if="c.description">{{ c.description }}</span>
+                  </label>
+                </li>
+                <li class="cat-empty" v-if="categories.length === 0">
+                  还没有资源类别，请先到「资源类别管理」新增
+                </li>
+              </ul>
+            </div>
             <div class="full models-box">
               <span class="label">需求模型及对应价格</span>
               <div class="model-row" v-for="(m, i) in draft.models" :key="i">
@@ -256,7 +325,8 @@ defineExpose({ loadStages })
   margin: 12px 0;
 }
 .form-grid label,
-.models-box {
+.models-box,
+.cat-box {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -322,6 +392,74 @@ defineExpose({ loadStages })
   gap: 8px;
   padding: 12px 20px;
   border-top: 1px solid #eee;
+}
+.cat-box {
+  position: relative;
+}
+.cat-trigger {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-height: 32px;
+  padding: 3px 28px 3px 7px;
+  position: relative;
+  background: #fff;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.cat-trigger .placeholder {
+  color: #999;
+}
+.cat-trigger .caret {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #888;
+}
+.cat-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  margin: 2px 0 0;
+  padding: 4px 0;
+  list-style: none;
+  background: #fff;
+  border: 1px solid #c7d7fb;
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  max-height: 220px;
+  overflow-y: auto;
+}
+.cat-list li label {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.cat-list li label:hover {
+  background: #eaf1ff;
+}
+.cat-desc {
+  color: #888;
+  font-size: 12px;
+}
+.cat-empty {
+  padding: 6px 10px;
+  color: #999;
+  font-size: 13px;
+}
+.tag.cat {
+  background: #eaf7ee;
+  color: #1e8e3e;
 }
 .req {
   color: #d92626;
