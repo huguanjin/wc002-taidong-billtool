@@ -17,6 +17,10 @@ const message = ref('')
 const keyword = ref('')
 // 列表筛选：active 在售 / delisted 已下架 / all 全部
 const view = ref('active')
+// 弹窗：新增/编辑表单、复制在售资源。表单内的错误单独显示在弹窗里。
+const showForm = ref(false)
+const formError = ref('')
+const showCopy = ref(false)
 
 function today() {
   const d = new Date()
@@ -153,9 +157,27 @@ function resetDraft() {
   draft.value = emptyDraft()
 }
 
-function startEdit(s) {
-  error.value = ''
+function openCreate() {
   message.value = ''
+  formError.value = ''
+  resetDraft()
+  showForm.value = true
+}
+
+function closeForm() {
+  showForm.value = false
+  formError.value = ''
+  resetDraft()
+}
+
+function openCopy() {
+  copyHint.value = ''
+  showCopy.value = true
+}
+
+function startEdit(s) {
+  message.value = ''
+  formError.value = ''
   draft.value = {
     id: s.id,
     addedDate: s.addedDate,
@@ -166,11 +188,10 @@ function startEdit(s) {
     ownerDemand: s.ownerDemand || '',
     delisted: s.delisted,
   }
-  window.scrollTo && window.scrollTo({ top: 0, behavior: 'smooth' })
+  showForm.value = true
 }
 
 async function save(payload, okMessage) {
-  error.value = ''
   message.value = ''
   saving.value = true
   try {
@@ -183,7 +204,9 @@ async function save(payload, okMessage) {
     await loadSources()
     return true
   } catch (err) {
-    error.value = '保存失败：' + err.message
+    const text = '保存失败：' + err.message
+    if (showForm.value) formError.value = text
+    else error.value = text
     return false
   } finally {
     saving.value = false
@@ -191,22 +214,23 @@ async function save(payload, okMessage) {
 }
 
 async function saveSource() {
+  formError.value = ''
   if (!draft.value.ownerName.trim()) {
-    error.value = '号主名称不能为空'
+    formError.value = '号主名称不能为空'
     return
   }
   if (!draft.value.resourceName.trim()) {
-    error.value = '资源名称不能为空'
+    formError.value = '资源名称不能为空'
     return
   }
   const ok = await save(draft.value, isEditing.value ? '已更新货源' : '已新增货源')
-  if (ok) resetDraft()
+  if (ok) closeForm()
 }
 
 // 列表里一键上/下架：只翻转 delisted，其余字段原样带回，避免另开一个接口。
 async function toggleDelisted(s) {
-  const ok = await save({ ...s, delisted: !s.delisted }, s.delisted ? `货源 #${s.id} 已重新上架` : `货源 #${s.id} 已下架`)
-  if (ok && draft.value.id === s.id) resetDraft()
+  error.value = ''
+  await save({ ...s, delisted: !s.delisted }, s.delisted ? `货源 #${s.id} 已重新上架` : `货源 #${s.id} 已下架`)
 }
 
 async function deleteSource(s) {
@@ -221,7 +245,6 @@ async function deleteSource(s) {
       body: JSON.stringify({ id: s.id }),
     })
     message.value = `已删除货源 #${s.id}`
-    if (draft.value.id === s.id) resetDraft()
     await loadSources()
   } catch (err) {
     error.value = '删除失败：' + err.message
@@ -237,71 +260,12 @@ defineExpose({ loadSources })
 <template>
   <div>
     <div class="card">
-      <h2>复制在售资源</h2>
-      <p class="hint">整理当前所有未下架的资源，勾选需要带上的字段后复制。</p>
-      <div class="check-row">
-        <label class="check"><input type="checkbox" v-model="copyDate" /> 复制日期</label>
-        <label class="check" v-for="f in COPY_FIELDS" :key="f.key">
-          <input type="checkbox" :value="f.key" v-model="copyFields" /> {{ f.label }}
-        </label>
-      </div>
-      <pre class="preview" ref="copyTextRef">{{ copyContent || '（当前没有在售资源）' }}</pre>
-      <div class="path-row">
-        <button type="button" class="btn-primary" @click="doCopy" :disabled="!copyContent">
-          复制（{{ activeSources.length }} 条在售）
-        </button>
-        <span class="hint inline" v-if="copyHint">{{ copyHint }}</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>上 key 货源整理</h2>
-      <p class="hint">货源序号由系统自动生成；添加日期默认今天。</p>
-
-      <div class="form-grid">
-        <label>
-          <span>添加日期</span>
-          <input v-model="draft.addedDate" type="date" />
-        </label>
-        <label>
-          <span>号主名称<em class="req">*</em></span>
-          <input v-model="draft.ownerName" type="text" />
-        </label>
-        <label>
-          <span>资源名称<em class="req">*</em></span>
-          <input v-model="draft.resourceName" type="text" />
-        </label>
-        <label>
-          <span>资源单价</span>
-          <input v-model="draft.unitPrice" type="text" placeholder="例如：0.8 元/刀" />
-        </label>
-        <label class="full">
-          <span>资源配置情况描述</span>
-          <textarea v-model="draft.configDesc" rows="2"></textarea>
-        </label>
-        <label class="full">
-          <span>号主要求</span>
-          <textarea v-model="draft.ownerDemand" rows="2"></textarea>
-        </label>
-        <label class="check">
-          <input type="checkbox" v-model="draft.delisted" /> 已下架
-        </label>
-      </div>
-
-      <div class="path-row">
-        <button type="button" class="btn-primary" @click="saveSource" :disabled="saving">
-          {{ saving ? '保存中…' : isEditing ? `保存修改（#${draft.id}）` : '新增货源' }}
-        </button>
-        <button type="button" class="btn-browse" @click="resetDraft" v-if="isEditing">取消编辑</button>
+      <div class="toolbar">
+        <button type="button" class="btn-primary" @click="openCreate">+ 新增货源</button>
+        <button type="button" class="btn-browse" @click="openCopy">复制在售资源（{{ activeSources.length }}）</button>
         <button type="button" class="btn-browse" @click="loadSources" :disabled="loading">
           {{ loading ? '读取中…' : '刷新' }}
         </button>
-      </div>
-
-      <p class="error" v-if="error">{{ error }}</p>
-      <span class="hint" v-if="message">{{ message }}</span>
-
-      <div class="path-row filter-row">
         <select v-model="view">
           <option value="active">在售</option>
           <option value="delisted">已下架</option>
@@ -309,6 +273,9 @@ defineExpose({ loadSources })
         </select>
         <input v-model="keyword" type="text" class="search" placeholder="搜索 序号 / 号主 / 资源 / 配置 / 单价 / 要求" />
       </div>
+
+      <p class="error" v-if="error">{{ error }}</p>
+      <span class="hint" v-if="message">{{ message }}</span>
 
       <table v-if="filtered.length > 0">
         <thead>
@@ -328,7 +295,7 @@ defineExpose({ loadSources })
           <tr
             v-for="s in filtered"
             :key="s.id"
-            :class="{ 'row-editing': draft.id === s.id, 'row-delisted': s.delisted }"
+            :class="{ 'row-delisted': s.delisted }"
           >
             <td>{{ s.id }}</td>
             <td class="nowrap">{{ s.addedDate }}</td>
@@ -349,8 +316,81 @@ defineExpose({ loadSources })
         </tbody>
       </table>
       <span class="hint" v-else-if="loaded && sources.length > 0">当前筛选下没有货源。</span>
-      <span class="hint" v-else-if="!loading && loaded">还没有货源，先在上面新增一条。</span>
+      <span class="hint" v-else-if="!loading && loaded">还没有货源，点击上方「新增货源」添加。</span>
       <span class="hint" v-else-if="!loaded">正在读取货源列表…</span>
+
+      <div class="modal-mask" v-if="showForm">
+        <div class="modal" role="dialog" aria-modal="true">
+          <div class="modal-head">
+            <h3>{{ isEditing ? `编辑货源 #${draft.id}` : '新增货源' }}</h3>
+            <button type="button" class="modal-close" @click="closeForm" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-body">
+            <div class="form-grid">
+              <label>
+                <span>添加日期</span>
+                <input v-model="draft.addedDate" type="date" />
+              </label>
+              <label>
+                <span>资源单价</span>
+                <input v-model="draft.unitPrice" type="text" placeholder="例如：0.8 元/刀" />
+              </label>
+              <label>
+                <span>号主名称<em class="req">*</em></span>
+                <input v-model="draft.ownerName" type="text" />
+              </label>
+              <label>
+                <span>资源名称<em class="req">*</em></span>
+                <input v-model="draft.resourceName" type="text" />
+              </label>
+              <label class="full">
+                <span>资源配置情况描述</span>
+                <textarea v-model="draft.configDesc" rows="3"></textarea>
+              </label>
+              <label class="full">
+                <span>号主要求</span>
+                <textarea v-model="draft.ownerDemand" rows="3"></textarea>
+              </label>
+              <label class="check">
+                <input type="checkbox" v-model="draft.delisted" /> 已下架
+              </label>
+            </div>
+            <p class="error" v-if="formError">{{ formError }}</p>
+          </div>
+          <div class="modal-foot">
+            <button type="button" class="btn-browse" @click="closeForm" :disabled="saving">取消</button>
+            <button type="button" class="btn-primary" @click="saveSource" :disabled="saving">
+              {{ saving ? '保存中…' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-mask" v-if="showCopy">
+        <div class="modal" role="dialog" aria-modal="true">
+          <div class="modal-head">
+            <h3>复制在售资源</h3>
+            <button type="button" class="modal-close" @click="showCopy = false" aria-label="关闭">×</button>
+          </div>
+          <div class="modal-body">
+            <p class="hint">整理当前所有未下架的资源，勾选需要带上的字段后复制。</p>
+            <div class="check-row">
+              <label class="check"><input type="checkbox" v-model="copyDate" /> 复制日期</label>
+              <label class="check" v-for="f in COPY_FIELDS" :key="f.key">
+                <input type="checkbox" :value="f.key" v-model="copyFields" /> {{ f.label }}
+              </label>
+            </div>
+            <pre class="preview" ref="copyTextRef">{{ copyContent || '（当前没有在售资源）' }}</pre>
+            <span class="hint" v-if="copyHint">{{ copyHint }}</span>
+          </div>
+          <div class="modal-foot">
+            <button type="button" class="btn-browse" @click="showCopy = false">关闭</button>
+            <button type="button" class="btn-primary" @click="doCopy" :disabled="!copyContent">
+              复制（{{ activeSources.length }} 条在售）
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -433,12 +473,12 @@ label.check {
   overflow: auto;
   margin: 8px 0;
 }
-.path-row {
+.toolbar {
   display: flex;
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
-  margin: 10px 0;
+  margin-bottom: 10px;
 }
 .search {
   flex: 1;
@@ -509,8 +549,55 @@ td.nowrap,
 td.ops {
   white-space: nowrap;
 }
-.row-editing {
-  background: #fff8e1;
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  z-index: 1000;
+}
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  width: 100%;
+  max-width: 680px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.25);
+}
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid #eee;
+}
+.modal-head h3 {
+  margin: 0;
+  font-size: 16px;
+}
+.modal-close {
+  background: none;
+  border: none;
+  font-size: 24px;
+  line-height: 1;
+  color: #888;
+  cursor: pointer;
+}
+.modal-body {
+  padding: 4px 20px 12px;
+  overflow-y: auto;
+}
+.modal-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid #eee;
 }
 .row-delisted {
   color: #999;
